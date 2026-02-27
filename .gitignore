@@ -1,0 +1,13 @@
+# Rust
+/target/
+
+# Local config and artifacts
+/config.json
+/data/
+*.log
+
+# Editor/OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

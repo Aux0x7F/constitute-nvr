@@ -1,0 +1,9 @@
+{
+  "service": "constitute-nvr",
+  "bind": "127.0.0.1:4500",
+  "data_dir": "./data",
+  "node_role": "native",
+  "capabilities": ["nvr"],
+  "gateway_relays": [],
+  "zones": []
+}
