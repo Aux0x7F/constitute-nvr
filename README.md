@@ -1,57 +1,66 @@
 # Constitute NVR
 
-`constitute-nvr` is the video-ingest and retention service for the Constitution ecosystem.
+`constitute-nvr` is the native NVR workload for Constitution.
 
-It is a service-layer repo. It depends on converged contracts from:
-- `constitute-gateway` (transport + discovery substrate)
-- `constitute` (web client control and identity UX)
+It runs as a Fedora/Linux service, joins swarm as `role=native` with `service=nvr`, ingests camera streams, encrypts retained segments, and serves authorized identity-bound clients over a negotiated symmetric session.
 
-## Status
-- Iteration 0: scaffold complete
-- Iteration 1 direction: Fedora-hosted service + ONVIF-first ingest
-- Not production-ready
+## Current Iteration Scope
+- ONVIF WS-Discovery probe path
+- RTSP ingest via `ffmpeg` segment recorder
+- encrypted segment store (`.cnv` blobs)
+- swarm-native UDP presence announcements (no Nostr relay dependency)
+- identity-gated websocket session with ECDH + symmetric payload channel
+- systemd self-update timer flow
 
-## Scope
-In scope:
-- ONVIF camera ingest adapters (first protocol target)
-- encrypted recording and retention policy
-- publish discoverable service capability for authorized clients
-- provide control/read APIs through ecosystem contracts
-- Fedora systemd service baseline for operator deployment
+## Quick Install (Opinionated Wizard)
 
-Out of scope:
-- replacing gateway transport primitives
-- redefining identity/discovery contracts
-- browser UI implementation
-- non-Fedora packaging in iteration-1
-
-## Target Platform
-- Primary host target: Fedora (systemd service)
-- First supported ingest path: ONVIF cameras
-
-Initial camera validation targets:
-- Anypiz IPC-B8743-S (4MP PoE U series)
-- Reolink E1 Outdoor SE PoE Pan Cam
-
-See `docs/CAMERA_COMPAT.md` for compatibility tracking.
-
-## Naming
-- Repo: `constitute-nvr`
-- Service capability: `nvr`
-- Runtime role: `native` with service capability metadata
-
-## Architecture
-See `ARCHITECTURE.md`.
-
-## Docs
-- `docs/ROADMAP.md`
-- `docs/PROTOCOL.md`
-- `docs/CAMERA_COMPAT.md`
-
-## Local Dev
 ```bash
-cargo run
+curl -fsSL https://raw.githubusercontent.com/Aux0x7F/constitute-nvr/main/scripts/linux/install-wizard.sh | bash
 ```
 
-## License
-TBD
+Wizard behavior:
+- builds and installs `constitute-nvr`
+- prompts for storage root path (default placeholder)
+- installs systemd service and self-update timer
+- optionally applies camera-interface hardening (RTSP/ONVIF + NTP lane)
+
+## Runtime Overview
+- Swarm transport: UDP, client mode (`native` + `nvr` capability)
+- Control/serving surface: websocket at `api.bind` (`/session`)
+- Health endpoint: `GET /health`
+- Config path default: `/etc/constitute-nvr/config.json`
+
+## Config Highlights
+`config.example.json` includes:
+- `swarm.bind`, `swarm.peers`, `swarm.zones`
+- `api.identity_id`, `api.authorized_device_pks`
+- `storage.root`, `storage.encryption_key_hex`
+- `update.interval_secs`
+- `cameras[]` ONVIF/RTSP source definitions
+
+## Security Model (Current)
+- Segment-at-rest encryption uses service storage key.
+- Device session channel uses X25519 ECDH + HKDF-derived symmetric key.
+- Session admission requires:
+  - matching `identity_id`
+  - optional device allowlist (`authorized_device_pks`)
+  - HMAC proof over hello envelope (`identity_secret_hex`)
+- Camera network hardening is operator-controlled and scriptable.
+
+## Local Dev
+
+```bash
+cargo test
+cargo run -- --config ./config.json --once
+cargo run -- --config ./config.json --discover-onvif
+```
+
+## Docs
+- `ARCHITECTURE.md`
+- `docs/PROTOCOL.md`
+- `docs/OPERATIONS.md`
+- `docs/ROADMAP.md`
+- `docs/CAMERA_COMPAT.md`
+
+## Status
+POC-grade for manual lab validation. Not production-ready.
