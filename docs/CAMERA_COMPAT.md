@@ -1,24 +1,27 @@
-# Camera Compatibility Matrix
+# Camera Compatibility Matrix (Iteration-1)
 
-Status legend:
-- `Planned`: model is in scope but not validated
-- `In Test`: active validation in progress
-- `Validated`: baseline ingest works for iteration criteria
-- `Blocked`: model-specific blocker tracked in issue
+## Validation Target Models
 
-## Iteration-1 Target Models (ONVIF)
+### Anypiz IPC-B8743-S (4MP PoE U series)
+- ONVIF discovery: pending lab validation
+- ONVIF service endpoint auth: pending
+- RTSP ingest: pending
+- Recommended status: test candidate
 
-| Vendor | Model | Protocol | Status | Notes |
-|---|---|---|---|---|
-| Anypiz | IPC-B8743-S (4MP PoE U series) | ONVIF | Planned | First-pass target for fixed PoE stream ingest |
-| Reolink | E1 Outdoor SE PoE Pan Cam | ONVIF | Planned | First-pass target for PTZ-capable stream ingest |
+### Reolink E1 Outdoor SE PoE Pan Cam
+- ONVIF port surfaced in probe observations: yes
+- Reolink cloud/P2P endpoint behavior observed: yes (expected vendor default)
+- RTSP ingest path: pending lab validation in this repo
+- Recommended status: test candidate with camera-jail policy enabled
 
-## Validation Criteria (Baseline)
-- ONVIF discovery/connection succeeds with configured credentials.
-- Primary stream is ingestible for sustained test interval.
-- Basic metadata (codec/resolution/framerate) is captured.
-- Stream reconnect behavior is deterministic after interruption.
-- No plaintext credentials are persisted.
+## Validation Gates
+A model is considered **supported for iteration-1** when all pass:
+1. ONVIF WS-Discovery returns stable endpoint(s)
+2. ONVIF auth works with configured credentials
+3. RTSP ingest records continuous segments for >= 20 minutes
+4. encrypted segment conversion pass succeeds without data loss
+5. retrieval command returns decrypted segment bytes to authorized session client
 
-## Tracking
-Camera-specific defects should be filed as separate issues and linked to the iteration umbrella.
+## Security Notes
+- Vendor cloud/P2P features should be disabled when camera firmware allows.
+- Regardless of vendor settings, enforce camera network isolation + egress policy.

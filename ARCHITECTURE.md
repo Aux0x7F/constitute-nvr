@@ -1,56 +1,57 @@
 # Constitute NVR Architecture
 
-This repository defines the NVR service layer for Constitution.
-
 ## Position In Ecosystem
-- `constitute-gateway`: network/discovery backbone
-- `constitute`: browser client and identity UX
-- `constitute-nvr`: service workload for video ingest/retention/control
+- `constitute-gateway`: mesh backbone and gateway relay substrate
+- `constitute` (web): identity UX and browser app layer
+- `constitute-nvr`: native service workload for camera ingest + retention + serving
 
-## Design Rule
-`constitute-nvr` consumes shared contracts; it does not create parallel identity or transport stacks.
+`constitute-nvr` does not replace gateway transport. It joins swarm as a native client service.
 
-## Platform Direction (Iteration 1)
-- deployment target: Fedora host with systemd-managed `constitute-nvr` service
-- ingest target: ONVIF-first
-- camera validation starts with:
-  - Anypiz IPC-B8743-S (4MP PoE U series)
-  - Reolink E1 Outdoor SE PoE Pan Cam
+## Runtime Layers
+1. Swarm Client Layer
+- UDP swarm participation (`role=native`, `service=nvr`)
+- signed device + zone presence records
+- zone-scoped peer announcements, no public Nostr relay requirement for bootstrap in this mode
 
-## Layer Responsibilities
-1. Ingest
-- accept ONVIF camera/media feeds from adapters
-- normalize stream metadata and capability shape
+2. Ingest Layer
+- ONVIF WS-Discovery probe support
+- camera source registry from config
+- RTSP ingest execution via `ffmpeg` segment loop per source
 
-2. Secure Storage
-- encrypt retained media and index metadata
-- enforce retention and deletion policy
+3. Secure Storage Layer
+- segment files written under `storage.root/segments/<source_id>/`
+- background encryption pass converts `.mp4` to encrypted `.cnv`
+- plaintext segment files removed after encryption
 
-3. Capability Publication
-- advertise service capability (`nvr`) in discovery-friendly records
-- publish only required metadata
+4. Session/API Layer
+- health endpoint: `GET /health`
+- websocket session endpoint: `GET /session`
+- identity-bound session negotiation:
+  - client hello + HMAC proof
+  - X25519 server/client key agreement
+  - HKDF-derived symmetric session key
+- encrypted command channel for source listing, discovery, segment listing, segment retrieval
 
-4. Service Control Surface
-- authenticated control endpoints for:
-  - source registration
-  - retention policy
-  - health/status
-  - stream/clip listing and retrieval authorization
+5. Update/Operations Layer
+- systemd service runtime (`constitute-nvr.service`)
+- systemd timer-driven self-update (`constitute-nvr-update.timer`)
+- update helper script rebuilds from tracked branch and restarts service
 
-## Security Baseline
-- no plaintext secrets in repo
-- key material managed by trusted host keystore path
-- minimize metadata leakage in service advertisements
-- assume hostile network observation; confidentiality is an application-layer responsibility
+## Network and Trust Boundaries
+- camera network is expected to be isolated (camera jail)
+- optional hardening script enforces:
+  - drop-by-default camera interface inbound
+  - host egress restricted to ONVIF/RTSP (+ optional discovery/NTP)
+- transport metadata is observable; identity/content confidentiality remains app/session layer responsibility
 
-## Convergence Constraints
-Before feature-complete NVR behavior:
-- gateway/web contract parity should be stable enough for client integration
-- role/capability publication contracts should be frozen for iteration
+## Current Constraints
+- ingest path depends on host `ffmpeg`
+- encrypted storage is service-key based (no HSM integration yet)
+- session serving currently segment-oriented (not full live stream relay)
+- gateway/web integration surface needs iterative parity checks as contracts evolve
 
-## Near-Term Build Order
-1. Contract skeleton and capability schema
-2. ONVIF ingest adapter trait + test harness
-3. Encrypted storage abstraction + retention policy engine
-4. Control-plane endpoints and authorization model
-5. Fedora service runbook + integration tests with gateway/web surfaces
+## Near-Term Completion Targets
+1. stabilize ONVIF source lifecycle and reconnect behavior
+2. finalize identity-device authorization semantics with web contract
+3. add integration tests with gateway/web swarm records
+4. promote update flow from source-build to signed release artifacts
