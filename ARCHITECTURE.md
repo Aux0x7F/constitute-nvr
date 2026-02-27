@@ -10,10 +10,17 @@ This repository defines the NVR service layer for Constitution.
 ## Design Rule
 `constitute-nvr` consumes shared contracts; it does not create parallel identity or transport stacks.
 
+## Platform Direction (Iteration 1)
+- deployment target: Fedora host with systemd-managed `constitute-nvr` service
+- ingest target: ONVIF-first
+- camera validation starts with:
+  - Anypiz IPC-B8743-S (4MP PoE U series)
+  - Reolink E1 Outdoor SE PoE Pan Cam
+
 ## Layer Responsibilities
 1. Ingest
-- accept camera/media feeds from local adapters
-- normalize stream metadata
+- accept ONVIF camera/media feeds from adapters
+- normalize stream metadata and capability shape
 
 2. Secure Storage
 - encrypt retained media and index metadata
@@ -43,7 +50,7 @@ Before feature-complete NVR behavior:
 
 ## Near-Term Build Order
 1. Contract skeleton and capability schema
-2. Ingest adapter trait + test harness
+2. ONVIF ingest adapter trait + test harness
 3. Encrypted storage abstraction + retention policy engine
 4. Control-plane endpoints and authorization model
-5. Integration tests with gateway/web surfaces
+5. Fedora service runbook + integration tests with gateway/web surfaces
