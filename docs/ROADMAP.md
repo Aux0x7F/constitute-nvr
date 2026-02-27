@@ -14,10 +14,10 @@
 - [x] encrypted segment-at-rest storage pass
 
 ## Iteration 2: Ingest Reliability
-- [ ] ONVIF source lifecycle (register/update/remove) with explicit state machine
-- [ ] reconnect/backoff policy with bounded retries and observability
+- [x] ONVIF source lifecycle (register/update/remove) with explicit state machine
+- [x] reconnect/backoff policy with bounded retries and observability
 - [ ] ingest validation on target camera matrix
-- [ ] service metrics publication in swarm records
+- [x] service metrics publication in swarm records
 
 ## Iteration 3: Web/Gateway Convergence
 - [ ] exact identity/device auth parity with `constitute` + `constitute-gateway`
@@ -30,3 +30,4 @@
 - [ ] hardware-backed key options and sealed secret handling
 - [ ] vendor-specific P2P disable automation hooks (where camera APIs allow)
 - [ ] full operator runbooks for fedora lab + vps deployment profiles
+

@@ -17,9 +17,25 @@ pub struct DiscoveredCamera {
     pub from: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceRuntimeState {
+    pub source_id: String,
+    pub state: String,
+    pub restart_attempt: u64,
+    pub backoff_secs: u64,
+    pub last_error: String,
+    pub updated_at: u64,
+}
+
+struct RuntimeEntry {
+    state: Arc<Mutex<SourceRuntimeState>>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
 #[derive(Clone)]
 pub struct RecorderManager {
-    inner: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    inner: Arc<Mutex<HashMap<String, RuntimeEntry>>>,
 }
 
 impl RecorderManager {
@@ -30,41 +46,105 @@ impl RecorderManager {
     }
 
     pub async fn ensure_started(&self, cfg: &Config) {
+        let storage_root = cfg.storage_root();
         for cam in &cfg.cameras {
-            if !cam.enabled {
-                continue;
-            }
-            self.start_camera(cfg, cam).await;
+            self.upsert_camera(storage_root.clone(), cam.clone()).await;
         }
     }
 
-    async fn start_camera(&self, cfg: &Config, cam: &CameraConfig) {
+    pub async fn upsert_camera(&self, storage_root: PathBuf, cam: CameraConfig) {
+        self.remove_camera(&cam.source_id).await;
+
+        let state = Arc::new(Mutex::new(SourceRuntimeState {
+            source_id: cam.source_id.clone(),
+            state: if cam.enabled {
+                "starting".to_string()
+            } else {
+                "stopped".to_string()
+            },
+            restart_attempt: 0,
+            backoff_secs: 0,
+            last_error: String::new(),
+            updated_at: now_ms(),
+        }));
+
+        let handle = if cam.enabled {
+            let source_id = cam.source_id.clone();
+            let camera = cam.clone();
+            let state_ref = Arc::clone(&state);
+            Some(tokio::spawn(async move {
+                if let Err(err) = record_loop(storage_root, camera, Arc::clone(&state_ref)).await {
+                    warn!(error = %err, source = %source_id, "camera recorder exited");
+                    update_state(
+                        &state_ref,
+                        "failed",
+                        0,
+                        String::from(err.to_string()),
+                        None,
+                    )
+                    .await;
+                }
+            }))
+        } else {
+            None
+        };
+
         let mut guard = self.inner.lock().await;
-        if guard.contains_key(&cam.source_id) {
-            return;
-        }
+        guard.insert(
+            cam.source_id.clone(),
+            RuntimeEntry {
+                state,
+                handle,
+            },
+        );
+    }
 
-        let source_id = cam.source_id.clone();
-        let camera = cam.clone();
-        let storage_root = cfg.storage_root();
+    pub async fn remove_camera(&self, source_id: &str) -> bool {
+        let source = String::from(source_id);
+        let entry = {
+            let mut guard = self.inner.lock().await;
+            guard.remove(&source)
+        };
 
-        let handle = tokio::spawn(async move {
-            if let Err(err) = record_loop(storage_root, camera).await {
-                warn!(error = %err, source = %source_id, "camera recorder exited");
+        if let Some(mut entry) = entry {
+            if let Some(handle) = entry.handle.take() {
+                handle.abort();
             }
-        });
+            update_state(&entry.state, "stopped", 0, String::new(), None).await;
+            return true;
+        }
+        false
+    }
 
-        guard.insert(cam.source_id.clone(), handle);
+    pub async fn list_states(&self) -> Vec<SourceRuntimeState> {
+        let entries: Vec<Arc<Mutex<SourceRuntimeState>>> = {
+            let guard = self.inner.lock().await;
+            guard.values().map(|e| Arc::clone(&e.state)).collect()
+        };
+
+        let mut out = Vec::with_capacity(entries.len());
+        for state in entries {
+            out.push(state.lock().await.clone());
+        }
+        out.sort_by(|a, b| a.source_id.cmp(&b.source_id));
+        out
     }
 }
 
-async fn record_loop(storage_root: PathBuf, cam: CameraConfig) -> Result<()> {
+async fn record_loop(
+    storage_root: PathBuf,
+    cam: CameraConfig,
+    state: Arc<Mutex<SourceRuntimeState>>,
+) -> Result<()> {
     let out_dir = storage_root.join("segments").join(sanitize(&cam.source_id));
     tokio::fs::create_dir_all(&out_dir).await?;
 
     let output_pattern = out_dir.join("%Y%m%dT%H%M%S.mp4");
+    let mut restart_attempt: u64 = 0;
 
     loop {
+        update_state(&state, "starting", restart_attempt, String::new(), Some(0)).await;
+
         let mut cmd = Command::new("ffmpeg");
         cmd.arg("-hide_banner")
             .arg("-loglevel")
@@ -86,20 +166,52 @@ async fn record_loop(storage_root: PathBuf, cam: CameraConfig) -> Result<()> {
             .arg(output_pattern.to_string_lossy().to_string());
 
         info!(source = %cam.source_id, rtsp = %cam.rtsp_url, "starting ffmpeg recorder");
+        update_state(&state, "running", restart_attempt, String::new(), Some(0)).await;
+
         match cmd.status().await {
             Ok(status) => {
+                let message = format!("ffmpeg exited with code {:?}", status.code());
                 warn!(source = %cam.source_id, code = ?status.code(), "ffmpeg exited; restarting");
+                restart_attempt = restart_attempt.saturating_add(1);
+                let backoff = backoff_secs(restart_attempt);
+                update_state(&state, "backoff", restart_attempt, message, Some(backoff)).await;
+                sleep(Duration::from_secs(backoff)).await;
             }
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::NotFound {
                     return Err(anyhow!("ffmpeg not found in PATH"));
                 }
+
+                let message = format!("failed to launch ffmpeg: {}", err);
                 warn!(source = %cam.source_id, error = %err, "failed to launch ffmpeg; retrying");
+                restart_attempt = restart_attempt.saturating_add(1);
+                let backoff = backoff_secs(restart_attempt);
+                update_state(&state, "backoff", restart_attempt, message, Some(backoff)).await;
+                sleep(Duration::from_secs(backoff)).await;
             }
         }
-
-        sleep(Duration::from_secs(3)).await;
     }
+}
+
+fn backoff_secs(attempt: u64) -> u64 {
+    let p = attempt.clamp(1, 6);
+    let secs = 2_u64.pow(p as u32);
+    secs.min(30)
+}
+
+async fn update_state(
+    state: &Arc<Mutex<SourceRuntimeState>>,
+    status: &str,
+    restart_attempt: u64,
+    last_error: String,
+    backoff_secs: Option<u64>,
+) {
+    let mut guard = state.lock().await;
+    guard.state = status.to_string();
+    guard.restart_attempt = restart_attempt;
+    guard.backoff_secs = backoff_secs.unwrap_or(guard.backoff_secs);
+    guard.last_error = last_error;
+    guard.updated_at = now_ms();
 }
 
 pub async fn discover_onvif(timeout_secs: u64) -> Result<Vec<DiscoveredCamera>> {
@@ -186,6 +298,13 @@ fn sanitize(value: &str) -> String {
         .collect()
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +314,12 @@ mod tests {
         let xml = "<XAddrs>http://10.0.0.2/onvif/device_service https://10.0.0.2/ws</XAddrs>";
         let out = extract_xaddrs(xml);
         assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn backoff_bounds() {
+        assert_eq!(backoff_secs(1), 2);
+        assert_eq!(backoff_secs(2), 4);
+        assert_eq!(backoff_secs(8), 30);
     }
 }
