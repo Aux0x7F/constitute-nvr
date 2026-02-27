@@ -68,7 +68,7 @@ Connect websocket to `/session` and perform:
 1. plaintext `hello`
 2. receive `hello_ack`
 3. switch to encrypted `cipher` envelopes
-4. issue `list_sources` and `list_segments`
+4. issue `list_sources`, `list_source_states`, then `list_segments`
 
 Use the configured values:
 - `api.identity_id`
@@ -86,3 +86,4 @@ sudo /usr/local/bin/constitute-nvr-self-update --source-dir /opt/constitute-nvr-
 - depends on host `ffmpeg`
 - source-build update flow (no signed release artifact path yet)
 - segment-serving path implemented before live stream relay path
+

@@ -94,7 +94,7 @@ async fn main() -> Result<()> {
         "constitute-nvr starting"
     );
 
-    api::run(cfg, storage).await
+    api::run(cfg, cfg_path, storage, recorder).await
 }
 
 fn init_logging(level: &str) {
@@ -108,3 +108,4 @@ fn init_logging(level: &str) {
         .compact()
         .init();
 }
+

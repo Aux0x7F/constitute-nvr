@@ -5,11 +5,11 @@
 It runs as a Fedora/Linux service, joins swarm as `role=native` with `service=nvr`, ingests camera streams, encrypts retained segments, and serves authorized identity-bound clients over a negotiated symmetric session.
 
 ## Current Iteration Scope
-- ONVIF WS-Discovery probe path
-- RTSP ingest via `ffmpeg` segment recorder
+- ONVIF WS-Discovery probe path + source lifecycle commands
+- RTSP ingest via `ffmpeg` segment recorder with restart/backoff state machine
 - encrypted segment store (`.cnv` blobs)
-- swarm-native UDP presence announcements (no Nostr relay dependency)
-- identity-gated websocket session with ECDH + symmetric payload channel
+- swarm-native UDP presence announcements with UI module advertisement + service metrics
+- identity-gated websocket session with ECDH + symmetric payload channel (`list_source_states`, `upsert_source`, `remove_source`)
 - systemd self-update timer flow
 
 ## Quick Install (Opinionated Wizard)
@@ -33,9 +33,9 @@ Wizard behavior:
 ## Config Highlights
 `config.example.json` includes:
 - `swarm.bind`, `swarm.peers`, `swarm.zones`
-- `api.identity_id`, `api.authorized_device_pks`
+- `api.identity_id`, `api.authorized_device_pks`, `api.public_ws_url`
 - `storage.root`, `storage.encryption_key_hex`
-- `update.interval_secs`
+- `update.interval_secs`\n- `ui.repo`, `ui.ref`, `ui.manifest_url`, `ui.entry`
 - `cameras[]` ONVIF/RTSP source definitions
 
 ## Security Model (Current)
@@ -64,3 +64,4 @@ cargo run -- --config ./config.json --discover-onvif
 
 ## Status
 POC-grade for manual lab validation. Not production-ready.
+

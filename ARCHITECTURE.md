@@ -10,13 +10,13 @@
 ## Runtime Layers
 1. Swarm Client Layer
 - UDP swarm participation (`role=native`, `service=nvr`)
-- signed device + zone presence records
+- signed device + zone presence records (including UI module references + live metrics)
 - zone-scoped peer announcements, no public Nostr relay requirement for bootstrap in this mode
 
 2. Ingest Layer
 - ONVIF WS-Discovery probe support
-- camera source registry from config
-- RTSP ingest execution via `ffmpeg` segment loop per source
+- camera source registry from config + encrypted control-plane upsert/remove commands
+- RTSP ingest execution via `ffmpeg` segment loop per source with explicit runtime state machine + restart/backoff
 
 3. Secure Storage Layer
 - segment files written under `storage.root/segments/<source_id>/`
@@ -30,7 +30,7 @@
   - client hello + HMAC proof
   - X25519 server/client key agreement
   - HKDF-derived symmetric session key
-- encrypted command channel for source listing, discovery, segment listing, segment retrieval
+- encrypted command channel for source lifecycle, source state, discovery, segment listing, segment retrieval
 
 5. Update/Operations Layer
 - systemd service runtime (`constitute-nvr.service`)
@@ -55,3 +55,4 @@
 2. finalize identity-device authorization semantics with web contract
 3. add integration tests with gateway/web swarm records
 4. promote update flow from source-build to signed release artifacts
+

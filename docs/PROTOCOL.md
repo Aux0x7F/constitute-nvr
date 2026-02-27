@@ -6,10 +6,15 @@ Define the active contract surface for `constitute-nvr` POC integration.
 ## Service Identity
 - runtime role: `native`
 - service capability: `nvr`
-- swarm records include:
+- swarm device record includes:
   - `role`
   - `service`
   - `serviceVersion`
+  - `ingestProtocols` (`onvif`, `rtsp`)
+  - `capabilities` (`camera`)
+  - UI module hints (`uiRepo`, `uiRef`, optional `uiManifestUrl`, `uiEntry`)
+  - optional `sessionWsUrl`
+  - live service metrics (`uptimeSec`, peer counts, camera counts)
 
 ## Swarm Transport (Native)
 - channel: UDP
@@ -36,10 +41,16 @@ Carries signed Nostr event payloads for:
 - device discovery (`kind=30078`, `t=swarm_discovery`, `type=device`, `role=native`, `service=nvr`)
 - zone presence (`kind=1`, `t=constitute`, `z=<zone>`)
 
-## ONVIF Discovery
+## ONVIF Discovery + Source Lifecycle
 - WS-Discovery probe to `239.255.255.250:3702`
 - ONVIF endpoint extraction from `XAddrs`
-- command surface supports discovery trigger from authenticated session
+- source lifecycle command surface:
+  - `upsert_source`
+  - `remove_source`
+  - `list_source_states`
+- recorder state machine:
+  - `starting` -> `running` -> `backoff` -> retry
+  - terminal `failed` on non-recoverable runtime failures (e.g., `ffmpeg` missing)
 
 ## Session Negotiation (`/session`)
 
@@ -91,7 +102,10 @@ Session key derivation:
 
 ## Encrypted Commands
 - `list_sources`
+- `list_source_states`
 - `discover_onvif`
+- `upsert_source` (source definition)
+- `remove_source` (`sourceId`)
 - `list_segments` (`sourceId`, `limit`)
 - `get_segment` (`sourceId`, `name`)
 

@@ -21,6 +21,7 @@
   },
   "api": {
     "bind": "0.0.0.0:8456",
+    "public_ws_url": "wss://replace-host:8456/session",
     "identity_id": "REPLACE_WITH_IDENTITY_ID",
     "authorized_device_pks": [],
     "identity_secret_hex": "",
@@ -37,6 +38,12 @@
     "source_dir": "/opt/constitute-nvr-src",
     "branch": "main",
     "script_path": "/usr/local/bin/constitute-nvr-self-update"
+  },
+  "ui": {
+    "repo": "Aux0x7F/constitute-nvr-ui",
+    "ref": "main",
+    "manifest_url": "https://raw.githubusercontent.com/Aux0x7F/constitute-nvr-ui/main/app.manifest.json",
+    "entry": "dist/index.html"
   },
   "cameras": [
     {

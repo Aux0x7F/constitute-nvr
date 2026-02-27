@@ -1,5 +1,6 @@
 use crate::camera;
-use crate::config::Config;
+use crate::camera::RecorderManager;
+use crate::config::{CameraConfig, Config};
 use crate::crypto;
 use crate::storage::StorageManager;
 use crate::util;
@@ -13,19 +14,33 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 #[derive(Clone)]
 pub struct ApiState {
-    pub cfg: Config,
+    pub cfg: Arc<Mutex<Config>>,
+    pub cfg_path: PathBuf,
     pub storage: StorageManager,
+    pub recorder: RecorderManager,
 }
 
-pub async fn run(cfg: Config, storage: StorageManager) -> Result<()> {
+pub async fn run(
+    cfg: Config,
+    cfg_path: PathBuf,
+    storage: StorageManager,
+    recorder: RecorderManager,
+) -> Result<()> {
     let bind = cfg.api.bind.clone();
-    let state = Arc::new(ApiState { cfg, storage });
+    let state = Arc::new(ApiState {
+        cfg: Arc::new(Mutex::new(cfg)),
+        cfg_path,
+        storage,
+        recorder,
+    });
 
     let app = Router::new()
         .route("/health", get(health))
@@ -40,13 +55,17 @@ pub async fn run(cfg: Config, storage: StorageManager) -> Result<()> {
 
 async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
     let sources = state.storage.list_sources().await.unwrap_or_default();
+    let runtime = state.recorder.list_states().await;
+    let cfg = state.cfg.lock().await.clone();
     Json(json!({
         "ok": true,
         "service": "nvr",
-        "version": state.cfg.service_version,
-        "nodeRole": state.cfg.node_role,
-        "identityId": state.cfg.api.identity_id,
+        "version": cfg.service_version,
+        "nodeRole": cfg.node_role,
+        "identityId": cfg.api.identity_id,
         "sources": sources,
+        "sourceRuntime": runtime,
+        "configuredSources": cfg.cameras.len(),
     }))
 }
 
@@ -91,7 +110,15 @@ struct CipherEnvelope {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum ClientCommand {
     ListSources,
+    ListSourceStates,
     DiscoverOnvif,
+    UpsertSource {
+        source: SourceUpsert,
+    },
+    RemoveSource {
+        #[serde(rename = "sourceId")]
+        source_id: String,
+    },
     ListSegments {
         #[serde(rename = "sourceId")]
         source_id: String,
@@ -102,6 +129,54 @@ enum ClientCommand {
         source_id: String,
         name: String,
     },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceUpsert {
+    source_id: String,
+    name: String,
+    onvif_host: String,
+    #[serde(default = "default_onvif_port")]
+    onvif_port: u16,
+    rtsp_url: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default = "default_segment_secs")]
+    segment_secs: u64,
+}
+
+impl SourceUpsert {
+    fn into_camera(self) -> Result<CameraConfig> {
+        if self.source_id.trim().is_empty() {
+            return Err(anyhow!("sourceId is required"));
+        }
+        if self.rtsp_url.trim().is_empty() {
+            return Err(anyhow!("rtsp_url is required"));
+        }
+        if self.onvif_host.trim().is_empty() {
+            return Err(anyhow!("onvif_host is required"));
+        }
+        Ok(CameraConfig {
+            source_id: self.source_id.trim().to_string(),
+            name: if self.name.trim().is_empty() {
+                self.source_id.trim().to_string()
+            } else {
+                self.name.trim().to_string()
+            },
+            onvif_host: self.onvif_host.trim().to_string(),
+            onvif_port: self.onvif_port,
+            rtsp_url: self.rtsp_url.trim().to_string(),
+            username: self.username,
+            password: self.password,
+            enabled: self.enabled,
+            segment_secs: self.segment_secs.max(2),
+        })
+    }
 }
 
 async fn handle_ws(mut socket: WebSocket, state: Arc<ApiState>) {
@@ -132,7 +207,9 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<ApiState>) {
         return;
     }
 
-    if let Err(err) = validate_hello(&state.cfg, &hello) {
+    let cfg_snapshot = state.cfg.lock().await.clone();
+
+    if let Err(err) = validate_hello(&cfg_snapshot, &hello) {
         let _ = socket
             .send(Message::Text(error_json(&err.to_string()).into()))
             .await;
@@ -143,12 +220,12 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<ApiState>) {
     let session_id = uuid::Uuid::new_v4().to_string();
     let context = format!(
         "constitute-nvr:{}:{}",
-        state.cfg.api.identity_id, session_id
+        cfg_snapshot.api.identity_id, session_id
     );
 
     let (session_key, server_key) = match crypto::derive_session_key(
-        &state.cfg.api.server_secret_hex,
-        &state.cfg.api.identity_secret_hex,
+        &cfg_snapshot.api.server_secret_hex,
+        &cfg_snapshot.api.identity_secret_hex,
         &hello.client_key,
         &context,
     ) {
@@ -309,6 +386,19 @@ async fn handle_command(
             )
             .await?;
         }
+        ClientCommand::ListSourceStates => {
+            let runtime = state.recorder.list_states().await;
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "list_source_states",
+                    "states": runtime,
+                }),
+            )
+            .await?;
+        }
         ClientCommand::DiscoverOnvif => {
             let found = camera::discover_onvif(3).await?;
             send_cipher_json(
@@ -318,6 +408,67 @@ async fn handle_command(
                     "ok": true,
                     "cmd": "discover_onvif",
                     "cameras": found,
+                }),
+            )
+            .await?;
+        }
+        ClientCommand::UpsertSource { source } => {
+            let camera_cfg = source.into_camera()?;
+            let storage_root = {
+                let mut guard = state.cfg.lock().await;
+                if let Some(existing) = guard
+                    .cameras
+                    .iter_mut()
+                    .find(|c| c.source_id == camera_cfg.source_id)
+                {
+                    *existing = camera_cfg.clone();
+                } else {
+                    guard.cameras.push(camera_cfg.clone());
+                }
+                let snapshot = guard.clone();
+                snapshot.persist(&state.cfg_path)?;
+                snapshot.storage_root()
+            };
+
+            state
+                .recorder
+                .upsert_camera(storage_root, camera_cfg.clone())
+                .await;
+
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "upsert_source",
+                    "source": camera_cfg,
+                }),
+            )
+            .await?;
+        }
+        ClientCommand::RemoveSource { source_id } => {
+            let removed = {
+                let mut guard = state.cfg.lock().await;
+                let before = guard.cameras.len();
+                guard.cameras.retain(|c| c.source_id != source_id);
+                let changed = guard.cameras.len() != before;
+                if changed {
+                    let snapshot = guard.clone();
+                    snapshot.persist(&state.cfg_path)?;
+                }
+                changed
+            };
+
+            let runtime_removed = state.recorder.remove_camera(&source_id).await;
+
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "remove_source",
+                    "sourceId": source_id,
+                    "removed": removed || runtime_removed,
                 }),
             )
             .await?;
@@ -402,4 +553,16 @@ async fn send_cipher_json(socket: &mut WebSocket, key: &[u8], value: &Value) -> 
 
 fn error_json(message: &str) -> String {
     json!({"ok": false, "error": message}).to_string()
+}
+
+fn default_onvif_port() -> u16 {
+    80
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_segment_secs() -> u64 {
+    10
 }

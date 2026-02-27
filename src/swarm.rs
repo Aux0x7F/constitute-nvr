@@ -58,6 +58,27 @@ struct DeviceRecordPayload {
     role: String,
     service: String,
     service_version: String,
+    ingest_protocols: Vec<String>,
+    capabilities: Vec<String>,
+    ui_repo: String,
+    #[serde(rename = "uiRef")]
+    ui_ref: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    ui_manifest_url: String,
+    ui_entry: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    session_ws_url: String,
+    metrics: DeviceMetricsPayload,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceMetricsPayload {
+    uptime_sec: u64,
+    peers_known: u64,
+    peers_confirmed: u64,
+    cameras_total: u64,
+    cameras_enabled: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -111,10 +132,11 @@ pub async fn start(cfg: Config) -> Result<SwarmHandle> {
 
     let tx_socket = Arc::clone(&socket);
     let tx_peers = Arc::clone(&peers);
+    let tx_table = Arc::clone(&table);
     let tx_cfg = cfg.clone();
 
     tokio::spawn(async move {
-        if let Err(err) = announce_loop(tx_socket, tx_peers, tx_cfg).await {
+        if let Err(err) = announce_loop(tx_socket, tx_peers, tx_table, tx_cfg).await {
             warn!(error = %err, "swarm announce loop exited");
         }
     });
@@ -140,8 +162,10 @@ async fn resolve_peers(raw: &[String]) -> Vec<SocketAddr> {
 async fn announce_loop(
     socket: Arc<UdpSocket>,
     peers: Arc<Mutex<Vec<SocketAddr>>>,
+    table: Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
     cfg: Config,
 ) -> Result<()> {
+    let started_at = Instant::now();
     let mut hello_tick = interval(Duration::from_secs(5));
     let mut announce_tick = interval(Duration::from_secs(cfg.swarm.announce_interval_secs.max(5)));
     let zones = cfg
@@ -164,8 +188,20 @@ async fn announce_loop(
                 broadcast_json(&socket, &peers, &hello).await;
             }
             _ = announce_tick.tick() => {
+                let peers_known = peers.lock().await.len() as u64;
+                let peers_confirmed = table.lock().await.values().filter(|p| p.confirmed).count() as u64;
+                let cameras_total = cfg.cameras.len() as u64;
+                let cameras_enabled = cfg.cameras.iter().filter(|c| c.enabled).count() as u64;
+                let metrics = DeviceMetricsPayload {
+                    uptime_sec: started_at.elapsed().as_secs(),
+                    peers_known,
+                    peers_confirmed,
+                    cameras_total,
+                    cameras_enabled,
+                };
+
                 for zone in &zones {
-                    if let Ok(ev) = build_device_record(&cfg) {
+                    if let Ok(ev) = build_device_record(&cfg, &metrics) {
                         let msg = UdpMessage::Record {
                             v: PROTOCOL_VERSION,
                             zone: zone.clone(),
@@ -316,7 +352,7 @@ async fn send_json(socket: &UdpSocket, to: SocketAddr, msg: &UdpMessage) {
     }
 }
 
-fn build_device_record(cfg: &Config) -> Result<NostrEvent> {
+fn build_device_record(cfg: &Config, metrics: &DeviceMetricsPayload) -> Result<NostrEvent> {
     let now = util::now_ms();
     let payload = DeviceRecordPayload {
         device_pk: cfg.nostr_pubkey.clone(),
@@ -327,6 +363,14 @@ fn build_device_record(cfg: &Config) -> Result<NostrEvent> {
         role: cfg.node_role.clone(),
         service: "nvr".to_string(),
         service_version: cfg.service_version.clone(),
+        ingest_protocols: vec!["onvif".to_string(), "rtsp".to_string()],
+        capabilities: vec!["camera".to_string()],
+        ui_repo: cfg.ui.repo.clone(),
+        ui_ref: cfg.ui.repo_ref.clone(),
+        ui_manifest_url: cfg.ui.manifest_url.clone(),
+        ui_entry: cfg.ui.entry.clone(),
+        session_ws_url: cfg.api.public_ws_url.clone(),
+        metrics: metrics.clone(),
     };
     let content = serde_json::to_string(&payload)?;
     let tags = vec![
@@ -334,6 +378,7 @@ fn build_device_record(cfg: &Config) -> Result<NostrEvent> {
         vec!["type".to_string(), "device".to_string()],
         vec!["role".to_string(), cfg.node_role.clone()],
         vec!["service".to_string(), "nvr".to_string()],
+        vec!["cap".to_string(), "camera".to_string()],
     ];
     let unsigned = nostr::build_unsigned_event(
         &cfg.nostr_pubkey,
