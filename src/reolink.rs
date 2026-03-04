@@ -602,53 +602,48 @@ fn sdk_bridge_available() -> bool {
 
 pub async fn read_state(request: ReolinkConnectRequest) -> Result<ReolinkStateResult> {
     let request = request.normalized()?;
-    if !sdk_bridge_available() {
-        return Err(anyhow!(format!(
-            "Reolink runtime settings require the external proprietary 9000 bridge until native cross-platform transport is finished (expected at {})",
-            sdk_bridge_script_path().display()
-        )));
+    if sdk_bridge_available() {
+        let value = run_sdk_bridge_value(json!({
+            "action": "state",
+            "ip": request.ip,
+            "username": request.username,
+            "password": request.password,
+        }))
+        .await?;
+
+        return serde_json::from_value(value).context("failed decoding Reolink runtime state");
     }
 
-    let value = run_sdk_bridge_value(json!({
-        "action": "state",
-        "ip": request.ip,
-        "username": request.username,
-        "password": request.password,
-    }))
-    .await?;
-
-    serde_json::from_value(value).context("failed decoding Reolink runtime state")
+    reolink_cgi::read_state(&request).await
 }
 
 pub async fn apply_state(request: ReolinkStateApplyRequest) -> Result<ReolinkStateApplyResult> {
     let request = request.normalized()?;
-    if !sdk_bridge_available() {
-        return Err(anyhow!(format!(
-            "Reolink runtime settings require the external proprietary 9000 bridge until native cross-platform transport is finished (expected at {})",
-            sdk_bridge_script_path().display()
-        )));
+    if sdk_bridge_available() {
+        let value = run_sdk_bridge_value(json!({
+            "action": "apply",
+            "ip": request.connection.ip,
+            "username": request.connection.username,
+            "channel": request.connection.channel,
+            "password": request.connection.password,
+            "normal": request.normal,
+            "advanced": request.advanced,
+            "p2p": request.p2p,
+            "autoReboot": request.auto_reboot,
+            "ptz": request.ptz,
+            "ptzPosition": request.ptz_position,
+            "smartTrackTask": request.smart_track_task,
+            "smartTrackLimit": request.smart_track_limit,
+            "signatureLogin": request.signature_login,
+            "userConfig": request.user_config,
+        }))
+        .await?;
+
+        return serde_json::from_value(value)
+            .context("failed decoding Reolink runtime state update");
     }
 
-    let value = run_sdk_bridge_value(json!({
-        "action": "apply",
-        "ip": request.connection.ip,
-        "username": request.connection.username,
-        "channel": request.connection.channel,
-        "password": request.connection.password,
-        "normal": request.normal,
-        "advanced": request.advanced,
-        "p2p": request.p2p,
-        "autoReboot": request.auto_reboot,
-        "ptz": request.ptz,
-        "ptzPosition": request.ptz_position,
-        "smartTrackTask": request.smart_track_task,
-        "smartTrackLimit": request.smart_track_limit,
-        "signatureLogin": request.signature_login,
-        "userConfig": request.user_config,
-    }))
-    .await?;
-
-    serde_json::from_value(value).context("failed decoding Reolink runtime state update")
+    reolink_cgi::apply_state(&request).await
 }
 
 async fn setup_via_sdk_bridge(request: &ReolinkSetupRequest) -> Result<ReolinkSetupBridgeResult> {

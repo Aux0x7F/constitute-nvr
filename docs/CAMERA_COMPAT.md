@@ -17,7 +17,7 @@
 - RTSP port observed on `554/tcp` after native enablement
 - Reolink cloud/P2P endpoint behavior observed: yes (`p2p.reolink.com`, `devices-apis.reolink.com`)
 - RTSP ingest path: pending sustained validation in this repo
-- Current automation status: native DHCP + native CGI setup path implemented; first-boot HTTP availability must still be validated on a factory-reset unit
+- Current automation status: native DHCP bootstrap is implemented; configured-camera control can fall back to native CGI for ports/P2P, but first-boot provisioning still depends on the proprietary 9000 path and remains the blocking native-Rust gap
 - Recommended status: test candidate with camera-jail policy enabled
 
 ## Validation Gates

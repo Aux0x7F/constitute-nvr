@@ -1,6 +1,7 @@
 use crate::reolink::{
     ReolinkAdvancedPortConfig, ReolinkNormalPortConfig, ReolinkP2PConfig, ReolinkSetupBridgeResult,
-    ReolinkSetupRequest,
+    ReolinkSetupRequest, ReolinkStateApplyRequest, ReolinkStateApplyResult, ReolinkStateResult,
+    ReolinkStateSnapshot,
 };
 use aes::Aes128;
 use anyhow::{Context, Result, anyhow};
@@ -644,6 +645,110 @@ pub async fn setup(request: &ReolinkSetupRequest) -> Result<ReolinkSetupBridgeRe
         after_advanced: after_net.advanced(),
         after_p2p: after_p2p.config(),
     })
+}
+
+pub async fn read_state(
+    request: &crate::reolink::ReolinkConnectRequest,
+) -> Result<ReolinkStateResult> {
+    let mut session = login_existing_session(request).await?;
+    let net = session.get_net_port().await?;
+    let p2p = session.get_p2p().await?;
+    Ok(ReolinkStateResult {
+        state: ReolinkStateSnapshot {
+            normal: serde_json::to_value(net.normal())
+                .context("failed encoding CGI normal state")?,
+            advanced: serde_json::to_value(net.advanced())
+                .context("failed encoding CGI advanced state")?,
+            p2p: serde_json::to_value(p2p.config()).context("failed encoding CGI p2p state")?,
+            ..ReolinkStateSnapshot::default()
+        },
+        active_password: request.password.clone(),
+    })
+}
+
+pub async fn apply_state(request: &ReolinkStateApplyRequest) -> Result<ReolinkStateApplyResult> {
+    if request.auto_reboot.is_some()
+        || request.ptz.is_some()
+        || request.ptz_position.is_some()
+        || request.smart_track_task.is_some()
+        || request.smart_track_limit.is_some()
+        || request.signature_login.is_some()
+        || request.user_config.is_some()
+    {
+        return Err(anyhow!(
+            "Reolink CGI fallback only supports normal ports, advanced ports, and P2P state"
+        ));
+    }
+
+    let mut session = login_existing_session(&request.connection).await?;
+    let before_net = session.get_net_port().await?;
+    let before_p2p = session.get_p2p().await?;
+
+    let before_normal = before_net.normal();
+    let before_advanced = before_net.advanced();
+    let before_p2p_cfg = before_p2p.config();
+
+    let target_normal = match request.normal.as_ref() {
+        Some(value) => serde_json::from_value::<ReolinkNormalPortConfig>(value.clone())
+            .context("invalid CGI normal port state payload")?,
+        None => before_normal.clone(),
+    };
+    let target_advanced = match request.advanced.as_ref() {
+        Some(value) => serde_json::from_value::<ReolinkAdvancedPortConfig>(value.clone())
+            .context("invalid CGI advanced port state payload")?,
+        None => before_advanced.clone(),
+    };
+    let target_p2p_cfg = match request.p2p.as_ref() {
+        Some(value) => serde_json::from_value::<ReolinkP2PConfig>(value.clone())
+            .context("invalid CGI P2P state payload")?,
+        None => before_p2p_cfg.clone(),
+    };
+
+    let target_net = ReolinkCgiNetPort::with_updates(&before_net, &target_normal, &target_advanced);
+    if target_net != before_net {
+        session.set_net_port(&target_net).await?;
+    }
+
+    let target_p2p = ReolinkCgiP2P::with_updates(&before_p2p, &target_p2p_cfg);
+    if target_p2p != before_p2p {
+        session.set_p2p(&target_p2p).await?;
+    }
+
+    let after_net = session.get_net_port().await?;
+    let after_p2p = session.get_p2p().await?;
+
+    Ok(ReolinkStateApplyResult {
+        before: ReolinkStateSnapshot {
+            normal: serde_json::to_value(before_normal)
+                .context("failed encoding CGI pre-update normal state")?,
+            advanced: serde_json::to_value(before_advanced)
+                .context("failed encoding CGI pre-update advanced state")?,
+            p2p: serde_json::to_value(before_p2p_cfg)
+                .context("failed encoding CGI pre-update p2p state")?,
+            ..ReolinkStateSnapshot::default()
+        },
+        after: ReolinkStateSnapshot {
+            normal: serde_json::to_value(after_net.normal())
+                .context("failed encoding CGI post-update normal state")?,
+            advanced: serde_json::to_value(after_net.advanced())
+                .context("failed encoding CGI post-update advanced state")?,
+            p2p: serde_json::to_value(after_p2p.config())
+                .context("failed encoding CGI post-update p2p state")?,
+            ..ReolinkStateSnapshot::default()
+        },
+        active_password: request.connection.password.clone(),
+    })
+}
+
+async fn login_existing_session(
+    request: &crate::reolink::ReolinkConnectRequest,
+) -> Result<ReolinkHttpSession> {
+    match ReolinkHttpSession::login(&request.ip, &request.username, &request.password).await? {
+        ReolinkLoginOutcome::Session(session) => Ok(session),
+        ReolinkLoginOutcome::Uninitialized { .. } => Err(anyhow!(
+            "Reolink CGI fallback cannot initialize a factory-reset device; use the proprietary 9000 provisioning path first"
+        )),
+    }
 }
 
 async fn bootstrap_user(
