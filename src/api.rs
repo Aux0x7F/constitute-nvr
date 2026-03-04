@@ -21,6 +21,8 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+const INSECURE_HELLO_SECRET_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
 #[derive(Clone)]
 pub struct ApiState {
     pub cfg: Arc<Mutex<Config>>,
@@ -242,7 +244,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<ApiState>) {
 
     let (session_key, server_key) = match crypto::derive_session_key(
         &cfg_snapshot.api.server_secret_hex,
-        &cfg_snapshot.api.identity_secret_hex,
+        session_identity_secret_hex(&cfg_snapshot),
         &hello.client_key,
         &context,
     ) {
@@ -367,6 +369,10 @@ fn validate_hello(cfg: &Config, hello: &HelloReq) -> Result<()> {
         return Err(anyhow!("hello timestamp outside allowed skew"));
     }
 
+    if cfg.api.allow_unsigned_hello_mvp {
+        return Ok(());
+    }
+
     let proof_ok = crypto::verify_hello_proof(
         &cfg.api.identity_secret_hex,
         &hello.identity_id,
@@ -381,6 +387,14 @@ fn validate_hello(cfg: &Config, hello: &HelloReq) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn session_identity_secret_hex(cfg: &Config) -> &str {
+    if cfg.api.allow_unsigned_hello_mvp {
+        INSECURE_HELLO_SECRET_HEX
+    } else {
+        &cfg.api.identity_secret_hex
+    }
 }
 
 async fn handle_command(

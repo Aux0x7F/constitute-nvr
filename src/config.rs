@@ -35,6 +35,8 @@ pub struct ApiConfig {
     pub identity_id: String,
     #[serde(default)]
     pub authorized_device_pks: Vec<String>,
+    #[serde(default)]
+    pub allow_unsigned_hello_mvp: bool,
     pub identity_secret_hex: String,
     pub server_secret_hex: String,
 }
@@ -266,6 +268,7 @@ impl Config {
                 public_ws_url: String::new(),
                 identity_id: "REPLACE_WITH_IDENTITY_ID".to_string(),
                 authorized_device_pks: Vec::new(),
+                allow_unsigned_hello_mvp: false,
                 identity_secret_hex: random_hex(32),
                 server_secret_hex: random_hex(32),
             },

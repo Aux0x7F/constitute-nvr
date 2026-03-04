@@ -1,6 +1,7 @@
 use aes::Aes128;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use md5::{Digest, Md5};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReolinkFrameHeader {
@@ -24,6 +25,9 @@ pub enum ReolinkFrameHeader {
 }
 
 pub const MAGIC: [u8; 4] = [0xf0, 0xde, 0xbc, 0x0a];
+pub const BC_XML_KEY: [u8; 8] = [0x1F, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0xFF];
+pub const OBSERVED_HANDSHAKE_REQUEST_FIELD_D: u32 = 0x6514_dc12;
+pub const OBSERVED_HANDSHAKE_RESPONSE_FIELD_D: u32 = 0x6614_dd12;
 pub const OBSERVED_CLIENT_FIELD_D: u32 = 0x6414_0000;
 pub const OBSERVED_SERVER_OK: u32 = 200;
 pub const LOGIN_FRAME_LEN: usize = 316;
@@ -1741,6 +1745,87 @@ pub fn build_short_frame(op: u32, field_c: u32, field_d: u32, payload: &[u8]) ->
     out
 }
 
+pub fn bcencrypt(offset: u8, payload: &[u8]) -> Vec<u8> {
+    payload
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| {
+            let key = BC_XML_KEY[(index + (offset as usize)) % BC_XML_KEY.len()];
+            byte ^ key ^ offset
+        })
+        .collect()
+}
+
+pub fn bcdecrypt(offset: u8, payload: &[u8]) -> Vec<u8> {
+    // BCEncrypt is a XOR stream, so decrypt == encrypt.
+    bcencrypt(offset, payload)
+}
+
+pub fn build_handshake_probe_frame() -> Vec<u8> {
+    build_short_frame(
+        ReolinkTransportOp::Handshake as u32,
+        0,
+        OBSERVED_HANDSHAKE_REQUEST_FIELD_D,
+        &[],
+    )
+}
+
+fn parse_nonce_from_xml(xml: &str) -> Option<String> {
+    let start = xml.find("<nonce>")?;
+    let value_start = start + "<nonce>".len();
+    let end = xml[value_start..].find("</nonce>")?;
+    Some(xml[value_start..(value_start + end)].to_string())
+}
+
+pub fn decrypt_handshake_xml(body: &[u8]) -> Option<String> {
+    let plaintext = bcdecrypt(0, body);
+    String::from_utf8(plaintext).ok()
+}
+
+pub fn extract_nonce_from_handshake_body(body: &[u8]) -> Option<String> {
+    let xml = decrypt_handshake_xml(body)?;
+    parse_nonce_from_xml(&xml)
+}
+
+pub fn md5_upper_31(input: &str) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(input.as_bytes());
+    let digest = hasher.finalize();
+    let upper = hex::encode_upper(digest);
+    upper[..31].to_string()
+}
+
+pub fn build_login_xml(username: &str, password: &str, nonce: &str) -> String {
+    let username_md5 = md5_upper_31(&format!("{username}{nonce}"));
+    let password_md5 = md5_upper_31(&format!("{password}{nonce}"));
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n\
+<body>\n\
+<LoginUser version=\"1.1\">\n\
+<userName>{username_md5}</userName>\n\
+<password>{password_md5}</password>\n\
+<userVer>1</userVer>\n\
+</LoginUser>\n\
+<LoginNet version=\"1.1\">\n\
+<type>LAN</type>\n\
+<udpPort>0</udpPort>\n\
+</LoginNet>\n\
+</body>\n"
+    )
+}
+
+pub fn build_login_frame(username: &str, password: &str, nonce: &str) -> Vec<u8> {
+    let xml = build_login_xml(username, password, nonce);
+    let encrypted = bcencrypt(0, xml.as_bytes());
+    build_extended_frame(
+        ReolinkTransportOp::Handshake as u32,
+        0,
+        OBSERVED_CLIENT_FIELD_D,
+        0,
+        &encrypted,
+    )
+}
+
 pub fn build_extended_frame(
     op: u32,
     field_c: u32,
@@ -2676,5 +2761,73 @@ mod tests {
             LOGIN_STATIC_MIDDLE
         );
         assert_eq!(login_password_block(&replaced).expect("password"), password);
+    }
+
+    #[test]
+    fn bcencrypt_roundtrip() {
+        let payload = b"constitute-reolink-bcencrypt";
+        let encrypted = bcencrypt(0, payload);
+        assert_ne!(encrypted, payload);
+        let decrypted = bcdecrypt(0, &encrypted);
+        assert_eq!(decrypted, payload);
+    }
+
+    #[test]
+    fn decrypts_observed_handshake_and_extracts_nonce() {
+        let frame = observed_server_handshake_frame();
+        let body = handshake_frame_body(&frame).expect("handshake body");
+        let xml = decrypt_handshake_xml(body).expect("handshake xml");
+        assert!(xml.contains("<Encryption version=\"1.1\">"));
+        assert!(xml.contains("<nonce>"));
+        let nonce = extract_nonce_from_handshake_body(body).expect("nonce");
+        assert!(!nonce.is_empty());
+    }
+
+    #[test]
+    fn computes_expected_modern_login_hashes() {
+        let nonce = "69a886e7-e6zQYHd61yUQBte6rV0F";
+        assert_eq!(
+            md5_upper_31(&format!("{}{}", "admin", nonce)),
+            "ED31EBDF0CB67A665AE471BF2A75BA7"
+        );
+        assert_eq!(
+            md5_upper_31(&format!("{}{}", "Test1234", nonce)),
+            "E400F51521344AC76EFCBF85C5A869C"
+        );
+    }
+
+    #[test]
+    fn builds_expected_login_xml_and_frame_shape() {
+        let nonce = "69a886e7-e6zQYHd61yUQBte6rV0F";
+        let xml = build_login_xml("admin", "Test1234", nonce);
+        assert!(xml.contains("<userName>ED31EBDF0CB67A665AE471BF2A75BA7</userName>"));
+        assert!(xml.contains("<password>E400F51521344AC76EFCBF85C5A869C</password>"));
+
+        let frame = build_login_frame("admin", "Test1234", nonce);
+        let header = parse_frame_header(&frame).expect("frame header");
+        assert_eq!(header.op(), ReolinkTransportOp::Handshake as u32);
+        assert_eq!(frame.len(), 24 + xml.len());
+
+        let encrypted = match header {
+            ReolinkFrameHeader::Extended { .. } => &frame[24..],
+            ReolinkFrameHeader::Short { .. } => panic!("expected extended login frame"),
+        };
+        let decrypted = String::from_utf8(bcdecrypt(0, encrypted)).expect("login xml utf8");
+        assert_eq!(decrypted, xml);
+    }
+
+    #[test]
+    fn builds_expected_handshake_probe_frame() {
+        let frame = build_handshake_probe_frame();
+        assert_eq!(
+            frame,
+            vec![
+                0xf0, 0xde, 0xbc, 0x0a, // magic
+                0x01, 0x00, 0x00, 0x00, // op
+                0x00, 0x00, 0x00, 0x00, // payload len
+                0x00, 0x00, 0x00, 0x00, // field c
+                0x12, 0xdc, 0x14, 0x65, // field d
+            ]
+        );
     }
 }

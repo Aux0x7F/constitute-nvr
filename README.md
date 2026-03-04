@@ -11,7 +11,7 @@ It runs as a Fedora/Linux service, joins swarm as `role=native` with `service=nv
 - swarm-native UDP presence announcements with UI module advertisement + service metrics
 - identity-gated websocket session with ECDH + symmetric payload channel (`list_source_states`, `upsert_source`, `remove_source`)
 - systemd self-update timer flow
-- Reolink native onboarding (temporary DHCP lease, proprietary LAN discovery, native HTTP CGI bootstrap for uninitialized devices, RTSP/ONVIF enable + P2P disable, standards-readiness probe)
+- Reolink onboarding for MVP using LAN discovery + HTTP CGI setup/read/apply (RTSP/ONVIF enable, P2P disable) while native `9000` replacement remains under R&D
 
 ## Quick Install (Opinionated Wizard)
 
@@ -30,11 +30,13 @@ Wizard behavior:
 - Control/serving surface: websocket at `api.bind` (`/session`)
 - Health endpoint: `GET /health`
 - Config path default: `/etc/constitute-nvr/config.json`
+- Reolink runtime default: CGI-first (`setup_reolink`, `read_reolink_state`, `apply_reolink_state`)
+- Optional bridge toggle: set `CONSTITUTE_NVR_USE_SDK_BRIDGE=1` to try Windows SDK bridge fallback for lab work
 
 ## Config Highlights
 `config.example.json` includes:
 - `swarm.bind`, `swarm.peers`, `swarm.zones`
-- `api.identity_id`, `api.authorized_device_pks`, `api.public_ws_url`
+- `api.identity_id`, `api.authorized_device_pks`, `api.public_ws_url`, `api.allow_unsigned_hello_mvp` (MVP mode for web shell launch without shipping identity secret)
 - `storage.root`, `storage.encryption_key_hex`
 - `update.interval_secs`
 - `ui.repo`, `ui.ref`, `ui.manifest_url`, `ui.entry`
@@ -46,7 +48,8 @@ Wizard behavior:
 - Session admission requires:
   - matching `identity_id`
   - optional device allowlist (`authorized_device_pks`)
-  - HMAC proof over hello envelope (`identity_secret_hex`)
+  - HMAC proof over hello envelope (`identity_secret_hex`) unless `allow_unsigned_hello_mvp=true`
+- Unsigned MVP mode is for local integration bring-up only; disable it for non-lab deployments.
 - Camera network hardening is operator-controlled and scriptable.
 
 ## Local Dev

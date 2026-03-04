@@ -9,10 +9,11 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::str::FromStr;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::process::Command;
 use tokio::time::{Duration, Instant, sleep, timeout};
+use tracing::{info, warn};
 
 const DISCOVERY_PROBE: [u8; 4] = [0xaa, 0xaa, 0x00, 0x00];
 const DHCP_COOKIE: [u8; 4] = [0x63, 0x82, 0x53, 0x63];
@@ -24,6 +25,10 @@ const DHCP_END: u8 = 255;
 const GENERATED_DEVICE_PASSWORD_LEN: usize = 24;
 const DEVICE_PASSWORD_CHARSET: &[u8] =
     b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789-_";
+const REOLINK_PROPRIETARY_PORT: u16 = 9000;
+const REOLINK_NATIVE_CONNECT_TIMEOUT_SECS: u64 = 5;
+const REOLINK_NATIVE_IO_TIMEOUT_SECS: u64 = 5;
+const REOLINK_NATIVE_MAX_PAYLOAD_LEN: usize = 1 << 20;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -470,7 +475,7 @@ async fn discover_on_targets(
 pub async fn probe(ip: &str, timeout_secs: u64) -> Result<ReolinkProbe> {
     let target = parse_ipv4(ip).context("invalid probe ip")?;
     let timeout_secs = timeout_secs.max(1);
-    let proprietary_port_open = tcp_open(target, 9000, timeout_secs).await;
+    let proprietary_port_open = tcp_open(target, REOLINK_PROPRIETARY_PORT, timeout_secs).await;
     let rtsp_port_open = tcp_open(target, 554, timeout_secs).await;
     let onvif_port_open = tcp_open(target, 8000, timeout_secs).await;
 
@@ -511,10 +516,24 @@ pub async fn setup(request: ReolinkSetupRequest) -> Result<ReolinkSetupResult> {
         None
     };
 
-    let bridge_result = if sdk_bridge_available() {
-        setup_via_sdk_bridge(&request)
+    if native_preflight_enabled() {
+        match native_9000_preflight(&request).await {
+            Ok(()) => info!(ip = %request.ip, "native 9000 preflight ok"),
+            Err(err) => warn!(ip = %request.ip, error = %err, "native 9000 preflight failed"),
+        }
+    }
+
+    let bridge_result = if use_sdk_bridge_for_mvp() {
+        match setup_via_sdk_bridge(&request)
             .await
             .context("Reolink proprietary 9000 setup failed")
+        {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                warn!(error = %err, "sdk bridge setup failed; falling back to CGI");
+                reolink_cgi::setup(&request).await
+            }
+        }
     } else {
         reolink_cgi::setup(&request).await
     };
@@ -543,6 +562,171 @@ pub async fn setup(request: ReolinkSetupRequest) -> Result<ReolinkSetupResult> {
         probe,
         generated_password,
     })
+}
+
+async fn native_9000_preflight(request: &ReolinkSetupRequest) -> Result<()> {
+    let target = parse_ipv4(&request.ip).context("invalid setup ip for native 9000 preflight")?;
+    let mut failures = Vec::new();
+
+    for password in native_password_candidates(request) {
+        match try_native_9000_login(target, &request.username, &password).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let label = if password.is_empty() {
+                    "<empty>"
+                } else if password == request.password.trim() {
+                    "<request.password>"
+                } else if password == request.desired_password.trim() {
+                    "<request.desired_password>"
+                } else {
+                    "<candidate>"
+                };
+                failures.push(format!("{label}: {err:#}"));
+            }
+        }
+    }
+
+    Err(anyhow!(format!(
+        "native 9000 login failed for all credential candidates ({})",
+        failures.join("; ")
+    )))
+}
+
+fn native_password_candidates(request: &ReolinkSetupRequest) -> Vec<String> {
+    let mut out = vec![request.password.trim().to_string()];
+    let desired = request.desired_password.trim().to_string();
+    if !desired.is_empty() && !out.contains(&desired) {
+        out.push(desired);
+    }
+    out
+}
+
+async fn try_native_9000_login(target: Ipv4Addr, username: &str, password: &str) -> Result<()> {
+    let addr = SocketAddrV4::new(target, REOLINK_PROPRIETARY_PORT);
+    let mut stream = timeout(
+        Duration::from_secs(REOLINK_NATIVE_CONNECT_TIMEOUT_SECS),
+        TcpStream::connect(addr),
+    )
+    .await
+    .context("timed out connecting to Reolink proprietary port")?
+    .with_context(|| format!("failed connecting to {addr}"))?;
+
+    let _ = stream.set_nodelay(true);
+
+    let probe = reolink_proto::build_handshake_probe_frame();
+    timed_write_all(&mut stream, &probe, "native handshake probe").await?;
+
+    let handshake_frame = read_reolink_transport_frame(&mut stream).await?;
+    let handshake_body = reolink_proto::handshake_frame_body(&handshake_frame)
+        .ok_or_else(|| anyhow!("native handshake response missing handshake body"))?;
+    let nonce = reolink_proto::extract_nonce_from_handshake_body(handshake_body)
+        .ok_or_else(|| anyhow!("native handshake response missing nonce"))?;
+
+    let login_frame = reolink_proto::build_login_frame(username, password, &nonce);
+    timed_write_all(&mut stream, &login_frame, "native login frame").await?;
+
+    let login_response = read_reolink_transport_frame(&mut stream).await?;
+    let login_header = reolink_proto::parse_frame_header(&login_response)
+        .ok_or_else(|| anyhow!("native login response is not a valid Reolink frame"))?;
+    if reolink_proto::ReolinkTransportOp::from_u32(login_header.op()).is_none() {
+        return Err(anyhow!(format!(
+            "native login response used unknown op {}",
+            login_header.op()
+        )));
+    }
+
+    Ok(())
+}
+
+async fn timed_write_all(stream: &mut TcpStream, buf: &[u8], label: &str) -> Result<()> {
+    timeout(
+        Duration::from_secs(REOLINK_NATIVE_IO_TIMEOUT_SECS),
+        stream.write_all(buf),
+    )
+    .await
+    .with_context(|| format!("timed out writing {label}"))?
+    .with_context(|| format!("failed writing {label}"))
+}
+
+async fn timed_read_exact(stream: &mut TcpStream, buf: &mut [u8], label: &str) -> Result<()> {
+    let _ = timeout(
+        Duration::from_secs(REOLINK_NATIVE_IO_TIMEOUT_SECS),
+        stream.read_exact(buf),
+    )
+    .await
+    .with_context(|| format!("timed out reading {label}"))?
+    .with_context(|| format!("failed reading {label}"))?;
+    Ok(())
+}
+
+async fn read_reolink_transport_frame(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut header = [0u8; 20];
+    timed_read_exact(stream, &mut header, "Reolink frame header").await?;
+    if header[..4] != reolink_proto::MAGIC {
+        return Err(anyhow!("invalid Reolink frame magic"));
+    }
+
+    let op = u32::from_le_bytes(
+        header[4..8]
+            .try_into()
+            .map_err(|_| anyhow!("failed decoding Reolink op field"))?,
+    );
+    let payload_len = u32::from_le_bytes(
+        header[8..12]
+            .try_into()
+            .map_err(|_| anyhow!("failed decoding Reolink payload length"))?,
+    ) as usize;
+    if payload_len > REOLINK_NATIVE_MAX_PAYLOAD_LEN {
+        return Err(anyhow!(format!(
+            "Reolink frame payload too large: {payload_len}"
+        )));
+    }
+
+    let mut frame = header.to_vec();
+
+    if op == reolink_proto::ReolinkTransportOp::Handshake as u32 {
+        if payload_len == 0 {
+            return Ok(frame);
+        }
+
+        let mut maybe_tail = [0u8; 4];
+        timed_read_exact(stream, &mut maybe_tail, "Reolink handshake tail").await?;
+
+        let maybe_field_e = u32::from_le_bytes(maybe_tail);
+        let use_extended_header = maybe_field_e == 0;
+
+        if use_extended_header {
+            frame.extend_from_slice(&maybe_tail);
+            let mut body = vec![0u8; payload_len];
+            if payload_len > 0 {
+                timed_read_exact(stream, &mut body, "Reolink handshake payload").await?;
+            }
+            frame.extend_from_slice(&body);
+            return Ok(frame);
+        }
+
+        let first_payload_len = payload_len.min(4);
+        frame.extend_from_slice(&maybe_tail[..first_payload_len]);
+        let remaining_payload = payload_len.saturating_sub(first_payload_len);
+        if remaining_payload > 0 {
+            let mut body = vec![0u8; remaining_payload];
+            timed_read_exact(stream, &mut body, "Reolink short payload").await?;
+            frame.extend_from_slice(&body);
+        }
+        return Ok(frame);
+    }
+
+    let mut field_e = [0u8; 4];
+    timed_read_exact(stream, &mut field_e, "Reolink extended field_e").await?;
+    frame.extend_from_slice(&field_e);
+
+    let mut body = vec![0u8; payload_len];
+    if payload_len > 0 {
+        timed_read_exact(stream, &mut body, "Reolink extended payload").await?;
+    }
+    frame.extend_from_slice(&body);
+
+    Ok(frame)
 }
 
 fn sdk_bridge_script_path() -> PathBuf {
@@ -600,18 +784,42 @@ fn sdk_bridge_available() -> bool {
     cfg!(target_os = "windows") && sdk_bridge_script_path().exists()
 }
 
+fn env_truthy(name: &str) -> bool {
+    matches!(
+        env::var(name)
+            .ok()
+            .map(|raw| raw.trim().to_ascii_lowercase()),
+        Some(value) if value == "1" || value == "true" || value == "yes" || value == "on"
+    )
+}
+
+fn use_sdk_bridge_for_mvp() -> bool {
+    env_truthy("CONSTITUTE_NVR_USE_SDK_BRIDGE") && sdk_bridge_available()
+}
+
+fn native_preflight_enabled() -> bool {
+    env_truthy("CONSTITUTE_NVR_NATIVE_PREFLIGHT")
+}
+
 pub async fn read_state(request: ReolinkConnectRequest) -> Result<ReolinkStateResult> {
     let request = request.normalized()?;
-    if sdk_bridge_available() {
-        let value = run_sdk_bridge_value(json!({
+    if use_sdk_bridge_for_mvp() {
+        match run_sdk_bridge_value(json!({
             "action": "state",
             "ip": request.ip,
             "username": request.username,
             "password": request.password,
         }))
-        .await?;
-
-        return serde_json::from_value(value).context("failed decoding Reolink runtime state");
+        .await
+        {
+            Ok(value) => {
+                return serde_json::from_value(value)
+                    .context("failed decoding Reolink runtime state");
+            }
+            Err(err) => {
+                warn!(error = %err, "sdk bridge state read failed; falling back to CGI");
+            }
+        }
     }
 
     reolink_cgi::read_state(&request).await
@@ -619,8 +827,8 @@ pub async fn read_state(request: ReolinkConnectRequest) -> Result<ReolinkStateRe
 
 pub async fn apply_state(request: ReolinkStateApplyRequest) -> Result<ReolinkStateApplyResult> {
     let request = request.normalized()?;
-    if sdk_bridge_available() {
-        let value = run_sdk_bridge_value(json!({
+    if use_sdk_bridge_for_mvp() {
+        match run_sdk_bridge_value(json!({
             "action": "apply",
             "ip": request.connection.ip,
             "username": request.connection.username,
@@ -637,10 +845,16 @@ pub async fn apply_state(request: ReolinkStateApplyRequest) -> Result<ReolinkSta
             "signatureLogin": request.signature_login,
             "userConfig": request.user_config,
         }))
-        .await?;
-
-        return serde_json::from_value(value)
-            .context("failed decoding Reolink runtime state update");
+        .await
+        {
+            Ok(value) => {
+                return serde_json::from_value(value)
+                    .context("failed decoding Reolink runtime state update");
+            }
+            Err(err) => {
+                warn!(error = %err, "sdk bridge state apply failed; falling back to CGI");
+            }
+        }
     }
 
     reolink_cgi::apply_state(&request).await
@@ -1123,6 +1337,23 @@ mod tests {
         .normalized()
         .expect("normalized");
         assert_eq!(request.username, "admin");
+    }
+
+    #[test]
+    fn native_password_candidates_preserve_blank_first_for_factory_reset() {
+        let request = ReolinkSetupRequest {
+            ip: "192.168.1.20".to_string(),
+            username: "admin".to_string(),
+            password: String::new(),
+            desired_password: "Test1234".to_string(),
+            generate_password: false,
+            normal: None,
+            advanced: None,
+            p2p: None,
+        };
+
+        let out = native_password_candidates(&request);
+        assert_eq!(out, vec!["".to_string(), "Test1234".to_string()]);
     }
 
     #[test]
