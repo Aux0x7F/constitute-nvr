@@ -318,7 +318,7 @@ impl ReolinkRemoteCommand {
             },
             Self::SetNetAdvancedPort => ReolinkObservedTransportRequest {
                 op: ReolinkTransportOp::WritePortBundle,
-                payload_len: 304,
+                payload_len: 222,
             },
             Self::GetNetNormalPort => ReolinkObservedTransportRequest {
                 op: ReolinkTransportOp::ReadPortBundle,
@@ -326,7 +326,7 @@ impl ReolinkRemoteCommand {
             },
             Self::SetNetNormalPort => ReolinkObservedTransportRequest {
                 op: ReolinkTransportOp::WritePortBundle,
-                payload_len: 310,
+                payload_len: 307,
             },
             Self::GetP2PCfg => ReolinkObservedTransportRequest {
                 op: ReolinkTransportOp::ReadP2P,
@@ -356,59 +356,120 @@ impl ReolinkRemoteCommand {
     }
 
     pub fn observed_apply_transport(self) -> Option<ReolinkObservedTransportRequest> {
-        None
+        Some(match self {
+            Self::SetNetAdvancedPort
+            | Self::SetNetNormalPort
+            | Self::SetP2PCfg
+            | Self::ForceUserPassword => ReolinkObservedTransportRequest {
+                op: ReolinkTransportOp::ApplyConfig,
+                payload_len: 125,
+            },
+            _ => return None,
+        })
     }
 
     pub fn observed_transport_ops(self) -> Option<&'static [ReolinkTransportOp]> {
         Some(match self {
             Self::GetNetAdvancedPort => &[
+                ReolinkTransportOp::Handshake,
+                ReolinkTransportOp::Handshake,
+                ReolinkTransportOp::Login,
+                ReolinkTransportOp::SessionBind,
+                ReolinkTransportOp::ChannelReady,
+                ReolinkTransportOp::CommonAck,
                 ReolinkTransportOp::CommonReadA,
                 ReolinkTransportOp::CommonReadB,
                 ReolinkTransportOp::CommonReadC,
-                ReolinkTransportOp::ReadPortBundle,
                 ReolinkTransportOp::Telemetry,
+                ReolinkTransportOp::ApplyConfig,
+                ReolinkTransportOp::ReadPortBundle,
             ],
             Self::SetNetAdvancedPort => &[
+                ReolinkTransportOp::Handshake,
+                ReolinkTransportOp::Handshake,
+                ReolinkTransportOp::Login,
+                ReolinkTransportOp::SessionBind,
+                ReolinkTransportOp::ChannelReady,
+                ReolinkTransportOp::CommonAck,
                 ReolinkTransportOp::CommonReadA,
                 ReolinkTransportOp::CommonReadB,
                 ReolinkTransportOp::CommonReadC,
-                ReolinkTransportOp::WritePortBundle,
                 ReolinkTransportOp::Telemetry,
+                ReolinkTransportOp::ApplyConfig,
+                ReolinkTransportOp::ReadPortBundle,
+                ReolinkTransportOp::WritePortBundle,
             ],
             Self::GetNetNormalPort => &[
+                ReolinkTransportOp::Handshake,
+                ReolinkTransportOp::Handshake,
+                ReolinkTransportOp::Login,
+                ReolinkTransportOp::SessionBind,
+                ReolinkTransportOp::ChannelReady,
+                ReolinkTransportOp::CommonAck,
                 ReolinkTransportOp::CommonReadA,
                 ReolinkTransportOp::CommonReadB,
                 ReolinkTransportOp::CommonReadC,
-                ReolinkTransportOp::ReadPortBundle,
                 ReolinkTransportOp::Telemetry,
+                ReolinkTransportOp::ApplyConfig,
+                ReolinkTransportOp::ReadPortBundle,
             ],
             Self::SetNetNormalPort => &[
+                ReolinkTransportOp::Handshake,
+                ReolinkTransportOp::Handshake,
+                ReolinkTransportOp::Login,
+                ReolinkTransportOp::SessionBind,
+                ReolinkTransportOp::ChannelReady,
+                ReolinkTransportOp::CommonAck,
                 ReolinkTransportOp::CommonReadA,
                 ReolinkTransportOp::CommonReadB,
                 ReolinkTransportOp::CommonReadC,
-                ReolinkTransportOp::WritePortBundle,
                 ReolinkTransportOp::Telemetry,
+                ReolinkTransportOp::ApplyConfig,
+                ReolinkTransportOp::ReadPortBundle,
+                ReolinkTransportOp::WritePortBundle,
             ],
             Self::ForceUserPassword => &[
+                ReolinkTransportOp::Handshake,
+                ReolinkTransportOp::Handshake,
+                ReolinkTransportOp::Login,
+                ReolinkTransportOp::SessionBind,
+                ReolinkTransportOp::ChannelReady,
+                ReolinkTransportOp::CommonAck,
                 ReolinkTransportOp::CommonReadA,
                 ReolinkTransportOp::CommonReadB,
                 ReolinkTransportOp::CommonReadC,
-                ReolinkTransportOp::ForceUserPassword,
                 ReolinkTransportOp::Telemetry,
+                ReolinkTransportOp::ApplyConfig,
+                ReolinkTransportOp::ForceUserPassword,
             ],
             Self::GetP2PCfg => &[
+                ReolinkTransportOp::Handshake,
+                ReolinkTransportOp::Handshake,
+                ReolinkTransportOp::Login,
+                ReolinkTransportOp::SessionBind,
+                ReolinkTransportOp::ChannelReady,
+                ReolinkTransportOp::CommonAck,
                 ReolinkTransportOp::CommonReadA,
                 ReolinkTransportOp::CommonReadB,
                 ReolinkTransportOp::CommonReadC,
-                ReolinkTransportOp::ReadP2P,
                 ReolinkTransportOp::Telemetry,
+                ReolinkTransportOp::ApplyConfig,
+                ReolinkTransportOp::ReadP2P,
             ],
             Self::GetBootPwdState => &[
+                ReolinkTransportOp::Handshake,
+                ReolinkTransportOp::Handshake,
+                ReolinkTransportOp::Login,
+                ReolinkTransportOp::SessionBind,
+                ReolinkTransportOp::ChannelReady,
+                ReolinkTransportOp::CommonAck,
                 ReolinkTransportOp::CommonReadA,
                 ReolinkTransportOp::CommonReadB,
                 ReolinkTransportOp::CommonReadC,
-                ReolinkTransportOp::ReadBootPwdState,
                 ReolinkTransportOp::Telemetry,
+                ReolinkTransportOp::ApplyConfig,
+                ReolinkTransportOp::ReadBootPwdState,
+                ReolinkTransportOp::AsyncStatus,
             ],
             Self::SetBootPwdState => &[
                 ReolinkTransportOp::CommonReadA,
@@ -418,11 +479,19 @@ impl ReolinkRemoteCommand {
                 ReolinkTransportOp::Telemetry,
             ],
             Self::SetP2PCfg => &[
+                ReolinkTransportOp::Handshake,
+                ReolinkTransportOp::Handshake,
+                ReolinkTransportOp::Login,
+                ReolinkTransportOp::SessionBind,
+                ReolinkTransportOp::ChannelReady,
+                ReolinkTransportOp::CommonAck,
                 ReolinkTransportOp::CommonReadA,
                 ReolinkTransportOp::CommonReadB,
                 ReolinkTransportOp::CommonReadC,
-                ReolinkTransportOp::WriteP2P,
                 ReolinkTransportOp::Telemetry,
+                ReolinkTransportOp::ApplyConfig,
+                ReolinkTransportOp::ReadP2P,
+                ReolinkTransportOp::WriteP2P,
             ],
             Self::GetLoginAuthCode => &[
                 ReolinkTransportOp::CommonReadA,
@@ -2378,14 +2447,14 @@ mod tests {
             ReolinkRemoteCommand::SetNetAdvancedPort.observed_primary_transport(),
             Some(ReolinkObservedTransportRequest {
                 op: ReolinkTransportOp::WritePortBundle,
-                payload_len: 304,
+                payload_len: 222,
             })
         );
         assert_eq!(
             ReolinkRemoteCommand::SetNetNormalPort.observed_primary_transport(),
             Some(ReolinkObservedTransportRequest {
                 op: ReolinkTransportOp::WritePortBundle,
-                payload_len: 310,
+                payload_len: 307,
             })
         );
         assert_eq!(
@@ -2397,7 +2466,10 @@ mod tests {
         );
         assert_eq!(
             ReolinkRemoteCommand::SetP2PCfg.observed_apply_transport(),
-            None
+            Some(ReolinkObservedTransportRequest {
+                op: ReolinkTransportOp::ApplyConfig,
+                payload_len: 125,
+            })
         );
         assert_eq!(
             ReolinkRemoteCommand::GetLoginAuthCode.observed_primary_transport(),
@@ -2414,11 +2486,18 @@ mod tests {
             ReolinkRemoteCommand::GetNetAdvancedPort.observed_transport_ops(),
             Some(
                 &[
+                    ReolinkTransportOp::Handshake,
+                    ReolinkTransportOp::Handshake,
+                    ReolinkTransportOp::Login,
+                    ReolinkTransportOp::SessionBind,
+                    ReolinkTransportOp::ChannelReady,
+                    ReolinkTransportOp::CommonAck,
                     ReolinkTransportOp::CommonReadA,
                     ReolinkTransportOp::CommonReadB,
                     ReolinkTransportOp::CommonReadC,
-                    ReolinkTransportOp::ReadPortBundle,
                     ReolinkTransportOp::Telemetry,
+                    ReolinkTransportOp::ApplyConfig,
+                    ReolinkTransportOp::ReadPortBundle,
                 ][..]
             )
         );
@@ -2426,11 +2505,19 @@ mod tests {
             ReolinkRemoteCommand::SetNetAdvancedPort.observed_transport_ops(),
             Some(
                 &[
+                    ReolinkTransportOp::Handshake,
+                    ReolinkTransportOp::Handshake,
+                    ReolinkTransportOp::Login,
+                    ReolinkTransportOp::SessionBind,
+                    ReolinkTransportOp::ChannelReady,
+                    ReolinkTransportOp::CommonAck,
                     ReolinkTransportOp::CommonReadA,
                     ReolinkTransportOp::CommonReadB,
                     ReolinkTransportOp::CommonReadC,
-                    ReolinkTransportOp::WritePortBundle,
                     ReolinkTransportOp::Telemetry,
+                    ReolinkTransportOp::ApplyConfig,
+                    ReolinkTransportOp::ReadPortBundle,
+                    ReolinkTransportOp::WritePortBundle,
                 ][..]
             )
         );
@@ -2438,11 +2525,18 @@ mod tests {
             ReolinkRemoteCommand::GetNetNormalPort.observed_transport_ops(),
             Some(
                 &[
+                    ReolinkTransportOp::Handshake,
+                    ReolinkTransportOp::Handshake,
+                    ReolinkTransportOp::Login,
+                    ReolinkTransportOp::SessionBind,
+                    ReolinkTransportOp::ChannelReady,
+                    ReolinkTransportOp::CommonAck,
                     ReolinkTransportOp::CommonReadA,
                     ReolinkTransportOp::CommonReadB,
                     ReolinkTransportOp::CommonReadC,
-                    ReolinkTransportOp::ReadPortBundle,
                     ReolinkTransportOp::Telemetry,
+                    ReolinkTransportOp::ApplyConfig,
+                    ReolinkTransportOp::ReadPortBundle,
                 ][..]
             )
         );
@@ -2450,11 +2544,19 @@ mod tests {
             ReolinkRemoteCommand::SetNetNormalPort.observed_transport_ops(),
             Some(
                 &[
+                    ReolinkTransportOp::Handshake,
+                    ReolinkTransportOp::Handshake,
+                    ReolinkTransportOp::Login,
+                    ReolinkTransportOp::SessionBind,
+                    ReolinkTransportOp::ChannelReady,
+                    ReolinkTransportOp::CommonAck,
                     ReolinkTransportOp::CommonReadA,
                     ReolinkTransportOp::CommonReadB,
                     ReolinkTransportOp::CommonReadC,
-                    ReolinkTransportOp::WritePortBundle,
                     ReolinkTransportOp::Telemetry,
+                    ReolinkTransportOp::ApplyConfig,
+                    ReolinkTransportOp::ReadPortBundle,
+                    ReolinkTransportOp::WritePortBundle,
                 ][..]
             )
         );
@@ -2462,11 +2564,18 @@ mod tests {
             ReolinkRemoteCommand::ForceUserPassword.observed_transport_ops(),
             Some(
                 &[
+                    ReolinkTransportOp::Handshake,
+                    ReolinkTransportOp::Handshake,
+                    ReolinkTransportOp::Login,
+                    ReolinkTransportOp::SessionBind,
+                    ReolinkTransportOp::ChannelReady,
+                    ReolinkTransportOp::CommonAck,
                     ReolinkTransportOp::CommonReadA,
                     ReolinkTransportOp::CommonReadB,
                     ReolinkTransportOp::CommonReadC,
-                    ReolinkTransportOp::ForceUserPassword,
                     ReolinkTransportOp::Telemetry,
+                    ReolinkTransportOp::ApplyConfig,
+                    ReolinkTransportOp::ForceUserPassword,
                 ][..]
             )
         );
@@ -2474,11 +2583,18 @@ mod tests {
             ReolinkRemoteCommand::GetP2PCfg.observed_transport_ops(),
             Some(
                 &[
+                    ReolinkTransportOp::Handshake,
+                    ReolinkTransportOp::Handshake,
+                    ReolinkTransportOp::Login,
+                    ReolinkTransportOp::SessionBind,
+                    ReolinkTransportOp::ChannelReady,
+                    ReolinkTransportOp::CommonAck,
                     ReolinkTransportOp::CommonReadA,
                     ReolinkTransportOp::CommonReadB,
                     ReolinkTransportOp::CommonReadC,
-                    ReolinkTransportOp::ReadP2P,
                     ReolinkTransportOp::Telemetry,
+                    ReolinkTransportOp::ApplyConfig,
+                    ReolinkTransportOp::ReadP2P,
                 ][..]
             )
         );
@@ -2486,11 +2602,19 @@ mod tests {
             ReolinkRemoteCommand::GetBootPwdState.observed_transport_ops(),
             Some(
                 &[
+                    ReolinkTransportOp::Handshake,
+                    ReolinkTransportOp::Handshake,
+                    ReolinkTransportOp::Login,
+                    ReolinkTransportOp::SessionBind,
+                    ReolinkTransportOp::ChannelReady,
+                    ReolinkTransportOp::CommonAck,
                     ReolinkTransportOp::CommonReadA,
                     ReolinkTransportOp::CommonReadB,
                     ReolinkTransportOp::CommonReadC,
-                    ReolinkTransportOp::ReadBootPwdState,
                     ReolinkTransportOp::Telemetry,
+                    ReolinkTransportOp::ApplyConfig,
+                    ReolinkTransportOp::ReadBootPwdState,
+                    ReolinkTransportOp::AsyncStatus,
                 ][..]
             )
         );
@@ -2510,11 +2634,19 @@ mod tests {
             ReolinkRemoteCommand::SetP2PCfg.observed_transport_ops(),
             Some(
                 &[
+                    ReolinkTransportOp::Handshake,
+                    ReolinkTransportOp::Handshake,
+                    ReolinkTransportOp::Login,
+                    ReolinkTransportOp::SessionBind,
+                    ReolinkTransportOp::ChannelReady,
+                    ReolinkTransportOp::CommonAck,
                     ReolinkTransportOp::CommonReadA,
                     ReolinkTransportOp::CommonReadB,
                     ReolinkTransportOp::CommonReadC,
-                    ReolinkTransportOp::WriteP2P,
                     ReolinkTransportOp::Telemetry,
+                    ReolinkTransportOp::ApplyConfig,
+                    ReolinkTransportOp::ReadP2P,
+                    ReolinkTransportOp::WriteP2P,
                 ][..]
             )
         );
