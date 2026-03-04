@@ -18,6 +18,7 @@
 - [x] reconnect/backoff policy with bounded retries and observability
 - [ ] ingest validation on target camera matrix
 - [x] service metrics publication in swarm records
+- [x] Reolink DHCP bootstrap + proprietary discovery + standards-readiness probe
 
 ## Iteration 3: Web/Gateway Convergence
 - [ ] exact identity/device auth parity with `constitute` + `constitute-gateway`
@@ -29,5 +30,6 @@
 - [ ] signed release artifact update path (replace source-build updater default)
 - [ ] hardware-backed key options and sealed secret handling
 - [ ] vendor-specific P2P disable automation hooks (where camera APIs allow)
+- [ ] Reolink `9000` control-plane reversal for zero-manual RTSP/ONVIF/P2P toggles
 - [ ] full operator runbooks for fedora lab + vps deployment profiles
 

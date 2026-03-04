@@ -75,14 +75,8 @@ impl RecorderManager {
             Some(tokio::spawn(async move {
                 if let Err(err) = record_loop(storage_root, camera, Arc::clone(&state_ref)).await {
                     warn!(error = %err, source = %source_id, "camera recorder exited");
-                    update_state(
-                        &state_ref,
-                        "failed",
-                        0,
-                        String::from(err.to_string()),
-                        None,
-                    )
-                    .await;
+                    update_state(&state_ref, "failed", 0, String::from(err.to_string()), None)
+                        .await;
                 }
             }))
         } else {
@@ -90,13 +84,7 @@ impl RecorderManager {
         };
 
         let mut guard = self.inner.lock().await;
-        guard.insert(
-            cam.source_id.clone(),
-            RuntimeEntry {
-                state,
-                handle,
-            },
-        );
+        guard.insert(cam.source_id.clone(), RuntimeEntry { state, handle });
     }
 
     pub async fn remove_camera(&self, source_id: &str) -> bool {

@@ -11,6 +11,7 @@ It runs as a Fedora/Linux service, joins swarm as `role=native` with `service=nv
 - swarm-native UDP presence announcements with UI module advertisement + service metrics
 - identity-gated websocket session with ECDH + symmetric payload channel (`list_source_states`, `upsert_source`, `remove_source`)
 - systemd self-update timer flow
+- Reolink native onboarding (temporary DHCP lease, proprietary LAN discovery, native HTTP CGI bootstrap for uninitialized devices, RTSP/ONVIF enable + P2P disable, standards-readiness probe)
 
 ## Quick Install (Opinionated Wizard)
 
@@ -35,7 +36,8 @@ Wizard behavior:
 - `swarm.bind`, `swarm.peers`, `swarm.zones`
 - `api.identity_id`, `api.authorized_device_pks`, `api.public_ws_url`
 - `storage.root`, `storage.encryption_key_hex`
-- `update.interval_secs`\n- `ui.repo`, `ui.ref`, `ui.manifest_url`, `ui.entry`
+- `update.interval_secs`
+- `ui.repo`, `ui.ref`, `ui.manifest_url`, `ui.entry`
 - `cameras[]` ONVIF/RTSP source definitions
 
 ## Security Model (Current)
@@ -53,6 +55,11 @@ Wizard behavior:
 cargo test
 cargo run -- --config ./config.json --once
 cargo run -- --config ./config.json --discover-onvif
+cargo run -- --discover-reolink --discover-reolink-hint-ip 192.168.1.20
+cargo run -- --probe-reolink-ip 192.168.1.20
+cargo run -- --setup-reolink-ip 192.168.1.20 --setup-reolink-password test1234
+cargo run -- --setup-reolink-ip 192.168.1.20 --setup-reolink-password test1234 --setup-reolink-generate-password
+sudo cargo run -- --bootstrap-reolink-server-ip 192.168.1.10 --bootstrap-reolink-target-mac EC:71:DB:32:0A:8F --setup-reolink-generate-password
 ```
 
 ## Docs

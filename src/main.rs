@@ -3,6 +3,10 @@ mod camera;
 mod config;
 mod crypto;
 mod nostr;
+mod reolink;
+mod reolink_cgi;
+#[allow(dead_code)]
+mod reolink_proto;
 mod storage;
 mod swarm;
 mod update;
@@ -29,12 +33,123 @@ struct Args {
     once: bool,
     #[arg(long)]
     discover_onvif: bool,
+    #[arg(long)]
+    discover_reolink: bool,
+    #[arg(long)]
+    discover_reolink_hint_ip: Option<String>,
+    #[arg(long)]
+    probe_reolink_ip: Option<String>,
+    #[arg(long)]
+    setup_reolink_ip: Option<String>,
+    #[arg(long, default_value = "admin")]
+    setup_reolink_username: String,
+    #[arg(long)]
+    setup_reolink_password: Option<String>,
+    #[arg(long)]
+    setup_reolink_desired_password: Option<String>,
+    #[arg(long)]
+    setup_reolink_generate_password: bool,
+    #[arg(long)]
+    bootstrap_reolink_server_ip: Option<String>,
+    #[arg(long, default_value = "192.168.1.20")]
+    bootstrap_reolink_lease_ip: String,
+    #[arg(long)]
+    bootstrap_reolink_target_mac: Option<String>,
+    #[arg(long, default_value_t = 20)]
+    bootstrap_reolink_timeout_secs: u64,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     init_logging(&args.log_level);
+
+    if args.discover_onvif {
+        let discovered = camera::discover_onvif(3).await?;
+        println!("{}", serde_json::to_string_pretty(&discovered)?);
+        return Ok(());
+    }
+
+    if args.discover_reolink {
+        let discovered = if let Some(hint) = &args.discover_reolink_hint_ip {
+            reolink::discover_with_hint(hint, 3).await?
+        } else {
+            reolink::discover(3).await?
+        };
+        println!("{}", serde_json::to_string_pretty(&discovered)?);
+        return Ok(());
+    }
+
+    if let Some(ip) = &args.probe_reolink_ip {
+        let probe = reolink::probe(ip, 3).await?;
+        println!("{}", serde_json::to_string_pretty(&probe)?);
+        return Ok(());
+    }
+
+    if let Some(ip) = &args.setup_reolink_ip {
+        let result = reolink::setup(reolink::ReolinkSetupRequest {
+            ip: ip.clone(),
+            username: args.setup_reolink_username.clone(),
+            password: args.setup_reolink_password.clone().unwrap_or_default(),
+            desired_password: args
+                .setup_reolink_desired_password
+                .clone()
+                .unwrap_or_default(),
+            generate_password: args.setup_reolink_generate_password,
+            normal: None,
+            advanced: None,
+            p2p: None,
+        })
+        .await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    if let Some(server_ip) = &args.bootstrap_reolink_server_ip {
+        let bootstrap = reolink::bootstrap(reolink::ReolinkBootstrapRequest {
+            server_ip: server_ip.clone(),
+            lease_ip: args.bootstrap_reolink_lease_ip.clone(),
+            target_mac: args
+                .bootstrap_reolink_target_mac
+                .clone()
+                .unwrap_or_default(),
+            timeout_secs: args.bootstrap_reolink_timeout_secs,
+            subnet_mask: "255.255.255.0".to_string(),
+            router_ip: String::new(),
+            dns_ip: String::new(),
+        })
+        .await?;
+
+        let should_setup = args.setup_reolink_password.is_some()
+            || args.setup_reolink_desired_password.is_some()
+            || args.setup_reolink_generate_password;
+        if should_setup {
+            let setup = reolink::setup(reolink::ReolinkSetupRequest {
+                ip: bootstrap.assigned_ip.clone(),
+                username: args.setup_reolink_username.clone(),
+                password: args.setup_reolink_password.clone().unwrap_or_default(),
+                desired_password: args
+                    .setup_reolink_desired_password
+                    .clone()
+                    .unwrap_or_default(),
+                generate_password: args.setup_reolink_generate_password,
+                normal: None,
+                advanced: None,
+                p2p: None,
+            })
+            .await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "bootstrap": bootstrap,
+                    "setup": setup,
+                }))?
+            );
+        } else {
+            println!("{}", serde_json::to_string_pretty(&bootstrap)?);
+        }
+        return Ok(());
+    }
 
     let cfg_path = args
         .config
@@ -56,12 +171,6 @@ async fn main() -> Result<()> {
         storage::StorageManager::new(cfg.storage_root(), &cfg.storage.encryption_key_hex)?;
     storage.ensure_dirs().await?;
     storage.start_encryptor(cfg.storage.encrypt_interval_secs);
-
-    if args.discover_onvif {
-        let discovered = camera::discover_onvif(3).await?;
-        println!("{}", serde_json::to_string_pretty(&discovered)?);
-        return Ok(());
-    }
 
     let recorder = camera::RecorderManager::new();
     recorder.ensure_started(&cfg).await;
@@ -108,4 +217,3 @@ fn init_logging(level: &str) {
         .compact()
         .init();
 }
-

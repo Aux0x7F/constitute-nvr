@@ -37,13 +37,27 @@ Critical fields before ingest:
 constitute-nvr --config /etc/constitute-nvr/config.json --discover-onvif
 ```
 
-## 5) Health Endpoint
+## 5) Reolink First-Boot Bootstrap (Camera Jail / No DHCP LAN)
+Use this only for first-boot cameras that request DHCP but do not yet expose RTSP/ONVIF.
+
+```bash
+sudo constitute-nvr --bootstrap-reolink-server-ip 192.168.1.10 --bootstrap-reolink-lease-ip 192.168.1.20 --bootstrap-reolink-target-mac EC:71:DB:32:0A:8F
+constitute-nvr --discover-reolink --discover-reolink-hint-ip 192.168.1.20
+constitute-nvr --probe-reolink-ip 192.168.1.20
+```
+
+Notes:
+- Binding UDP/67 generally requires root or `CAP_NET_BIND_SERVICE`.
+- Current automation covers lease + vendor discovery + standards readiness checks.
+- The proprietary `9000` control plane is still required for fully automatic RTSP/ONVIF/P2P toggles.
+
+## 6) Health Endpoint
 
 ```bash
 curl -s http://127.0.0.1:8456/health | jq .
 ```
 
-## 6) Camera Hardening Script
+## 7) Camera Hardening Script
 Audit-only:
 
 ```bash
@@ -63,7 +77,7 @@ Expected effect:
 - camera NIC zone target `DROP`
 - host egress on camera NIC restricted to ONVIF/RTSP (+ optional WS-Discovery, optional NTP)
 
-## 7) Manual Session Protocol Test (Identity-bound)
+## 8) Manual Session Protocol Test (Identity-bound)
 Connect websocket to `/session` and perform:
 1. plaintext `hello`
 2. receive `hello_ack`
@@ -75,7 +89,7 @@ Use the configured values:
 - `api.identity_secret_hex`
 - `api.server_secret_hex`
 
-## 8) Self-Update
+## 9) Self-Update
 Manual run:
 
 ```bash

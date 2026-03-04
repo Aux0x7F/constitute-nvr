@@ -52,6 +52,18 @@ Carries signed Nostr event payloads for:
   - `starting` -> `running` -> `backoff` -> retry
   - terminal `failed` on non-recoverable runtime failures (e.g., `ffmpeg` missing)
 
+## Reolink Bootstrap (Current)
+- temporary DHCP lease responder on UDP/67 for first-boot cameras that only request DHCP
+- proprietary LAN discovery probe: UDP broadcast `aaaa0000` to port `2000`, replies observed from camera `2000 -> client 3000`
+- readiness probe checks:
+  - proprietary control port `9000`
+  - RTSP port `554`
+  - ONVIF service port `8000`
+- standards-ready means:
+  - `554/tcp` open
+  - `8000/tcp` open
+  - ONVIF XAddr resolves to `http://<ip>:8000/onvif/device_service`
+
 ## Session Negotiation (`/session`)
 
 ### 1) Client hello (plaintext frame)
@@ -104,6 +116,9 @@ Session key derivation:
 - `list_sources`
 - `list_source_states`
 - `discover_onvif`
+- `discover_reolink`
+- `probe_reolink` (`ip`)
+- `bootstrap_reolink` (`request`)
 - `upsert_source` (source definition)
 - `remove_source` (`sourceId`)
 - `list_segments` (`sourceId`, `limit`)

@@ -2,6 +2,7 @@ use crate::camera;
 use crate::camera::RecorderManager;
 use crate::config::{CameraConfig, Config};
 use crate::crypto;
+use crate::reolink;
 use crate::storage::StorageManager;
 use crate::util;
 use anyhow::{Result, anyhow};
@@ -112,6 +113,22 @@ enum ClientCommand {
     ListSources,
     ListSourceStates,
     DiscoverOnvif,
+    DiscoverReolink,
+    ProbeReolink {
+        ip: String,
+    },
+    ReadReolinkState {
+        request: reolink::ReolinkConnectRequest,
+    },
+    ApplyReolinkState {
+        request: reolink::ReolinkStateApplyRequest,
+    },
+    SetupReolink {
+        request: reolink::ReolinkSetupRequest,
+    },
+    BootstrapReolink {
+        request: reolink::ReolinkBootstrapRequest,
+    },
     UpsertSource {
         source: SourceUpsert,
     },
@@ -408,6 +425,84 @@ async fn handle_command(
                     "ok": true,
                     "cmd": "discover_onvif",
                     "cameras": found,
+                }),
+            )
+            .await?;
+        }
+        ClientCommand::DiscoverReolink => {
+            let found = reolink::discover(3).await?;
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "discover_reolink",
+                    "devices": found,
+                }),
+            )
+            .await?;
+        }
+        ClientCommand::ProbeReolink { ip } => {
+            let result = reolink::probe(&ip, 3).await?;
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "probe_reolink",
+                    "result": result,
+                }),
+            )
+            .await?;
+        }
+        ClientCommand::ReadReolinkState { request } => {
+            let result = reolink::read_state(request).await?;
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "read_reolink_state",
+                    "result": result,
+                }),
+            )
+            .await?;
+        }
+        ClientCommand::ApplyReolinkState { request } => {
+            let result = reolink::apply_state(request).await?;
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "apply_reolink_state",
+                    "result": result,
+                }),
+            )
+            .await?;
+        }
+        ClientCommand::SetupReolink { request } => {
+            let result = reolink::setup(request).await?;
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "setup_reolink",
+                    "result": result,
+                }),
+            )
+            .await?;
+        }
+        ClientCommand::BootstrapReolink { request } => {
+            let result = reolink::bootstrap(request).await?;
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "bootstrap_reolink",
+                    "result": result,
                 }),
             )
             .await?;
