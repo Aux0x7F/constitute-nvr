@@ -14,10 +14,11 @@
 - [x] encrypted segment-at-rest storage pass
 
 ## Iteration 2: Ingest Reliability
-- [ ] ONVIF source lifecycle (register/update/remove) with explicit state machine
-- [ ] reconnect/backoff policy with bounded retries and observability
+- [x] ONVIF source lifecycle (register/update/remove) with explicit state machine
+- [x] reconnect/backoff policy with bounded retries and observability
 - [ ] ingest validation on target camera matrix
-- [ ] service metrics publication in swarm records
+- [x] service metrics publication in swarm records
+- [x] Reolink DHCP bootstrap + proprietary discovery + standards-readiness probe
 
 ## Iteration 3: Web/Gateway Convergence
 - [ ] exact identity/device auth parity with `constitute` + `constitute-gateway`
@@ -26,7 +27,10 @@
 - [ ] zone routing and discovery resilience test matrix
 
 ## Iteration 4: Productionization
-- [ ] signed release artifact update path (replace source-build updater default)
+- [ ] signed/provenance verification for release artifacts (beyond SHA256 file checks)
+- [x] GitHub release artifact update path with SHA256 verification (source-build path no longer default)
 - [ ] hardware-backed key options and sealed secret handling
 - [ ] vendor-specific P2P disable automation hooks (where camera APIs allow)
+- [ ] Reolink `9000` control-plane reversal for zero-manual RTSP/ONVIF/P2P toggles
 - [ ] full operator runbooks for fedora lab + vps deployment profiles
+

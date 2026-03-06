@@ -6,10 +6,15 @@ Define the active contract surface for `constitute-nvr` POC integration.
 ## Service Identity
 - runtime role: `native`
 - service capability: `nvr`
-- swarm records include:
+- swarm device record includes:
   - `role`
   - `service`
   - `serviceVersion`
+  - `ingestProtocols` (`onvif`, `rtsp`)
+  - `capabilities` (`camera`)
+  - UI module hints (`uiRepo`, `uiRef`, optional `uiManifestUrl`, `uiEntry`)
+  - optional `sessionWsUrl`
+  - live service metrics (`uptimeSec`, peer counts, camera counts)
 
 ## Swarm Transport (Native)
 - channel: UDP
@@ -35,11 +40,31 @@ Define the active contract surface for `constitute-nvr` POC integration.
 Carries signed Nostr event payloads for:
 - device discovery (`kind=30078`, `t=swarm_discovery`, `type=device`, `role=native`, `service=nvr`)
 - zone presence (`kind=1`, `t=constitute`, `z=<zone>`)
+- optional install enrollment signal (`record_type=signal`, payload `type=pair_request`) when `pair_identity_label` + `pair_code_hash` are configured
 
-## ONVIF Discovery
+## ONVIF Discovery + Source Lifecycle
 - WS-Discovery probe to `239.255.255.250:3702`
 - ONVIF endpoint extraction from `XAddrs`
-- command surface supports discovery trigger from authenticated session
+- source lifecycle command surface:
+  - `upsert_source`
+  - `remove_source`
+  - `list_source_states`
+  - `setup_reolink` (successful setup also auto-upserts/starts a source)
+- recorder state machine:
+  - `starting` -> `running` -> `backoff` -> retry
+  - terminal `failed` on non-recoverable runtime failures (e.g., `ffmpeg` missing)
+
+## Reolink Bootstrap (Current)
+- temporary DHCP lease responder on UDP/67 for first-boot cameras that only request DHCP
+- proprietary LAN discovery probe: UDP broadcast `aaaa0000` to port `2000`, replies observed from camera `2000 -> client 3000`
+- readiness probe checks:
+  - proprietary control port `9000`
+  - RTSP port `554`
+  - ONVIF service port `8000`
+- standards-ready means:
+  - `554/tcp` open
+  - `8000/tcp` open
+  - ONVIF XAddr resolves to `http://<ip>:8000/onvif/device_service`
 
 ## Session Negotiation (`/session`)
 
@@ -91,7 +116,16 @@ Session key derivation:
 
 ## Encrypted Commands
 - `list_sources`
+- `list_source_states`
 - `discover_onvif`
+- `discover_reolink`
+- `probe_reolink` (`ip`)
+- `read_reolink_state` (`request`)
+- `apply_reolink_state` (`request`)
+- `setup_reolink` (`request`)
+- `bootstrap_reolink` (`request`)
+- `upsert_source` (source definition)
+- `remove_source` (`sourceId`)
 - `list_segments` (`sourceId`, `limit`)
 - `get_segment` (`sourceId`, `name`)
 

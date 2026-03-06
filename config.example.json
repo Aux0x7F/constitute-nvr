@@ -3,8 +3,8 @@
   "node_role": "native",
   "device_label": "Constitute NVR",
   "service_version": "0.1.0",
-  "nostr_pubkey": "",
-  "nostr_sk_hex": "",
+  "nostr_pubkey": "650ebf57f24bcbf7f4e0da11a48943e26a82377146343a3797c2e5356c04b00c",
+  "nostr_sk_hex": "9f09c1a637549ad6b9023c1e88971dc26cf8c771aad4d15a4997d310f6315197",
   "swarm": {
     "bind": "0.0.0.0:4050",
     "peers": [
@@ -21,14 +21,16 @@
   },
   "api": {
     "bind": "0.0.0.0:8456",
+    "public_ws_url": "wss://replace-host:8456/session",
     "identity_id": "REPLACE_WITH_IDENTITY_ID",
     "authorized_device_pks": [],
-    "identity_secret_hex": "",
-    "server_secret_hex": ""
+    "allow_unsigned_hello_mvp": true,
+    "identity_secret_hex": "2c80e2f0b8c3fbdd550a47cc4bb7151c9f62d721587b768522089363da071133",
+    "server_secret_hex": "2130dde3d606451764e5151283327478461548e28d12c1462562a628fb665588"
   },
   "storage": {
     "root": "/mnt/REPLACE_WITH_STORAGE_MOUNT/constitute-nvr",
-    "encryption_key_hex": "",
+    "encryption_key_hex": "c402bbf460a252bc1e741795a7b3036d34c7fceedc9f189d1ae7e7aa873d54ac",
     "encrypt_interval_secs": 5
   },
   "update": {
@@ -37,6 +39,12 @@
     "source_dir": "/opt/constitute-nvr-src",
     "branch": "main",
     "script_path": "/usr/local/bin/constitute-nvr-self-update"
+  },
+  "ui": {
+    "repo": "Aux0x7F/constitute-nvr-ui",
+    "ref": "main",
+    "manifest_url": "https://raw.githubusercontent.com/Aux0x7F/constitute-nvr-ui/main/app.manifest.json",
+    "entry": "dist/index.html"
   },
   "cameras": [
     {
@@ -50,5 +58,19 @@
       "enabled": true,
       "segment_secs": 10
     }
-  ]
+  ],
+  "autoprovision": {
+    "reolink_enabled": false,
+    "reolink_username": "admin",
+    "reolink_password": "",
+    "reolink_desired_password": "",
+    "reolink_generate_password": false,
+    "reolink_discover_timeout_secs": 3,
+    "reolink_hint_ip": ""
+  },
+  "pair_identity_label": "",
+  "pair_code": "",
+  "pair_code_hash": "",
+  "pair_request_interval_secs": 15,
+  "pair_request_attempts": 24
 }

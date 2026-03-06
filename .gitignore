@@ -11,3 +11,7 @@
 Thumbs.db
 .vscode/
 .idea/
+p2pc_mem.txt
+
+# Local reverse-engineering workspace
+/scripts/windows/reolink-sdk-bridge.cjs

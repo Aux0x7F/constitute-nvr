@@ -9,9 +9,15 @@
 - Recommended status: test candidate
 
 ### Reolink E1 Outdoor SE PoE Pan Cam
-- ONVIF port surfaced in probe observations: yes
-- Reolink cloud/P2P endpoint behavior observed: yes (expected vendor default)
-- RTSP ingest path: pending lab validation in this repo
+- First boot requires DHCP lease before the camera exposes an address
+- Proprietary LAN discovery observed on UDP `2000/3000`
+- Proprietary control plane observed on TCP `9000`
+- Native HTTP CGI control plane observed at `http://<ip>:80/cgi-bin/api.cgi`
+- ONVIF service observed at `http://<ip>:8000/onvif/device_service` after native enablement
+- RTSP port observed on `554/tcp` after native enablement
+- Reolink cloud/P2P endpoint behavior observed: yes (`p2p.reolink.com`, `devices-apis.reolink.com`)
+- RTSP ingest path: pending sustained validation in this repo
+- Current automation status: native DHCP bootstrap is implemented; configured-camera control can fall back to native CGI for ports/P2P, but first-boot provisioning still depends on the proprietary 9000 path and remains the blocking native-Rust gap
 - Recommended status: test candidate with camera-jail policy enabled
 
 ## Validation Gates

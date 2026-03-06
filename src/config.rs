@@ -30,9 +30,13 @@ pub struct SwarmConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApiConfig {
     pub bind: String,
+    #[serde(default)]
+    pub public_ws_url: String,
     pub identity_id: String,
     #[serde(default)]
     pub authorized_device_pks: Vec<String>,
+    #[serde(default)]
+    pub allow_unsigned_hello_mvp: bool,
     pub identity_secret_hex: String,
     pub server_secret_hex: String,
 }
@@ -60,6 +64,38 @@ pub struct UpdateConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AutoProvisionConfig {
+    #[serde(default)]
+    pub reolink_enabled: bool,
+    #[serde(default = "default_reolink_username")]
+    pub reolink_username: String,
+    #[serde(default)]
+    pub reolink_password: String,
+    #[serde(default)]
+    pub reolink_desired_password: String,
+    #[serde(default)]
+    pub reolink_generate_password: bool,
+    #[serde(default = "default_reolink_discover_timeout_secs")]
+    pub reolink_discover_timeout_secs: u64,
+    #[serde(default)]
+    pub reolink_hint_ip: String,
+}
+
+impl Default for AutoProvisionConfig {
+    fn default() -> Self {
+        Self {
+            reolink_enabled: false,
+            reolink_username: default_reolink_username(),
+            reolink_password: String::new(),
+            reolink_desired_password: String::new(),
+            reolink_generate_password: false,
+            reolink_discover_timeout_secs: default_reolink_discover_timeout_secs(),
+            reolink_hint_ip: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CameraConfig {
     pub source_id: String,
     pub name: String,
@@ -78,6 +114,29 @@ pub struct CameraConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UiModuleConfig {
+    #[serde(default = "default_ui_repo")]
+    pub repo: String,
+    #[serde(rename = "ref", default = "default_ui_ref")]
+    pub repo_ref: String,
+    #[serde(default)]
+    pub manifest_url: String,
+    #[serde(default = "default_ui_entry")]
+    pub entry: String,
+}
+
+impl Default for UiModuleConfig {
+    fn default() -> Self {
+        Self {
+            repo: default_ui_repo(),
+            repo_ref: default_ui_ref(),
+            manifest_url: String::new(),
+            entry: default_ui_entry(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub node_id: String,
     #[serde(default = "default_node_role")]
@@ -91,6 +150,20 @@ pub struct Config {
     pub api: ApiConfig,
     pub storage: StorageConfig,
     pub update: UpdateConfig,
+    #[serde(default)]
+    pub pair_identity_label: String,
+    #[serde(default)]
+    pub pair_code: String,
+    #[serde(default)]
+    pub pair_code_hash: String,
+    #[serde(default = "default_pair_request_interval_secs")]
+    pub pair_request_interval_secs: u64,
+    #[serde(default = "default_pair_request_attempts")]
+    pub pair_request_attempts: u32,
+    #[serde(default)]
+    pub ui: UiModuleConfig,
+    #[serde(default)]
+    pub autoprovision: AutoProvisionConfig,
     #[serde(default)]
     pub cameras: Vec<CameraConfig>,
 }
@@ -178,11 +251,53 @@ impl Config {
             changed = true;
         }
 
+        if self.ui.repo.trim().is_empty() {
+            self.ui.repo = default_ui_repo();
+            changed = true;
+        }
+
+        if self.ui.repo_ref.trim().is_empty() {
+            self.ui.repo_ref = default_ui_ref();
+            changed = true;
+        }
+
+        if self.ui.entry.trim().is_empty() {
+            self.ui.entry = default_ui_entry();
+            changed = true;
+        }
+
+        if self.ui.manifest_url.trim().is_empty() {
+            if let Some(url) = derive_manifest_url(&self.ui.repo, &self.ui.repo_ref) {
+                self.ui.manifest_url = url;
+                changed = true;
+            }
+        }
+
+        if self.autoprovision.reolink_username.trim().is_empty() {
+            self.autoprovision.reolink_username = default_reolink_username();
+            changed = true;
+        }
+
+        if self.autoprovision.reolink_discover_timeout_secs == 0 {
+            self.autoprovision.reolink_discover_timeout_secs = default_reolink_discover_timeout_secs();
+            changed = true;
+        }
+
         if self.swarm.zones.is_empty() {
             self.swarm.zones.push(ZoneConfig {
                 key: short_hex(10),
                 name: "Default Zone".to_string(),
             });
+            changed = true;
+        }
+
+        if self.pair_request_interval_secs == 0 {
+            self.pair_request_interval_secs = default_pair_request_interval_secs();
+            changed = true;
+        }
+
+        if self.pair_request_attempts == 0 {
+            self.pair_request_attempts = default_pair_request_attempts();
             changed = true;
         }
 
@@ -214,8 +329,10 @@ impl Config {
             },
             api: ApiConfig {
                 bind: "0.0.0.0:8456".to_string(),
+                public_ws_url: String::new(),
                 identity_id: "REPLACE_WITH_IDENTITY_ID".to_string(),
                 authorized_device_pks: Vec::new(),
+                allow_unsigned_hello_mvp: false,
                 identity_secret_hex: random_hex(32),
                 server_secret_hex: random_hex(32),
             },
@@ -231,6 +348,13 @@ impl Config {
                 branch: default_update_branch(),
                 script_path: default_update_script(),
             },
+            pair_identity_label: String::new(),
+            pair_code: String::new(),
+            pair_code_hash: String::new(),
+            pair_request_interval_secs: default_pair_request_interval_secs(),
+            pair_request_attempts: default_pair_request_attempts(),
+            ui: UiModuleConfig::default(),
+            autoprovision: AutoProvisionConfig::default(),
             cameras: Vec::new(),
         }
     }
@@ -264,6 +388,14 @@ fn default_onvif_port() -> u16 {
     80
 }
 
+fn default_reolink_username() -> String {
+    "admin".to_string()
+}
+
+fn default_reolink_discover_timeout_secs() -> u64 {
+    3
+}
+
 fn default_update_enabled() -> bool {
     true
 }
@@ -282,6 +414,50 @@ fn default_update_branch() -> String {
 
 fn default_update_script() -> String {
     "/usr/local/bin/constitute-nvr-self-update".to_string()
+}
+
+fn default_pair_request_interval_secs() -> u64 {
+    15
+}
+
+fn default_pair_request_attempts() -> u32 {
+    24
+}
+
+fn default_ui_repo() -> String {
+    "Aux0x7F/constitute-nvr-ui".to_string()
+}
+
+fn default_ui_ref() -> String {
+    "main".to_string()
+}
+
+fn default_ui_entry() -> String {
+    "dist/index.html".to_string()
+}
+
+fn derive_manifest_url(repo: &str, repo_ref: &str) -> Option<String> {
+    let trimmed = repo.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some((owner, name)) = trimmed.split_once('/') {
+        if owner.trim().is_empty() || name.trim().is_empty() {
+            return None;
+        }
+        let reference = if repo_ref.trim().is_empty() {
+            default_ui_ref()
+        } else {
+            repo_ref.trim().to_string()
+        };
+        return Some(format!(
+            "https://raw.githubusercontent.com/{}/{}/{}/app.manifest.json",
+            owner.trim(),
+            name.trim(),
+            reference
+        ));
+    }
+    None
 }
 
 fn random_hex(len: usize) -> String {
@@ -307,10 +483,37 @@ mod tests {
     }
 
     #[test]
+    fn default_config_has_ui_defaults() {
+        let cfg = Config::default_generated();
+        assert_eq!(cfg.ui.repo, "Aux0x7F/constitute-nvr-ui");
+        assert_eq!(cfg.ui.repo_ref, "main");
+        assert_eq!(cfg.ui.entry, "dist/index.html");
+    }
+
+    #[test]
     fn apply_defaults_populates_keys() {
         let mut cfg = Config::default_generated();
         cfg.nostr_pubkey.clear();
         cfg.apply_defaults();
         assert!(!cfg.nostr_pubkey.is_empty());
+    }
+
+    #[test]
+    fn apply_defaults_derives_manifest_url() {
+        let mut cfg = Config::default_generated();
+        cfg.ui.manifest_url.clear();
+        cfg.apply_defaults();
+        assert!(cfg.ui.manifest_url.contains("raw.githubusercontent.com"));
+        assert!(cfg.ui.manifest_url.ends_with("/app.manifest.json"));
+    }
+
+    #[test]
+    fn apply_defaults_sets_pair_enrollment_defaults() {
+        let mut cfg = Config::default_generated();
+        cfg.pair_request_interval_secs = 0;
+        cfg.pair_request_attempts = 0;
+        cfg.apply_defaults();
+        assert_eq!(cfg.pair_request_interval_secs, 15);
+        assert_eq!(cfg.pair_request_attempts, 24);
     }
 }

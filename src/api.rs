@@ -1,6 +1,8 @@
 use crate::camera;
-use crate::config::Config;
+use crate::camera::RecorderManager;
+use crate::config::{CameraConfig, Config};
 use crate::crypto;
+use crate::reolink;
 use crate::storage::StorageManager;
 use crate::util;
 use anyhow::{Result, anyhow};
@@ -13,19 +15,35 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+const INSECURE_HELLO_SECRET_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Clone)]
 pub struct ApiState {
-    pub cfg: Config,
+    pub cfg: Arc<Mutex<Config>>,
+    pub cfg_path: PathBuf,
     pub storage: StorageManager,
+    pub recorder: RecorderManager,
 }
 
-pub async fn run(cfg: Config, storage: StorageManager) -> Result<()> {
+pub async fn run(
+    cfg: Config,
+    cfg_path: PathBuf,
+    storage: StorageManager,
+    recorder: RecorderManager,
+) -> Result<()> {
     let bind = cfg.api.bind.clone();
-    let state = Arc::new(ApiState { cfg, storage });
+    let state = Arc::new(ApiState {
+        cfg: Arc::new(Mutex::new(cfg)),
+        cfg_path,
+        storage,
+        recorder,
+    });
 
     let app = Router::new()
         .route("/health", get(health))
@@ -40,13 +58,17 @@ pub async fn run(cfg: Config, storage: StorageManager) -> Result<()> {
 
 async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
     let sources = state.storage.list_sources().await.unwrap_or_default();
+    let runtime = state.recorder.list_states().await;
+    let cfg = state.cfg.lock().await.clone();
     Json(json!({
         "ok": true,
         "service": "nvr",
-        "version": state.cfg.service_version,
-        "nodeRole": state.cfg.node_role,
-        "identityId": state.cfg.api.identity_id,
+        "version": cfg.service_version,
+        "nodeRole": cfg.node_role,
+        "identityId": cfg.api.identity_id,
         "sources": sources,
+        "sourceRuntime": runtime,
+        "configuredSources": cfg.cameras.len(),
     }))
 }
 
@@ -91,7 +113,31 @@ struct CipherEnvelope {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum ClientCommand {
     ListSources,
+    ListSourceStates,
     DiscoverOnvif,
+    DiscoverReolink,
+    ProbeReolink {
+        ip: String,
+    },
+    ReadReolinkState {
+        request: reolink::ReolinkConnectRequest,
+    },
+    ApplyReolinkState {
+        request: reolink::ReolinkStateApplyRequest,
+    },
+    SetupReolink {
+        request: reolink::ReolinkSetupRequest,
+    },
+    BootstrapReolink {
+        request: reolink::ReolinkBootstrapRequest,
+    },
+    UpsertSource {
+        source: SourceUpsert,
+    },
+    RemoveSource {
+        #[serde(rename = "sourceId")]
+        source_id: String,
+    },
     ListSegments {
         #[serde(rename = "sourceId")]
         source_id: String,
@@ -102,6 +148,54 @@ enum ClientCommand {
         source_id: String,
         name: String,
     },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceUpsert {
+    source_id: String,
+    name: String,
+    onvif_host: String,
+    #[serde(default = "default_onvif_port")]
+    onvif_port: u16,
+    rtsp_url: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default = "default_segment_secs")]
+    segment_secs: u64,
+}
+
+impl SourceUpsert {
+    fn into_camera(self) -> Result<CameraConfig> {
+        if self.source_id.trim().is_empty() {
+            return Err(anyhow!("sourceId is required"));
+        }
+        if self.rtsp_url.trim().is_empty() {
+            return Err(anyhow!("rtsp_url is required"));
+        }
+        if self.onvif_host.trim().is_empty() {
+            return Err(anyhow!("onvif_host is required"));
+        }
+        Ok(CameraConfig {
+            source_id: self.source_id.trim().to_string(),
+            name: if self.name.trim().is_empty() {
+                self.source_id.trim().to_string()
+            } else {
+                self.name.trim().to_string()
+            },
+            onvif_host: self.onvif_host.trim().to_string(),
+            onvif_port: self.onvif_port,
+            rtsp_url: self.rtsp_url.trim().to_string(),
+            username: self.username,
+            password: self.password,
+            enabled: self.enabled,
+            segment_secs: self.segment_secs.max(2),
+        })
+    }
 }
 
 async fn handle_ws(mut socket: WebSocket, state: Arc<ApiState>) {
@@ -132,7 +226,9 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<ApiState>) {
         return;
     }
 
-    if let Err(err) = validate_hello(&state.cfg, &hello) {
+    let cfg_snapshot = state.cfg.lock().await.clone();
+
+    if let Err(err) = validate_hello(&cfg_snapshot, &hello) {
         let _ = socket
             .send(Message::Text(error_json(&err.to_string()).into()))
             .await;
@@ -143,12 +239,12 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<ApiState>) {
     let session_id = uuid::Uuid::new_v4().to_string();
     let context = format!(
         "constitute-nvr:{}:{}",
-        state.cfg.api.identity_id, session_id
+        cfg_snapshot.api.identity_id, session_id
     );
 
     let (session_key, server_key) = match crypto::derive_session_key(
-        &state.cfg.api.server_secret_hex,
-        &state.cfg.api.identity_secret_hex,
+        &cfg_snapshot.api.server_secret_hex,
+        session_identity_secret_hex(&cfg_snapshot),
         &hello.client_key,
         &context,
     ) {
@@ -273,6 +369,10 @@ fn validate_hello(cfg: &Config, hello: &HelloReq) -> Result<()> {
         return Err(anyhow!("hello timestamp outside allowed skew"));
     }
 
+    if cfg.api.allow_unsigned_hello_mvp {
+        return Ok(());
+    }
+
     let proof_ok = crypto::verify_hello_proof(
         &cfg.api.identity_secret_hex,
         &hello.identity_id,
@@ -287,6 +387,14 @@ fn validate_hello(cfg: &Config, hello: &HelloReq) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn session_identity_secret_hex(cfg: &Config) -> &str {
+    if cfg.api.allow_unsigned_hello_mvp {
+        INSECURE_HELLO_SECRET_HEX
+    } else {
+        &cfg.api.identity_secret_hex
+    }
 }
 
 async fn handle_command(
@@ -309,6 +417,19 @@ async fn handle_command(
             )
             .await?;
         }
+        ClientCommand::ListSourceStates => {
+            let runtime = state.recorder.list_states().await;
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "list_source_states",
+                    "states": runtime,
+                }),
+            )
+            .await?;
+        }
         ClientCommand::DiscoverOnvif => {
             let found = camera::discover_onvif(3).await?;
             send_cipher_json(
@@ -318,6 +439,191 @@ async fn handle_command(
                     "ok": true,
                     "cmd": "discover_onvif",
                     "cameras": found,
+                }),
+            )
+            .await?;
+        }
+        ClientCommand::DiscoverReolink => {
+            let found = reolink::discover(3).await?;
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "discover_reolink",
+                    "devices": found,
+                }),
+            )
+            .await?;
+        }
+        ClientCommand::ProbeReolink { ip } => {
+            let result = reolink::probe(&ip, 3).await?;
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "probe_reolink",
+                    "result": result,
+                }),
+            )
+            .await?;
+        }
+        ClientCommand::ReadReolinkState { request } => {
+            let result = reolink::read_state(request).await?;
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "read_reolink_state",
+                    "result": result,
+                }),
+            )
+            .await?;
+        }
+        ClientCommand::ApplyReolinkState { request } => {
+            let result = reolink::apply_state(request).await?;
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "apply_reolink_state",
+                    "result": result,
+                }),
+            )
+            .await?;
+        }
+        ClientCommand::SetupReolink { request } => {
+            let request = request.normalized()?;
+            let result = reolink::setup(request.clone()).await?;
+
+            let effective_password = if !result.generated_password.trim().is_empty() {
+                result.generated_password.clone()
+            } else if !request.desired_password.trim().is_empty() {
+                request.desired_password.clone()
+            } else {
+                request.password.clone()
+            };
+
+            let onvif_port = if result.bridge.after_advanced.i_onvif_port_enable != 0 {
+                result.bridge.after_advanced.i_onvif_port.max(1) as u16
+            } else if result.probe.onvif_port_open {
+                8000
+            } else {
+                8000
+            };
+
+            let rtsp_port = if result.bridge.after_advanced.i_rtsp_port_enable != 0 {
+                result.bridge.after_advanced.i_rtsp_port.max(1) as u16
+            } else if result.probe.rtsp_port_open {
+                554
+            } else {
+                554
+            };
+
+            let discovered = reolink::discover_with_hint(&request.ip, 2)
+                .await
+                .unwrap_or_default();
+            let discovered_entry = discovered
+                .into_iter()
+                .find(|d| d.ip.trim() == request.ip.trim());
+            let uid = discovered_entry
+                .as_ref()
+                .map(|d| d.uid.clone())
+                .unwrap_or_default();
+            let model = discovered_entry
+                .as_ref()
+                .map(|d| d.model.clone())
+                .unwrap_or_default();
+
+            let source_id = build_reolink_source_id(&uid, &request.ip);
+            let source_name = if model.trim().is_empty() {
+                format!("Reolink {}", request.ip)
+            } else {
+                model
+            };
+            let camera_cfg = CameraConfig {
+                source_id: source_id.clone(),
+                name: source_name,
+                onvif_host: request.ip.clone(),
+                onvif_port,
+                rtsp_url: format!(
+                    "rtsp://{}:{}@{}:{}/h264Preview_01_main",
+                    request.username, effective_password, request.ip, rtsp_port
+                ),
+                username: request.username.clone(),
+                password: effective_password,
+                enabled: true,
+                segment_secs: 10,
+            };
+
+            persist_camera_source(state, camera_cfg.clone()).await?;
+
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "setup_reolink",
+                    "result": result,
+                    "source": camera_cfg,
+                }),
+            )
+            .await?;
+        }
+        ClientCommand::BootstrapReolink { request } => {
+            let result = reolink::bootstrap(request).await?;
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "bootstrap_reolink",
+                    "result": result,
+                }),
+            )
+            .await?;
+        }
+        ClientCommand::UpsertSource { source } => {
+            let camera_cfg = source.into_camera()?;
+            persist_camera_source(state, camera_cfg.clone()).await?;
+
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "upsert_source",
+                    "source": camera_cfg,
+                }),
+            )
+            .await?;
+        }
+        ClientCommand::RemoveSource { source_id } => {
+            let removed = {
+                let mut guard = state.cfg.lock().await;
+                let before = guard.cameras.len();
+                guard.cameras.retain(|c| c.source_id != source_id);
+                let changed = guard.cameras.len() != before;
+                if changed {
+                    let snapshot = guard.clone();
+                    snapshot.persist(&state.cfg_path)?;
+                }
+                changed
+            };
+
+            let runtime_removed = state.recorder.remove_camera(&source_id).await;
+
+            send_cipher_json(
+                socket,
+                key,
+                &json!({
+                    "ok": true,
+                    "cmd": "remove_source",
+                    "sourceId": source_id,
+                    "removed": removed || runtime_removed,
                 }),
             )
             .await?;
@@ -383,6 +689,46 @@ async fn handle_command(
     Ok(())
 }
 
+async fn persist_camera_source(state: &ApiState, camera_cfg: CameraConfig) -> Result<()> {
+    let storage_root = {
+        let mut guard = state.cfg.lock().await;
+        if let Some(existing) = guard
+            .cameras
+            .iter_mut()
+            .find(|c| c.source_id == camera_cfg.source_id || c.onvif_host == camera_cfg.onvif_host)
+        {
+            *existing = camera_cfg.clone();
+        } else {
+            guard.cameras.push(camera_cfg.clone());
+        }
+        let snapshot = guard.clone();
+        snapshot.persist(&state.cfg_path)?;
+        snapshot.storage_root()
+    };
+
+    state
+        .recorder
+        .upsert_camera(storage_root, camera_cfg)
+        .await;
+
+    Ok(())
+}
+
+fn build_reolink_source_id(uid: &str, ip: &str) -> String {
+    let key = if uid.trim().is_empty() { ip.trim() } else { uid.trim() };
+    let sanitized = key
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    format!("reolink-{}", sanitized.trim_matches('-'))
+}
+
 async fn send_cipher_error(socket: &mut WebSocket, key: &[u8], message: &str) -> Result<()> {
     send_cipher_json(socket, key, &json!({"ok": false, "error": message})).await
 }
@@ -402,4 +748,16 @@ async fn send_cipher_json(socket: &mut WebSocket, key: &[u8], value: &Value) -> 
 
 fn error_json(message: &str) -> String {
     json!({"ok": false, "error": message}).to_string()
+}
+
+fn default_onvif_port() -> u16 {
+    80
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_segment_secs() -> u64 {
+    10
 }
