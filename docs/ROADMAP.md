@@ -27,7 +27,8 @@
 - [ ] zone routing and discovery resilience test matrix
 
 ## Iteration 4: Productionization
-- [ ] signed release artifact update path (replace source-build updater default)
+- [ ] signed/provenance verification for release artifacts (beyond SHA256 file checks)
+- [x] GitHub release artifact update path with SHA256 verification (source-build path no longer default)
 - [ ] hardware-backed key options and sealed secret handling
 - [ ] vendor-specific P2P disable automation hooks (where camera APIs allow)
 - [ ] Reolink `9000` control-plane reversal for zero-manual RTSP/ONVIF/P2P toggles

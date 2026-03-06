@@ -496,7 +496,71 @@ async fn handle_command(
             .await?;
         }
         ClientCommand::SetupReolink { request } => {
-            let result = reolink::setup(request).await?;
+            let request = request.normalized()?;
+            let result = reolink::setup(request.clone()).await?;
+
+            let effective_password = if !result.generated_password.trim().is_empty() {
+                result.generated_password.clone()
+            } else if !request.desired_password.trim().is_empty() {
+                request.desired_password.clone()
+            } else {
+                request.password.clone()
+            };
+
+            let onvif_port = if result.bridge.after_advanced.i_onvif_port_enable != 0 {
+                result.bridge.after_advanced.i_onvif_port.max(1) as u16
+            } else if result.probe.onvif_port_open {
+                8000
+            } else {
+                8000
+            };
+
+            let rtsp_port = if result.bridge.after_advanced.i_rtsp_port_enable != 0 {
+                result.bridge.after_advanced.i_rtsp_port.max(1) as u16
+            } else if result.probe.rtsp_port_open {
+                554
+            } else {
+                554
+            };
+
+            let discovered = reolink::discover_with_hint(&request.ip, 2)
+                .await
+                .unwrap_or_default();
+            let discovered_entry = discovered
+                .into_iter()
+                .find(|d| d.ip.trim() == request.ip.trim());
+            let uid = discovered_entry
+                .as_ref()
+                .map(|d| d.uid.clone())
+                .unwrap_or_default();
+            let model = discovered_entry
+                .as_ref()
+                .map(|d| d.model.clone())
+                .unwrap_or_default();
+
+            let source_id = build_reolink_source_id(&uid, &request.ip);
+            let source_name = if model.trim().is_empty() {
+                format!("Reolink {}", request.ip)
+            } else {
+                model
+            };
+            let camera_cfg = CameraConfig {
+                source_id: source_id.clone(),
+                name: source_name,
+                onvif_host: request.ip.clone(),
+                onvif_port,
+                rtsp_url: format!(
+                    "rtsp://{}:{}@{}:{}/h264Preview_01_main",
+                    request.username, effective_password, request.ip, rtsp_port
+                ),
+                username: request.username.clone(),
+                password: effective_password,
+                enabled: true,
+                segment_secs: 10,
+            };
+
+            persist_camera_source(state, camera_cfg.clone()).await?;
+
             send_cipher_json(
                 socket,
                 key,
@@ -504,6 +568,7 @@ async fn handle_command(
                     "ok": true,
                     "cmd": "setup_reolink",
                     "result": result,
+                    "source": camera_cfg,
                 }),
             )
             .await?;
@@ -523,26 +588,7 @@ async fn handle_command(
         }
         ClientCommand::UpsertSource { source } => {
             let camera_cfg = source.into_camera()?;
-            let storage_root = {
-                let mut guard = state.cfg.lock().await;
-                if let Some(existing) = guard
-                    .cameras
-                    .iter_mut()
-                    .find(|c| c.source_id == camera_cfg.source_id)
-                {
-                    *existing = camera_cfg.clone();
-                } else {
-                    guard.cameras.push(camera_cfg.clone());
-                }
-                let snapshot = guard.clone();
-                snapshot.persist(&state.cfg_path)?;
-                snapshot.storage_root()
-            };
-
-            state
-                .recorder
-                .upsert_camera(storage_root, camera_cfg.clone())
-                .await;
+            persist_camera_source(state, camera_cfg.clone()).await?;
 
             send_cipher_json(
                 socket,
@@ -641,6 +687,46 @@ async fn handle_command(
         }
     }
     Ok(())
+}
+
+async fn persist_camera_source(state: &ApiState, camera_cfg: CameraConfig) -> Result<()> {
+    let storage_root = {
+        let mut guard = state.cfg.lock().await;
+        if let Some(existing) = guard
+            .cameras
+            .iter_mut()
+            .find(|c| c.source_id == camera_cfg.source_id || c.onvif_host == camera_cfg.onvif_host)
+        {
+            *existing = camera_cfg.clone();
+        } else {
+            guard.cameras.push(camera_cfg.clone());
+        }
+        let snapshot = guard.clone();
+        snapshot.persist(&state.cfg_path)?;
+        snapshot.storage_root()
+    };
+
+    state
+        .recorder
+        .upsert_camera(storage_root, camera_cfg)
+        .await;
+
+    Ok(())
+}
+
+fn build_reolink_source_id(uid: &str, ip: &str) -> String {
+    let key = if uid.trim().is_empty() { ip.trim() } else { uid.trim() };
+    let sanitized = key
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    format!("reolink-{}", sanitized.trim_matches('-'))
 }
 
 async fn send_cipher_error(socket: &mut WebSocket, key: &[u8], message: &str) -> Result<()> {

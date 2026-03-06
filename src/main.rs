@@ -14,8 +14,8 @@ mod util;
 
 use anyhow::Result;
 use clap::Parser;
-use config::Config;
-use std::path::PathBuf;
+use config::{CameraConfig, Config};
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -154,7 +154,7 @@ async fn main() -> Result<()> {
     let cfg_path = args
         .config
         .unwrap_or_else(|| PathBuf::from("/etc/constitute-nvr/config.json"));
-    let (cfg, created) = Config::load_or_create(&cfg_path)?;
+    let (mut cfg, created) = Config::load_or_create(&cfg_path)?;
 
     if created {
         warn!(path = %cfg_path.display(), "created new config file; update placeholders before production use");
@@ -165,6 +165,10 @@ async fn main() -> Result<()> {
             placeholder = %config::DEFAULT_STORAGE_PLACEHOLDER,
             "storage root is still placeholder; set a dedicated mount path"
         );
+    }
+
+    if let Err(err) = run_reolink_autoprovision(&mut cfg, &cfg_path).await {
+        warn!(error = %err, "reolink auto-provision failed");
     }
 
     let storage =
@@ -206,6 +210,154 @@ async fn main() -> Result<()> {
     api::run(cfg, cfg_path, storage, recorder).await
 }
 
+
+async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<()> {
+    if !cfg.autoprovision.reolink_enabled {
+        return Ok(());
+    }
+
+    let username = cfg.autoprovision.reolink_username.trim().to_string();
+    if username.is_empty() {
+        warn!("reolink auto-provision skipped: username is empty");
+        return Ok(());
+    }
+
+    if cfg.autoprovision.reolink_password.trim().is_empty()
+        && cfg.autoprovision.reolink_desired_password.trim().is_empty()
+        && !cfg.autoprovision.reolink_generate_password
+    {
+        warn!("reolink auto-provision skipped: no password material configured");
+        return Ok(());
+    }
+
+    let timeout = cfg.autoprovision.reolink_discover_timeout_secs.max(1);
+    let hint_ip = cfg.autoprovision.reolink_hint_ip.trim().to_string();
+    let discovered = if hint_ip.is_empty() {
+        reolink::discover(timeout).await?
+    } else {
+        reolink::discover_with_hint(&hint_ip, timeout).await?
+    };
+
+    if discovered.is_empty() {
+        info!("reolink auto-provision: no cameras discovered");
+        return Ok(());
+    }
+
+    let mut changed = false;
+    for device in discovered {
+        let ip = device.ip.trim().to_string();
+        if ip.is_empty() {
+            continue;
+        }
+
+        let setup_req = reolink::ReolinkSetupRequest {
+            ip: ip.clone(),
+            username: username.clone(),
+            password: cfg.autoprovision.reolink_password.clone(),
+            desired_password: cfg.autoprovision.reolink_desired_password.clone(),
+            generate_password: cfg.autoprovision.reolink_generate_password,
+            normal: None,
+            advanced: None,
+            p2p: None,
+        };
+
+        let setup = match reolink::setup(setup_req).await {
+            Ok(result) => result,
+            Err(err) => {
+                warn!(ip = %ip, error = %err, "reolink auto-provision setup failed");
+                continue;
+            }
+        };
+
+        let effective_password = if !setup.generated_password.is_empty() {
+            setup.generated_password.clone()
+        } else if !cfg.autoprovision.reolink_desired_password.trim().is_empty() {
+            cfg.autoprovision.reolink_desired_password.clone()
+        } else {
+            cfg.autoprovision.reolink_password.clone()
+        };
+
+        let onvif_port = if setup.bridge.after_advanced.i_onvif_port_enable != 0 {
+            setup.bridge.after_advanced.i_onvif_port.max(1)
+        } else if setup.probe.onvif_port_open {
+            8000
+        } else {
+            8000
+        };
+        let rtsp_port = if setup.bridge.after_advanced.i_rtsp_port_enable != 0 {
+            setup.bridge.after_advanced.i_rtsp_port.max(1)
+        } else if setup.probe.rtsp_port_open {
+            554
+        } else {
+            554
+        };
+
+        let source_id = reolink_source_id(&device.uid, &ip);
+        let source_name = if device.model.trim().is_empty() {
+            format!("Reolink {}", ip)
+        } else {
+            device.model.clone()
+        };
+        let rtsp_url = format!(
+            "rtsp://{}:{}@{}:{}/h264Preview_01_main",
+            username,
+            effective_password,
+            ip,
+            rtsp_port
+        );
+
+        let mut found = false;
+        for cam in &mut cfg.cameras {
+            if cam.source_id == source_id || cam.onvif_host == ip {
+                cam.source_id = source_id.clone();
+                cam.name = source_name.clone();
+                cam.onvif_host = ip.clone();
+                cam.onvif_port = onvif_port as u16;
+                cam.rtsp_url = rtsp_url.clone();
+                cam.username = username.clone();
+                cam.password = effective_password.clone();
+                cam.enabled = true;
+                found = true;
+                changed = true;
+                break;
+            }
+        }
+
+        if !found {
+            cfg.cameras.push(CameraConfig {
+                source_id: source_id.clone(),
+                name: source_name.clone(),
+                onvif_host: ip.clone(),
+                onvif_port: onvif_port as u16,
+                rtsp_url: rtsp_url.clone(),
+                username: username.clone(),
+                password: effective_password.clone(),
+                enabled: true,
+                segment_secs: 10,
+            });
+            changed = true;
+        }
+
+        info!(source_id = %source_id, ip = %ip, onvif_port, rtsp_port, "reolink auto-provisioned camera source");
+    }
+
+    if changed {
+        cfg.persist(cfg_path)?;
+        info!(path = %cfg_path.display(), camera_count = cfg.cameras.len(), "persisted auto-provisioned camera config");
+    }
+
+    Ok(())
+}
+
+fn reolink_source_id(uid: &str, ip: &str) -> String {
+    let key = if uid.trim().is_empty() { ip.trim() } else { uid.trim() };
+    let sanitized = key
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_lowercase() } else { '-' })
+        .collect::<String>();
+    format!("reolink-{}", sanitized.trim_matches('-'))
+}
+
 fn init_logging(level: &str) {
     let env = tracing_subscriber::EnvFilter::try_new(level)
         .or_else(|_| tracing_subscriber::EnvFilter::try_new("info"))
@@ -217,3 +369,4 @@ fn init_logging(level: &str) {
         .compact()
         .init();
 }
+

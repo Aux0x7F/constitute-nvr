@@ -1,0 +1,62 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (Linux)
+        run: cargo build --release
+
+      - name: Package Linux artifact
+        run: bash scripts/linux/package.sh
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: constitute-nvr-linux
+          path: constitute-nvr-linux-amd64.tar.gz
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [linux]
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Collect assets
+        shell: bash
+        run: |
+          mkdir -p out
+          linux_file=$(find dist -type f -name "constitute-nvr-linux-amd64.tar.gz" | head -n 1)
+          if [ -z "$linux_file" ]; then
+            echo "linux tarball not found" >&2
+            exit 1
+          fi
+          cp "$linux_file" out/constitute-nvr-linux-amd64.tar.gz
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd out
+          sha256sum * > SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*

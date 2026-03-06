@@ -40,6 +40,7 @@ Define the active contract surface for `constitute-nvr` POC integration.
 Carries signed Nostr event payloads for:
 - device discovery (`kind=30078`, `t=swarm_discovery`, `type=device`, `role=native`, `service=nvr`)
 - zone presence (`kind=1`, `t=constitute`, `z=<zone>`)
+- optional install enrollment signal (`record_type=signal`, payload `type=pair_request`) when `pair_identity_label` + `pair_code_hash` are configured
 
 ## ONVIF Discovery + Source Lifecycle
 - WS-Discovery probe to `239.255.255.250:3702`
@@ -48,6 +49,7 @@ Carries signed Nostr event payloads for:
   - `upsert_source`
   - `remove_source`
   - `list_source_states`
+  - `setup_reolink` (successful setup also auto-upserts/starts a source)
 - recorder state machine:
   - `starting` -> `running` -> `backoff` -> retry
   - terminal `failed` on non-recoverable runtime failures (e.g., `ffmpeg` missing)
@@ -118,6 +120,9 @@ Session key derivation:
 - `discover_onvif`
 - `discover_reolink`
 - `probe_reolink` (`ip`)
+- `read_reolink_state` (`request`)
+- `apply_reolink_state` (`request`)
+- `setup_reolink` (`request`)
 - `bootstrap_reolink` (`request`)
 - `upsert_source` (source definition)
 - `remove_source` (`sourceId`)

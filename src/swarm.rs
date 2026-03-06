@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::nostr::{self, NostrEvent};
 use crate::util;
 use anyhow::{Context, Result};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -177,6 +178,28 @@ async fn announce_loop(
         .map(|z| z.key.clone())
         .collect::<Vec<_>>();
 
+    let pair_identity_label = cfg.pair_identity_label.trim().to_string();
+    let pair_code = cfg.pair_code.trim().to_string();
+    let pair_code_hash = if !cfg.pair_code_hash.trim().is_empty() {
+        cfg.pair_code_hash.trim().to_string()
+    } else if !pair_identity_label.is_empty() && !pair_code.is_empty() {
+        util::sha256_b64url(&format!("{}|{}", pair_identity_label, pair_code))
+    } else {
+        String::new()
+    };
+
+    if !pair_identity_label.is_empty() && pair_code_hash.is_empty() {
+        warn!("pair_identity_label configured but no pair_code/pair_code_hash available; enrollment publish disabled");
+    }
+
+    let pair_enabled = !pair_identity_label.is_empty() && !pair_code_hash.is_empty();
+    let mut pair_tick = interval(Duration::from_secs(cfg.pair_request_interval_secs.max(5)));
+    let mut pair_attempts_remaining = if pair_enabled {
+        cfg.pair_request_attempts.max(1)
+    } else {
+        0
+    };
+
     loop {
         tokio::select! {
             _ = hello_tick.tick() => {
@@ -224,6 +247,30 @@ async fn announce_loop(
                         broadcast_json(&socket, &peers, &msg).await;
                     }
                 }
+            }
+            _ = pair_tick.tick(), if pair_enabled && pair_attempts_remaining > 0 => {
+                for zone in &zones {
+                    match build_pair_request_event(&cfg, zone, &pair_identity_label, &pair_code, &pair_code_hash) {
+                        Ok(ev) => {
+                            let msg = UdpMessage::Record {
+                                v: PROTOCOL_VERSION,
+                                zone: zone.clone(),
+                                record_type: "signal".to_string(),
+                                event: ev,
+                                ts: util::now_ms(),
+                            };
+                            broadcast_json(&socket, &peers, &msg).await;
+                        }
+                        Err(err) => {
+                            warn!(error = %err, zone = %zone, "failed building pair_request enrollment signal");
+                        }
+                    }
+                }
+
+                if pair_attempts_remaining > 0 {
+                    pair_attempts_remaining -= 1;
+                }
+                info!(remaining = pair_attempts_remaining, identity = %pair_identity_label, "published nvr pair_request enrollment");
             }
         }
     }
@@ -428,4 +475,74 @@ fn build_zone_presence(cfg: &Config, zone: &str) -> Result<NostrEvent> {
         util::now_unix_seconds(),
     );
     nostr::sign_event(&unsigned, &cfg.nostr_sk_hex)
+}
+
+
+fn build_pair_request_event(
+    cfg: &Config,
+    zone: &str,
+    identity_label: &str,
+    pair_code: &str,
+    pair_code_hash: &str,
+) -> Result<NostrEvent> {
+    let mut rid = [0u8; 6];
+    rand::thread_rng().fill_bytes(&mut rid);
+    let request_id = format!("req-nvr-{}", hex::encode(rid));
+
+    let payload = serde_json::json!({
+        "type": "pair_request",
+        "identity": identity_label,
+        "requestId": request_id,
+        "code": pair_code,
+        "codeHash": pair_code_hash,
+        "devicePk": cfg.nostr_pubkey.clone(),
+        "deviceDid": format!("did:key:{}", cfg.nostr_pubkey.clone()),
+        "deviceLabel": cfg.device_label.clone(),
+        "ts": util::now_ms(),
+        "ttl": 120,
+    });
+
+    let tags = vec![
+        vec!["t".to_string(), "constitute".to_string()],
+        vec!["i".to_string(), identity_label.to_string()],
+        vec!["z".to_string(), zone.to_string()],
+    ];
+
+    let unsigned = nostr::build_unsigned_event(
+        &cfg.nostr_pubkey,
+        APP_KIND,
+        tags,
+        serde_json::to_string(&payload)?,
+        util::now_unix_seconds(),
+    );
+    nostr::sign_event(&unsigned, &cfg.nostr_sk_hex)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pair_request_event_contains_required_tags_and_payload() {
+        let path = std::env::temp_dir().join(format!(
+            "constitute-nvr-swarm-test-{}.json",
+            std::process::id()
+        ));
+        let cfg = crate::config::Config::load_or_create(&path)
+            .expect("create temp config")
+            .0;
+        let _ = std::fs::remove_file(&path);
+
+        let ev = build_pair_request_event(&cfg, "zone-test", "Identity", "123456", "hash123")
+            .expect("pair request event");
+        assert_eq!(ev.kind, APP_KIND);
+        assert!(ev.tags.iter().any(|t| t.get(0).map(String::as_str) == Some("t") && t.get(1).map(String::as_str) == Some("constitute")));
+        assert!(ev.tags.iter().any(|t| t.get(0).map(String::as_str) == Some("z") && t.get(1).map(String::as_str) == Some("zone-test")));
+
+        let payload: serde_json::Value = serde_json::from_str(&ev.content).expect("json payload");
+        assert_eq!(payload.get("type").and_then(|v| v.as_str()), Some("pair_request"));
+        assert_eq!(payload.get("identity").and_then(|v| v.as_str()), Some("Identity"));
+        assert_eq!(payload.get("codeHash").and_then(|v| v.as_str()), Some("hash123"));
+    }
 }

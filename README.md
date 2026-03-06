@@ -9,28 +9,38 @@ It runs as a Fedora/Linux service, joins swarm as `role=native` with `service=nv
 - RTSP ingest via `ffmpeg` segment recorder with restart/backoff state machine
 - encrypted segment store (`.cnv` blobs)
 - swarm-native UDP presence announcements with UI module advertisement + service metrics
-- identity-gated websocket session with ECDH + symmetric payload channel (`list_source_states`, `upsert_source`, `remove_source`)
+- identity-gated websocket session with ECDH + symmetric payload channel (`list_source_states`, `upsert_source`, `remove_source`, `setup_reolink`)
 - systemd self-update timer flow
 - Reolink onboarding for MVP using LAN discovery + HTTP CGI setup/read/apply (RTSP/ONVIF enable, P2P disable) while native `9000` replacement remains under R&D
 
 ## Quick Install (Opinionated Wizard)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Aux0x7F/constitute-nvr/main/scripts/linux/install-wizard.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Aux0x7F/constitute-nvr/main/scripts/linux/install-latest.sh | bash
 ```
 
-Wizard behavior:
-- builds and installs `constitute-nvr`
-- prompts for storage root path (default placeholder)
-- installs systemd service and self-update timer
+Installer behavior:
+- downloads the latest GitHub release artifact and verifies `SHA256SUMS`
+- skips reinstall/restart when installed binary hash is unchanged
+- installs systemd service and self-update timer by default
 - optionally applies camera-interface hardening (RTSP/ONVIF + NTP lane)
+
+When copied from `constitute` Appliances panel, the command includes install-time context:
+- identity binding (`--identity-id`, authorized device PKs)
+- gateway swarm peer (`--swarm-peer`) + zone keys (`--zone-key`)
+- auto-associate enrollment (`--pair-identity`, `--pair-code`, `--pair-code-hash`)
+
+Optional auto-provision flags:
+- `--enable-reolink-autoprovision`
+- `--reolink-username`, `--reolink-password` / `--reolink-desired-password`
+- `--reolink-generate-password`, `--reolink-hint-ip`
 
 ## Runtime Overview
 - Swarm transport: UDP, client mode (`native` + `nvr` capability)
 - Control/serving surface: websocket at `api.bind` (`/session`)
 - Health endpoint: `GET /health`
 - Config path default: `/etc/constitute-nvr/config.json`
-- Reolink runtime default: CGI-first (`setup_reolink`, `read_reolink_state`, `apply_reolink_state`)
+- Reolink runtime default: CGI-first (`setup_reolink`, `read_reolink_state`, `apply_reolink_state`), with `setup_reolink` auto-upserting a recorder source on success
 - Optional bridge toggle: set `CONSTITUTE_NVR_USE_SDK_BRIDGE=1` to try Windows SDK bridge fallback for lab work
 
 ## Config Highlights

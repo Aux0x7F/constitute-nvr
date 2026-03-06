@@ -3,13 +3,27 @@
 ## 1) Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Aux0x7F/constitute-nvr/main/scripts/linux/install-wizard.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Aux0x7F/constitute-nvr/main/scripts/linux/install-latest.sh | bash
 ```
 
-Wizard prompts for:
-- storage root path (default placeholder)
-- self-update timer interval
-- optional camera hardening settings
+Web-driven install (from `constitute` Appliances panel) passes context flags similar to:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Aux0x7F/constitute-nvr/main/scripts/linux/install-latest.sh | bash -s -- \
+  --identity-id '<identity-id>' \
+  --authorized-device-pk '<device-pk>' \
+  --swarm-peer '<gateway-host:4040>' \
+  --zone-key '<zone-key>' \
+  --pair-identity '<identity-label>' \
+  --pair-code '<code>' \
+  --pair-code-hash '<code-hash>' \
+  --allow-unsigned-hello-mvp
+```
+
+Install flow notes:
+- release tarball is verified against `SHA256SUMS`
+- unchanged binary hash skips reinstall/restart (unless install context flags are provided)
+- auto-update timer is enabled by default (`constitute-nvr-update.timer`)
 
 ## 2) Service Checks
 
@@ -26,9 +40,12 @@ File:
 
 Critical fields before ingest:
 - `api.identity_id`
+- `api.authorized_device_pks`
 - `swarm.peers`
 - `swarm.zones[]`
+- `pair_identity_label` / `pair_code_hash` (if auto-associate was armed)
 - `storage.root`
+- `autoprovision.reolink_*` (when auto-provision enabled)
 - `cameras[]`
 
 ## 4) ONVIF Discovery Smoke
@@ -49,7 +66,7 @@ constitute-nvr --probe-reolink-ip 192.168.1.20
 Notes:
 - Binding UDP/67 generally requires root or `CAP_NET_BIND_SERVICE`.
 - Current automation covers lease + vendor discovery + standards readiness checks.
-- The proprietary `9000` control plane is still required for fully automatic RTSP/ONVIF/P2P toggles.
+- CGI setup path covers RTSP/ONVIF/P2P toggles when HTTP API is available; proprietary `9000` path remains fallback/R&D for HTTP-disabled devices.
 
 ## 6) Health Endpoint
 
@@ -93,11 +110,11 @@ Use the configured values:
 Manual run:
 
 ```bash
-sudo /usr/local/bin/constitute-nvr-self-update --source-dir /opt/constitute-nvr-src --branch main --service-name constitute-nvr --try-restart
+sudo /usr/local/bin/constitute-nvr-self-update --service-name constitute-nvr --try-restart
 ```
 
 ## Known POC Limits
 - depends on host `ffmpeg`
-- source-build update flow (no signed release artifact path yet)
+- release checksums are hash-verified but not signature-verified yet
 - segment-serving path implemented before live stream relay path
 

@@ -58,5 +58,19 @@
       "enabled": true,
       "segment_secs": 10
     }
-  ]
+  ],
+  "autoprovision": {
+    "reolink_enabled": false,
+    "reolink_username": "admin",
+    "reolink_password": "",
+    "reolink_desired_password": "",
+    "reolink_generate_password": false,
+    "reolink_discover_timeout_secs": 3,
+    "reolink_hint_ip": ""
+  },
+  "pair_identity_label": "",
+  "pair_code": "",
+  "pair_code_hash": "",
+  "pair_request_interval_secs": 15,
+  "pair_request_attempts": 24
 }
