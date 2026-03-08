@@ -231,6 +231,11 @@ if [[ "$FORCE" -eq 0 && -f "$installed_bin" ]]; then
 fi
 
 if [[ "$needs_install" -eq 1 ]]; then
+  rollback_bin="$tmpdir/constitute-nvr.prev"
+  if [[ -f "$installed_bin" ]]; then
+    cp -f "$installed_bin" "$rollback_bin"
+  fi
+
   run_sudo install -d "$INSTALL_PREFIX/bin"
   run_sudo install -m 0755 "$incoming_bin" "$installed_bin"
   run_sudo ln -sf "$installed_bin" /usr/local/bin/constitute-nvr
@@ -241,6 +246,21 @@ if [[ "$needs_install" -eq 1 ]]; then
 
   echo "[self-update] installed latest release"
   if [[ "$TRY_RESTART" -eq 1 ]]; then
-    run_sudo systemctl restart "$SERVICE_NAME" || true
+    if ! run_sudo systemctl restart "$SERVICE_NAME"; then
+      if [[ -f "$rollback_bin" ]]; then
+        echo "[self-update] restart failed; rolling back binary" >&2
+        run_sudo install -m 0755 "$rollback_bin" "$installed_bin" || true
+        run_sudo systemctl restart "$SERVICE_NAME" || true
+      fi
+      exit 1
+    fi
+    if ! run_sudo systemctl is-active --quiet "$SERVICE_NAME"; then
+      if [[ -f "$rollback_bin" ]]; then
+        echo "[self-update] service unhealthy after update; rolling back binary" >&2
+        run_sudo install -m 0755 "$rollback_bin" "$installed_bin" || true
+        run_sudo systemctl restart "$SERVICE_NAME" || true
+      fi
+      exit 1
+    fi
   fi
 fi

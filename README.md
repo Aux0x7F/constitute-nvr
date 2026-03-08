@@ -23,6 +23,7 @@ Installer behavior:
 - downloads the latest GitHub release artifact and verifies `SHA256SUMS`
 - skips reinstall/restart when installed binary hash is unchanged
 - installs systemd service and self-update timer by default
+- updater keeps config/state out of release paths and rolls back binary on failed restart/health check
 - optionally applies camera-interface hardening (RTSP/ONVIF + NTP lane)
 
 When copied from `constitute` Appliances panel, the command includes install-time context:
@@ -34,6 +35,12 @@ Optional auto-provision flags:
 - `--enable-reolink-autoprovision`
 - `--reolink-username`, `--reolink-password` / `--reolink-desired-password`
 - `--reolink-generate-password`, `--reolink-hint-ip`
+
+## Persistence Contract
+- Config path: `/etc/constitute-nvr/config.json`
+- Runtime state: `/var/lib/constitute-nvr`
+- Retained encrypted media: `storage.root` (operator mount, recommended separate volume)
+- Release updates replace executable payload only; identity/session config and retained data are preserved.
 
 ## Runtime Overview
 - Swarm transport: UDP, client mode (`native` + `nvr` capability)

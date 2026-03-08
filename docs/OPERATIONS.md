@@ -24,6 +24,7 @@ Install flow notes:
 - release tarball is verified against `SHA256SUMS`
 - unchanged binary hash skips reinstall/restart (unless install context flags are provided)
 - auto-update timer is enabled by default (`constitute-nvr-update.timer`)
+- updater rolls back binary when restart/health validation fails
 
 ## 2) Service Checks
 
@@ -33,6 +34,12 @@ journalctl -u constitute-nvr -n 100 --no-pager
 systemctl status constitute-nvr-update.timer
 systemctl list-timers | grep constitute-nvr-update
 ```
+
+## Persistence Contract
+- Config is persistent at `/etc/constitute-nvr/config.json`.
+- Runtime state is persistent at `/var/lib/constitute-nvr`.
+- Media retention is persistent at `storage.root` (recommended dedicated data mount).
+- Update scripts must not delete config/state/media roots.
 
 ## 3) Config Checks
 File:
