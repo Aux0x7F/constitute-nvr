@@ -110,7 +110,7 @@ sudo bash scripts/linux/harden-camera-interface.sh \
 Expected effect:
 - camera NIC zone target `DROP`
 - camera->host DHCP remains allowed on the isolated segment
-- host egress on camera NIC restricted to DHCP/camera-control/RTSP (+ optional WS-Discovery, optional NTP); default control allowlist includes Reolink `9000/tcp`
+- host egress on camera NIC restricted to DHCP/camera-control/RTSP (+ Reolink discovery UDP `2000/3000`, optional WS-Discovery, optional NTP); default control allowlist includes Reolink `9000/tcp`
 
 ## 8) Manual Session Protocol Test (Identity-bound)
 Connect websocket to `/session` and perform:

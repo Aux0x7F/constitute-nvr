@@ -21,7 +21,7 @@ Audit/apply camera-network hardening for constitute-nvr.
 Goals:
 - bind the camera NIC to a drop-by-default firewalld zone
 - allow only explicit camera->host ingress (DHCP + optional NTP)
-- lock host egress over that NIC to DHCP/camera-control/RTSP (+ optional WS-Discovery + NTP)
+- lock host egress over that NIC to DHCP/camera-control/RTSP (+ Reolink discovery, optional WS-Discovery + NTP)
 
 Options:
   --apply                     Apply changes (default is audit-only)
@@ -230,7 +230,7 @@ fi
 ntp_rule="rule family=\"ipv4\" source address=\"${CAMERA_CIDR}\" port protocol=\"udp\" port=\"123\" accept"
 while IFS= read -r existing_rule; do
   [[ -z "$existing_rule" ]] && continue
-  if [[ "$existing_rule" == *'port port="123" protocol="udp"'* ]]; then
+  if [[ "$existing_rule" == *'port port="67" protocol="udp"'* || "$existing_rule" == *'port port="123" protocol="udp"'* ]]; then
     run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --remove-rich-rule="$existing_rule" >/dev/null 2>&1 || true
   fi
 done < <(run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --list-rich-rules 2>/dev/null || true)
@@ -254,6 +254,7 @@ run_sudo nft "add chain inet ${NFT_TABLE} output { type filter hook output prior
 
 run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${CAMERA_CIDR} tcp dport { ${ALLOWED_TCP_PORTS//,/ , } } accept"
 run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${CAMERA_CIDR} udp dport 68 accept"
+run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${CAMERA_CIDR} udp dport { 2000, 3000 } accept"
 if [[ "$ALLOW_ONVIF_DISCOVERY" -eq 1 ]]; then
   run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${CAMERA_CIDR} udp dport 3702 accept"
 fi
