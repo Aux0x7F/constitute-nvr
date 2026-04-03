@@ -9,7 +9,7 @@ NON_INTERACTIVE=0
 APPLY_HARDENING="ask"
 CAMERA_IFACE=""
 CAMERA_CIDR=""
-ONVIF_PORTS="80,443,8000,8080,8899"
+ONVIF_PORTS="80,443,8000,8080,8899,9000"
 RTSP_PORTS="554"
 ALLOW_NTP_HOST=1
 INSTALL_PREFIX="/opt/constitute-nvr"
@@ -70,7 +70,7 @@ Options:
   --skip-hardening           Skip camera hardening
   --camera-iface <iface>     Camera interface (e.g. enp2s0)
   --camera-cidr <cidr>       Camera subnet (auto-selects non-colliding /24 when omitted)
-  --onvif-ports <csv>        ONVIF TCP ports (default: 80,443,8000,8080,8899)
+  --onvif-ports <csv>        Camera control TCP ports (default: 80,443,8000,8080,8899,9000)
   --rtsp-ports <csv>         RTSP TCP ports (default: 554)
   --no-ntp-host              Do not allow camera->host UDP/123
   --identity-id <id>         Bind NVR session auth to identity id
