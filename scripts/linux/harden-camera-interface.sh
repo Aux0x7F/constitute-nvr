@@ -227,6 +227,13 @@ if ! run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --query-interface="$I
   run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --add-interface="$IFACE" >/dev/null
 fi
 
+while IFS= read -r existing_rule; do
+  [[ -z "$existing_rule" ]] && continue
+  if [[ "$existing_rule" == *'port port="67" protocol="udp"'* || "$existing_rule" == *'port port="123" protocol="udp"'* ]]; then
+    run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --remove-rich-rule="$existing_rule" >/dev/null 2>&1 || true
+  fi
+done < <(run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --list-rich-rules 2>/dev/null || true)
+
 ntp_rule="rule family=\"ipv4\" source address=\"${CAMERA_CIDR}\" port protocol=\"udp\" port=\"123\" accept"
 dhcp_rule="rule family=\"ipv4\" source address=\"${CAMERA_CIDR}\" port protocol=\"udp\" port=\"67\" accept"
 run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --remove-rich-rule="$dhcp_rule" >/dev/null 2>&1 || true
@@ -262,4 +269,3 @@ fi
 log "applied"
 run_sudo firewall-cmd --zone="$ZONE_NAME" --list-all || true
 run_sudo nft list table inet "$NFT_TABLE" || true
-

@@ -538,6 +538,27 @@ if [[ ! -f /etc/constitute-nvr/config.json && -n "$CONFIG_TEMPLATE_SRC" ]]; then
   CONFIG_WAS_INSTALLED=1
 fi
 
+if [[ -f /etc/constitute-nvr/config.json && ( -z "$CAMERA_IFACE" || -z "$CAMERA_CIDR" ) ]]; then
+  existing_camera="$(
+    run_sudo python3 - <<'PY'
+import json
+from pathlib import Path
+
+path = Path('/etc/constitute-nvr/config.json')
+raw = json.loads(path.read_text(encoding='utf-8'))
+camera = raw.get('camera_network') or {}
+print((camera.get('interface') or '').strip())
+print((camera.get('subnet_cidr') or '').strip())
+PY
+  )"
+  if [[ -z "$CAMERA_IFACE" ]]; then
+    CAMERA_IFACE="$(printf '%s\n' "$existing_camera" | sed -n '1p')"
+  fi
+  if [[ -z "$CAMERA_CIDR" ]]; then
+    CAMERA_CIDR="$(printf '%s\n' "$existing_camera" | sed -n '2p')"
+  fi
+fi
+
 log "bootstrapping camera network"
 bootstrap_args=(--apply --print-env)
 if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
