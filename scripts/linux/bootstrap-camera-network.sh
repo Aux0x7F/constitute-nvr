@@ -287,6 +287,7 @@ apply_networkmanager_config() {
     ipv4.never-default yes \
     ipv6.method disabled \
     >/dev/null
+  run_sudo ip -4 addr flush dev "$CAMERA_IFACE" >/dev/null 2>&1 || true
   run_sudo nmcli connection up "$connection_name" ifname "$CAMERA_IFACE" >/dev/null
 }
 
