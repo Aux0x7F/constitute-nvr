@@ -643,6 +643,20 @@ camera_dhcp_range_start = os.environ.get('CFG_CAMERA_DHCP_RANGE_START', '').stri
 camera_dhcp_range_end = os.environ.get('CFG_CAMERA_DHCP_RANGE_END', '').strip()
 first_install = os.environ.get('CFG_FIRST_INSTALL', '0').strip() == '1'
 
+def looks_like_template_camera(camera: dict) -> bool:
+    if not isinstance(camera, dict):
+        return False
+    onvif_host = str(camera.get('onvif_host', '')).strip()
+    rtsp_url = str(camera.get('rtsp_url', '')).strip()
+    source_id = str(camera.get('source_id', '')).strip()
+    username = str(camera.get('username', '')).strip()
+    password = str(camera.get('password', '')).strip()
+    return (
+        onvif_host == '10.60.0.11'
+        or '@10.60.0.11:' in rtsp_url
+        or (source_id == 'cam-reolink-e1' and username == 'user' and password == 'pass')
+    )
+
 raw.setdefault('storage', {})['root'] = storage_root
 raw.setdefault('update', {})['enabled'] = True
 raw['update']['interval_secs'] = update_interval
@@ -700,7 +714,11 @@ camera_network['dhcp_enabled'] = True
 camera_network['dhcp_range_start'] = camera_dhcp_range_start
 camera_network['dhcp_range_end'] = camera_dhcp_range_end
 
-if first_install:
+if first_install or (
+    isinstance(raw.get('cameras'), list)
+    and raw['cameras']
+    and all(looks_like_template_camera(item) for item in raw['cameras'])
+):
     raw['cameras'] = []
 
 path.write_text(json.dumps(raw, indent=2) + '\n', encoding='utf-8')
@@ -762,8 +780,18 @@ WantedBy=timers.target
 EOF
 
 run_sudo systemctl daemon-reload
-run_sudo systemctl enable --now "$SERVICE_NAME"
-run_sudo systemctl enable --now "${SERVICE_NAME}-update.timer"
+run_sudo systemctl enable "$SERVICE_NAME"
+if run_sudo systemctl is-active --quiet "$SERVICE_NAME"; then
+  run_sudo systemctl restart "$SERVICE_NAME"
+else
+  run_sudo systemctl start "$SERVICE_NAME"
+fi
+run_sudo systemctl enable "${SERVICE_NAME}-update.timer"
+if run_sudo systemctl is-active --quiet "${SERVICE_NAME}-update.timer"; then
+  run_sudo systemctl restart "${SERVICE_NAME}-update.timer"
+else
+  run_sudo systemctl start "${SERVICE_NAME}-update.timer"
+fi
 
 if [[ "$APPLY_HARDENING" -eq 1 ]]; then
   log "applying camera hardening"
