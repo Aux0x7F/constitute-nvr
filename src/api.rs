@@ -88,9 +88,14 @@ pub async fn run(
 }
 
 async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
-    let sources = state.storage.list_sources().await.unwrap_or_default();
+    let retained_sources = state.storage.list_sources().await.unwrap_or_default();
     let runtime = state.recorder.list_states().await;
     let cfg = state.cfg.lock().await.clone();
+    let sources = cfg
+        .cameras
+        .iter()
+        .map(|cam| cam.source_id.clone())
+        .collect::<Vec<_>>();
     let cameras = cfg
         .cameras
         .iter()
@@ -123,6 +128,7 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
         "devicePk": cfg.nostr_pubkey,
         "hostGatewayPk": cfg.gateway.host_gateway_pk,
         "sources": sources,
+        "retainedSources": retained_sources,
         "cameras": cameras,
         "cameraNetwork": camera_network,
         "sourceRuntime": runtime,
