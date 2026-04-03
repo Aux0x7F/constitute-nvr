@@ -25,6 +25,8 @@ Install flow notes:
 - unchanged binary hash skips reinstall/restart (unless install context flags are provided)
 - auto-update timer is enabled by default (`constitute-nvr-update.timer`)
 - updater rolls back binary when restart/health validation fails
+- install bootstrap now provisions the dedicated camera NIC, selects a non-colliding `/24`, and binds `dnsmasq` DHCP on that NIC
+- source-build/dev installs are expected to update through `constitute-nvr-update.timer`; in-process source updates are intentionally skipped
 
 ## 2) Service Checks
 
@@ -52,6 +54,10 @@ Critical fields before ingest:
 - `swarm.zones[]`
 - `pair_identity_label` / `pair_code_hash` (if auto-associate was armed)
 - `storage.root`
+- `camera_network.interface`
+- `camera_network.subnet_cidr`
+- `camera_network.host_ip`
+- `camera_network.dhcp_enabled`
 - `autoprovision.reolink_*` (when auto-provision enabled)
 - `cameras[]`
 
@@ -81,6 +87,10 @@ Notes:
 curl -s http://127.0.0.1:8456/health | jq .
 ```
 
+Notes:
+- `/health` is intentionally redacted; camera credentials and raw credential-bearing RTSP URLs are never returned.
+- `cameraNetwork` should reflect the provisioned camera NIC and DHCP range.
+
 ## 7) Camera Hardening Script
 Audit-only:
 
@@ -99,7 +109,8 @@ sudo bash scripts/linux/harden-camera-interface.sh \
 
 Expected effect:
 - camera NIC zone target `DROP`
-- host egress on camera NIC restricted to ONVIF/RTSP (+ optional WS-Discovery, optional NTP)
+- camera->host DHCP remains allowed on the isolated segment
+- host egress on camera NIC restricted to DHCP/ONVIF/RTSP (+ optional WS-Discovery, optional NTP)
 
 ## 8) Manual Session Protocol Test (Identity-bound)
 Connect websocket to `/session` and perform:
@@ -123,5 +134,5 @@ sudo /usr/local/bin/constitute-nvr-self-update --service-name constitute-nvr --t
 ## Known POC Limits
 - depends on host `ffmpeg`
 - release checksums are hash-verified but not signature-verified yet
-- segment-serving path implemented before live stream relay path
+- TURN remains a documented stub; same-LAN and NAT-friendly direct ICE paths are the active target for this iteration
 

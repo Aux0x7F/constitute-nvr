@@ -20,8 +20,8 @@ Audit/apply camera-network hardening for constitute-nvr.
 
 Goals:
 - bind the camera NIC to a drop-by-default firewalld zone
-- allow only explicit camera->host ingress (optional NTP)
-- lock host egress over that NIC to ONVIF/RTSP (+ optional WS-Discovery + NTP)
+- allow only explicit camera->host ingress (DHCP + optional NTP)
+- lock host egress over that NIC to DHCP/ONVIF/RTSP (+ optional WS-Discovery + NTP)
 
 Options:
   --apply                     Apply changes (default is audit-only)
@@ -170,6 +170,7 @@ log "mode: $([[ "$APPLY" -eq 1 ]] && echo apply || echo audit)"
 log "iface: ${IFACE:-<unset>}"
 log "camera-cidr: ${CAMERA_CIDR:-<unset>}"
 log "allowed tcp ports (ONVIF+RTSP): $ALLOWED_TCP_PORTS"
+log "camera->host DHCP: enabled"
 log "camera->host ntp: $([[ "$ALLOW_NTP_HOST" -eq 1 ]] && echo enabled || echo disabled)"
 log "host->camera ws-discovery (udp/3702): $([[ "$ALLOW_ONVIF_DISCOVERY" -eq 1 ]] && echo enabled || echo disabled)"
 log "egress lock: $([[ "$NO_EGRESS_LOCK" -eq 0 ]] && echo enabled || echo disabled)"
@@ -227,6 +228,11 @@ if ! run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --query-interface="$I
 fi
 
 ntp_rule="rule family=\"ipv4\" source address=\"${CAMERA_CIDR}\" port protocol=\"udp\" port=\"123\" accept"
+dhcp_rule="rule family=\"ipv4\" source address=\"${CAMERA_CIDR}\" port protocol=\"udp\" port=\"67\" accept"
+run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --remove-rich-rule="$dhcp_rule" >/dev/null 2>&1 || true
+log "allowing camera->host DHCP (udp/67) from $CAMERA_CIDR"
+run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --add-rich-rule="$dhcp_rule" >/dev/null
+
 run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --remove-rich-rule="$ntp_rule" >/dev/null 2>&1 || true
 if [[ "$ALLOW_NTP_HOST" -eq 1 ]]; then
   log "allowing camera->host NTP (udp/123) from $CAMERA_CIDR"
@@ -242,6 +248,7 @@ run_sudo nft "delete chain inet ${NFT_TABLE} output" >/dev/null 2>&1 || true
 run_sudo nft "add chain inet ${NFT_TABLE} output { type filter hook output priority 0; policy accept; }"
 
 run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${CAMERA_CIDR} tcp dport { ${ALLOWED_TCP_PORTS//,/ , } } accept"
+run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${CAMERA_CIDR} udp dport 68 accept"
 if [[ "$ALLOW_ONVIF_DISCOVERY" -eq 1 ]]; then
   run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${CAMERA_CIDR} udp dport 3702 accept"
 fi

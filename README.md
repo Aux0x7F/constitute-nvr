@@ -25,7 +25,8 @@ Installer behavior:
 - skips reinstall/restart when installed binary hash is unchanged
 - installs systemd service and self-update timer by default
 - updater keeps config/state out of release paths and rolls back binary on failed restart/health check
-- optionally applies camera-interface hardening (RTSP/ONVIF + NTP lane)
+- provisions an isolated camera NIC with a collision-checked `/24` and `dnsmasq` DHCP
+- optionally applies camera-interface hardening (DHCP + RTSP/ONVIF + optional NTP lane)
 
 When copied from `constitute` Appliances panel, the command includes install-time context:
 - identity binding (`--identity-id`, authorized device PKs)
@@ -57,8 +58,9 @@ Optional auto-provision flags:
 - `swarm.bind`, `swarm.peers`, `swarm.zones`
 - `api.identity_id`, `api.authorized_device_pks`, `api.public_ws_url`, `api.allow_unsigned_hello_mvp` (direct/manual debug mode only)
 - `storage.root`, `storage.encryption_key_hex`
-- `update.interval_secs`
+- `update.interval_secs`, `update.mode`, `update.build_user`
 - `gateway.host_gateway_pk`
+- `camera_network.*`
 - `cameras[]` ONVIF/RTSP source definitions
 
 ## Security Model (Current)
@@ -67,7 +69,8 @@ Optional auto-provision flags:
 - Direct debug session channel uses X25519 ECDH + HKDF-derived symmetric key.
 - Direct debug admission still supports the legacy HMAC proof flow for lab work.
 - Unsigned MVP mode is for local integration bring-up only and is not the canonical managed path.
-- Camera network hardening is operator-controlled and scriptable.
+- Camera-network bootstrap is installer-managed; health output is redacted and never exposes camera credentials.
+- TURN remains intentionally incomplete in this iteration; direct ICE is the active path and decentralized gateway-hosted TURN stays on the roadmap for later work.
 
 ## Local Dev
 

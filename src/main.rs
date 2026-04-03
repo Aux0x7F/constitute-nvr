@@ -17,6 +17,7 @@ use anyhow::Result;
 use clap::Parser;
 use config::{CameraConfig, Config};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -168,6 +169,9 @@ async fn main() -> Result<()> {
         );
     }
 
+    warn_if_camera_network_not_ready(&cfg);
+    warn_if_template_cameras(&cfg);
+
     if let Err(err) = run_reolink_autoprovision(&mut cfg, &cfg_path).await {
         warn!(error = %err, "reolink auto-provision failed");
     }
@@ -211,6 +215,85 @@ async fn main() -> Result<()> {
     api::run(cfg, cfg_path, storage, recorder).await
 }
 
+fn warn_if_camera_network_not_ready(cfg: &Config) {
+    if !cfg.camera_network.managed {
+        return;
+    }
+
+    let iface = cfg.camera_network.interface.trim();
+    if iface.is_empty() {
+        warn!("camera_network is managed but interface is not configured");
+        return;
+    }
+
+    let link = Command::new("ip").args(["link", "show", iface]).output();
+    match link {
+        Ok(output) if output.status.success() => {}
+        Ok(_) => {
+            warn!(interface = iface, "configured camera interface not present");
+            return;
+        }
+        Err(err) => {
+            warn!(interface = iface, error = %err, "failed inspecting camera interface");
+            return;
+        }
+    }
+
+    let host_ip = cfg.camera_network.host_ip.trim();
+    if host_ip.is_empty() {
+        warn!(
+            interface = iface,
+            "camera_network host_ip is not configured"
+        );
+        return;
+    }
+
+    let addr = Command::new("ip")
+        .args(["-4", "-o", "addr", "show", "dev", iface])
+        .output();
+    match addr {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if !text.contains(host_ip) {
+                warn!(
+                    interface = iface,
+                    host_ip = host_ip,
+                    subnet = %cfg.camera_network.subnet_cidr,
+                    "camera network address is not present on configured interface"
+                );
+            }
+        }
+        Ok(_) => {
+            warn!(
+                interface = iface,
+                "failed reading configured camera interface addresses"
+            );
+        }
+        Err(err) => {
+            warn!(interface = iface, error = %err, "failed reading configured camera interface addresses");
+        }
+    }
+}
+
+fn warn_if_template_cameras(cfg: &Config) {
+    for cam in &cfg.cameras {
+        if looks_like_template_camera(cam) {
+            warn!(
+                source = %cam.source_id,
+                onvif_host = %cam.onvif_host,
+                "camera source still matches template defaults; replace it with discovered camera config"
+            );
+        }
+    }
+}
+
+fn looks_like_template_camera(cam: &CameraConfig) -> bool {
+    cam.onvif_host.trim() == "10.60.0.11"
+        || cam.rtsp_url.contains("@10.60.0.11:")
+        || (cam.source_id.trim() == "cam-reolink-e1"
+            && cam.username.trim() == "user"
+            && cam.password.trim() == "pass")
+}
 
 async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<()> {
     if !cfg.autoprovision.reolink_enabled {
@@ -301,10 +384,7 @@ async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<
         };
         let rtsp_url = format!(
             "rtsp://{}:{}@{}:{}/h264Preview_01_main",
-            username,
-            effective_password,
-            ip,
-            rtsp_port
+            username, effective_password, ip, rtsp_port
         );
 
         let mut found = false;
@@ -351,10 +431,20 @@ async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<
 }
 
 fn reolink_source_id(uid: &str, ip: &str) -> String {
-    let key = if uid.trim().is_empty() { ip.trim() } else { uid.trim() };
+    let key = if uid.trim().is_empty() {
+        ip.trim()
+    } else {
+        uid.trim()
+    };
     let sanitized = key
         .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_lowercase() } else { '-' })
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect::<String>();
     format!("reolink-{}", sanitized.trim_matches('-'))
 }
@@ -370,4 +460,3 @@ fn init_logging(level: &str) {
         .compact()
         .init();
 }
-
