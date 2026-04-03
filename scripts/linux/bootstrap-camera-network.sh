@@ -112,6 +112,7 @@ mapfile -t ethernet_ifaces < <(
       iface=$2
       sub(/@.*/, "", iface)
       if (iface == "lo") next
+      if (iface ~ /^(wl|ww|docker|veth|virbr|br-|tun|tap)/) next
       print iface
     }
   '
