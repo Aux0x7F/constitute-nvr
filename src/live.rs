@@ -16,6 +16,7 @@ use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::ice::mdns::MulticastDnsMode;
+use webrtc::ice::network_type::NetworkType;
 use webrtc::ice::udp_network::{EphemeralUDP, UDPNetwork};
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -265,6 +266,7 @@ fn build_setting_engine(cfg: &LivePreviewConfig, camera_iface: &str) -> Result<S
             .map_err(|err| anyhow!("invalid live preview udp port range: {err}"))?,
     );
     setting_engine.set_udp_network(udp_network);
+    setting_engine.set_network_types(vec![NetworkType::Udp4]);
     let blocked_iface = camera_iface.trim().to_string();
     setting_engine.set_interface_filter(Box::new(move |iface| {
         let trimmed = iface.trim();
