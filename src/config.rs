@@ -136,6 +136,12 @@ impl Default for UiModuleConfig {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GatewayConfig {
+    #[serde(default)]
+    pub host_gateway_pk: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub node_id: String,
@@ -160,6 +166,8 @@ pub struct Config {
     pub pair_request_interval_secs: u64,
     #[serde(default = "default_pair_request_attempts")]
     pub pair_request_attempts: u32,
+    #[serde(default)]
+    pub gateway: GatewayConfig,
     #[serde(default)]
     pub ui: UiModuleConfig,
     #[serde(default)]
@@ -353,6 +361,7 @@ impl Config {
             pair_code_hash: String::new(),
             pair_request_interval_secs: default_pair_request_interval_secs(),
             pair_request_attempts: default_pair_request_attempts(),
+            gateway: GatewayConfig::default(),
             ui: UiModuleConfig::default(),
             autoprovision: AutoProvisionConfig::default(),
             cameras: Vec::new(),

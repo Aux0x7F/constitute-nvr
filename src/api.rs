@@ -2,14 +2,16 @@ use crate::camera;
 use crate::camera::RecorderManager;
 use crate::config::{CameraConfig, Config};
 use crate::crypto;
+use crate::live::{ManagedCloseRequest, ManagedOfferRequest, PreviewManager};
 use crate::reolink;
 use crate::storage::StorageManager;
 use crate::util;
 use anyhow::{Result, anyhow};
+use axum::http::StatusCode;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
@@ -29,6 +31,7 @@ pub struct ApiState {
     pub cfg_path: PathBuf,
     pub storage: StorageManager,
     pub recorder: RecorderManager,
+    pub preview: PreviewManager,
 }
 
 pub async fn run(
@@ -43,11 +46,14 @@ pub async fn run(
         cfg_path,
         storage,
         recorder,
+        preview: PreviewManager::new()?,
     });
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/session", get(ws_session))
+        .route("/managed/offer", post(managed_offer))
+        .route("/managed/close", post(managed_close))
         .with_state(state);
 
     let listener = TcpListener::bind(&bind).await?;
@@ -63,10 +69,14 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
     Json(json!({
         "ok": true,
         "service": "nvr",
+        "deviceKind": "service",
         "version": cfg.service_version,
         "nodeRole": cfg.node_role,
         "identityId": cfg.api.identity_id,
+        "devicePk": cfg.nostr_pubkey,
+        "hostGatewayPk": cfg.gateway.host_gateway_pk,
         "sources": sources,
+        "cameras": cfg.cameras,
         "sourceRuntime": runtime,
         "configuredSources": cfg.cameras.len(),
     }))
@@ -74,6 +84,47 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
 
 async fn ws_session(ws: WebSocketUpgrade, State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws(socket, state))
+}
+
+async fn managed_offer(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<ManagedOfferRequest>,
+) -> impl IntoResponse {
+    let cfg = state.cfg.lock().await.clone();
+    match state.preview.handle_offer(&cfg, request).await {
+        Ok(response) => Json(json!({
+            "signalType": response.signal_type,
+            "payload": response.answer,
+            "answer": response.answer,
+            "sessionId": response.session_id,
+            "sources": response.sources,
+        }))
+        .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": err.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn managed_close(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<ManagedCloseRequest>,
+) -> impl IntoResponse {
+    let cfg = state.cfg.lock().await.clone();
+    match state.preview.handle_close(&cfg, request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": err.to_string(),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]

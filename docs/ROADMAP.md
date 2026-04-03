@@ -20,11 +20,13 @@
 - [x] service metrics publication in swarm records
 - [x] Reolink DHCP bootstrap + proprietary discovery + standards-readiness probe
 
-## Iteration 3: Web/Gateway Convergence
-- [ ] exact identity/device auth parity with `constitute` + `constitute-gateway`
-- [ ] browser client integration test for encrypted session channel
-- [ ] segment retrieval UX/API convergence in web repo
-- [ ] zone routing and discovery resilience test matrix
+## Iteration 3: Managed Launch + Live Preview
+- [ ] service-backed device metadata parity with gateway/web
+- [ ] gateway-issued launch/session authorization
+- [ ] WebRTC signaling and session admission
+- [ ] H.264 live preview path for camera grid
+- [ ] recorded retrieval preserved alongside live preview
+- [ ] same-LAN and NAT-friendly path validation
 
 ## Iteration 4: Productionization
 - [ ] signed/provenance verification for release artifacts (beyond SHA256 file checks)
@@ -33,4 +35,3 @@
 - [ ] vendor-specific P2P disable automation hooks (where camera APIs allow)
 - [ ] Reolink `9000` control-plane reversal for zero-manual RTSP/ONVIF/P2P toggles
 - [ ] full operator runbooks for fedora lab + vps deployment profiles
-

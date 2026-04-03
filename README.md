@@ -2,14 +2,15 @@
 
 `constitute-nvr` is the native NVR workload for Constitution.
 
-It runs as a Fedora/Linux service, joins swarm as `role=native` with `service=nvr`, ingests camera streams, encrypts retained segments, and serves authorized identity-bound clients over a negotiated symmetric session.
+It runs as a Fedora/Linux service, joins swarm as a service-backed device with `role=native` and `service=nvr`, ingests camera streams, encrypts retained segments, and serves managed live preview through gateway-authorized WebRTC.
 
 ## Current Iteration Scope
 - ONVIF WS-Discovery probe path + source lifecycle commands
 - RTSP ingest via `ffmpeg` segment recorder with restart/backoff state machine
 - encrypted segment store (`.cnv` blobs)
-- swarm-native UDP presence announcements with UI module advertisement + service metrics
-- identity-gated websocket session with ECDH + symmetric payload channel (`list_source_states`, `upsert_source`, `remove_source`, `setup_reolink`)
+- service-backed device publication with host gateway relationship and service metrics
+- gateway-authorized WebRTC H.264 live preview
+- recorded retrieval path preserved for archive access
 - systemd self-update timer flow
 - Reolink onboarding for MVP using LAN discovery + HTTP CGI setup/read/apply (RTSP/ONVIF enable, P2P disable) while native `9000` replacement remains under R&D
 
@@ -44,7 +45,8 @@ Optional auto-provision flags:
 
 ## Runtime Overview
 - Swarm transport: UDP, client mode (`native` + `nvr` capability)
-- Control/serving surface: websocket at `api.bind` (`/session`)
+- Managed live view: gateway-mediated signaling plus WebRTC H.264 preview
+- Control/archive surface: command/session API for discovery, camera lifecycle, and recorded retrieval
 - Health endpoint: `GET /health`
 - Config path default: `/etc/constitute-nvr/config.json`
 - Reolink runtime default: CGI-first (`setup_reolink`, `read_reolink_state`, `apply_reolink_state`), with `setup_reolink` auto-upserting a recorder source on success
@@ -53,20 +55,18 @@ Optional auto-provision flags:
 ## Config Highlights
 `config.example.json` includes:
 - `swarm.bind`, `swarm.peers`, `swarm.zones`
-- `api.identity_id`, `api.authorized_device_pks`, `api.public_ws_url`, `api.allow_unsigned_hello_mvp` (MVP mode for web shell launch without shipping identity secret)
+- `api.identity_id`, `api.authorized_device_pks`, `api.public_ws_url`, `api.allow_unsigned_hello_mvp` (direct/manual debug mode only)
 - `storage.root`, `storage.encryption_key_hex`
 - `update.interval_secs`
-- `ui.repo`, `ui.ref`, `ui.manifest_url`, `ui.entry`
+- `gateway.host_gateway_pk`
 - `cameras[]` ONVIF/RTSP source definitions
 
 ## Security Model (Current)
 - Segment-at-rest encryption uses service storage key.
-- Device session channel uses X25519 ECDH + HKDF-derived symmetric key.
-- Session admission requires:
-  - matching `identity_id`
-  - optional device allowlist (`authorized_device_pks`)
-  - HMAC proof over hello envelope (`identity_secret_hex`) unless `allow_unsigned_hello_mvp=true`
-- Unsigned MVP mode is for local integration bring-up only; disable it for non-lab deployments.
+- Managed live preview requires short-lived gateway-issued authorization.
+- Direct debug session channel uses X25519 ECDH + HKDF-derived symmetric key.
+- Direct debug admission still supports the legacy HMAC proof flow for lab work.
+- Unsigned MVP mode is for local integration bring-up only and is not the canonical managed path.
 - Camera network hardening is operator-controlled and scriptable.
 
 ## Local Dev
@@ -91,4 +91,3 @@ sudo cargo run -- --bootstrap-reolink-server-ip 192.168.1.10 --bootstrap-reolink
 
 ## Status
 POC-grade for manual lab validation. Not production-ready.
-

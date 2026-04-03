@@ -2,6 +2,7 @@ mod api;
 mod camera;
 mod config;
 mod crypto;
+mod live;
 mod nostr;
 mod reolink;
 mod reolink_cgi;
