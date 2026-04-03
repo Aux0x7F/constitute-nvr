@@ -67,11 +67,11 @@ pub async fn run(
 ) -> Result<()> {
     let bind = cfg.api.bind.clone();
     let state = Arc::new(ApiState {
+        preview: PreviewManager::new(&cfg)?,
         cfg: Arc::new(Mutex::new(cfg)),
         cfg_path,
         storage,
         recorder,
-        preview: PreviewManager::new()?,
     });
 
     let app = Router::new()

@@ -1,4 +1,4 @@
-use crate::config::{CameraConfig, Config};
+use crate::config::{CameraConfig, Config, LivePreviewConfig};
 use crate::nostr::{self, NostrEvent};
 use anyhow::{Context, Result, anyhow};
 use rtp::packet::Packet as RtpPacket;
@@ -14,6 +14,9 @@ use tracing::{info, warn};
 use util::Unmarshal;
 use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
+use webrtc::api::setting_engine::SettingEngine;
+use webrtc::ice::mdns::MulticastDnsMode;
+use webrtc::ice::udp_network::{EphemeralUDP, UDPNetwork};
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -124,10 +127,18 @@ pub struct PreviewManager {
 }
 
 impl PreviewManager {
-    pub fn new() -> Result<Self> {
+    pub fn new(cfg: &Config) -> Result<Self> {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
-        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        let mut setting_engine = build_setting_engine(
+            &cfg.live_preview,
+            cfg.camera_network.interface.trim(),
+        )?;
+        setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::QueryOnly);
+        let api = APIBuilder::new()
+            .with_media_engine(media_engine)
+            .with_setting_engine(setting_engine)
+            .build();
         Ok(Self {
             api: Arc::new(api),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -245,6 +256,21 @@ impl PreviewManager {
             "reason": request.payload.get("reason").cloned().unwrap_or_else(|| json!("closed")),
         }))
     }
+}
+
+fn build_setting_engine(cfg: &LivePreviewConfig, camera_iface: &str) -> Result<SettingEngine> {
+    let mut setting_engine = SettingEngine::default();
+    let udp_network = UDPNetwork::Ephemeral(
+        EphemeralUDP::new(cfg.udp_port_min, cfg.udp_port_max)
+            .map_err(|err| anyhow!("invalid live preview udp port range: {err}"))?,
+    );
+    setting_engine.set_udp_network(udp_network);
+    let blocked_iface = camera_iface.trim().to_string();
+    setting_engine.set_interface_filter(Box::new(move |iface| {
+        let trimmed = iface.trim();
+        !trimmed.eq_ignore_ascii_case("lo") && trimmed != blocked_iface
+    }));
+    Ok(setting_engine)
 }
 
 fn build_rtc_configuration(hints: &ManagedIceServerHints) -> RTCConfiguration {

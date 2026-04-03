@@ -43,6 +43,8 @@ REOLINK_HINT_IP=""
 CAMERA_HOST_IP=""
 CAMERA_DHCP_RANGE_START=""
 CAMERA_DHCP_RANGE_END=""
+PREVIEW_UDP_PORT_MIN=41000
+PREVIEW_UDP_PORT_MAX=41031
 UPDATE_MODE="release_artifact"
 UPDATE_BUILD_USER="${SUDO_USER:-${USER:-}}"
 
@@ -72,6 +74,8 @@ Options:
   --camera-cidr <cidr>       Camera subnet (auto-selects non-colliding /24 when omitted)
   --onvif-ports <csv>        Camera control TCP ports (default: 80,443,8000,8080,8899,9000)
   --rtsp-ports <csv>         RTSP TCP ports (default: 554)
+  --preview-udp-port-min <port> Lower bound for live preview ICE UDP ports (default: 41000)
+  --preview-udp-port-max <port> Upper bound for live preview ICE UDP ports (default: 41031)
   --no-ntp-host              Do not allow camera->host UDP/123
   --identity-id <id>         Bind NVR session auth to identity id
   --authorized-device-pk <pk> Add authorized identity device pk (repeatable)
@@ -134,6 +138,42 @@ confirm() {
     [Yy]|[Yy][Ee][Ss]) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+configure_live_preview_firewall() {
+  local port_min="$1"
+  local port_max="$2"
+
+  if ! command -v firewall-cmd >/dev/null 2>&1; then
+    log "firewall-cmd not found; skipping live preview firewall config"
+    return 0
+  fi
+  if ! run_sudo systemctl is-active --quiet firewalld; then
+    log "firewalld inactive; skipping live preview firewall config"
+    return 0
+  fi
+
+  local upstream_iface=""
+  upstream_iface="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')"
+  if [[ -z "$upstream_iface" ]]; then
+    log "no default-route interface found; skipping live preview firewall config"
+    return 0
+  fi
+
+  local zone=""
+  zone="$(run_sudo firewall-cmd --get-zone-of-interface="$upstream_iface" 2>/dev/null | tr -d '\r' | head -n 1)"
+  if [[ -z "$zone" ]]; then
+    zone="$(run_sudo firewall-cmd --get-default-zone 2>/dev/null | tr -d '\r' | head -n 1)"
+  fi
+  if [[ -z "$zone" ]]; then
+    log "unable to determine firewalld zone for $upstream_iface; skipping live preview firewall config"
+    return 0
+  fi
+
+  log "opening live preview UDP ports on ${upstream_iface} (${zone}): 5353 and ${port_min}-${port_max}"
+  run_sudo firewall-cmd --permanent --zone="$zone" --add-port=5353/udp >/dev/null 2>&1 || true
+  run_sudo firewall-cmd --permanent --zone="$zone" --add-port="${port_min}-${port_max}/udp" >/dev/null 2>&1 || true
+  run_sudo firewall-cmd --reload >/dev/null
 }
 
 while [[ $# -gt 0 ]]; do
@@ -204,6 +244,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --rtsp-ports)
       RTSP_PORTS="${2:?missing value for --rtsp-ports}"
+      shift 2
+      ;;
+    --preview-udp-port-min)
+      PREVIEW_UDP_PORT_MIN="${2:?missing value for --preview-udp-port-min}"
+      shift 2
+      ;;
+    --preview-udp-port-max)
+      PREVIEW_UDP_PORT_MAX="${2:?missing value for --preview-udp-port-max}"
       shift 2
       ;;
     --no-ntp-host)
@@ -367,6 +415,14 @@ fi
 
 if ! [[ "$UPDATE_INTERVAL_SECS" =~ ^[0-9]+$ ]]; then
   echo "update interval must be integer seconds" >&2
+  exit 1
+fi
+if ! [[ "$PREVIEW_UDP_PORT_MIN" =~ ^[0-9]+$ && "$PREVIEW_UDP_PORT_MAX" =~ ^[0-9]+$ ]]; then
+  echo "live preview UDP port bounds must be integers" >&2
+  exit 1
+fi
+if (( PREVIEW_UDP_PORT_MIN < 1024 || PREVIEW_UDP_PORT_MIN > 65535 || PREVIEW_UDP_PORT_MAX < PREVIEW_UDP_PORT_MIN || PREVIEW_UDP_PORT_MAX > 65535 )); then
+  echo "live preview UDP port bounds must describe a valid range within 1024-65535" >&2
   exit 1
 fi
 
@@ -624,6 +680,8 @@ run_sudo env \
   CFG_CAMERA_HOST_IP="${CAMERA_HOST_IP}" \
   CFG_CAMERA_DHCP_RANGE_START="${CAMERA_DHCP_RANGE_START}" \
   CFG_CAMERA_DHCP_RANGE_END="${CAMERA_DHCP_RANGE_END}" \
+  CFG_PREVIEW_UDP_PORT_MIN="${PREVIEW_UDP_PORT_MIN}" \
+  CFG_PREVIEW_UDP_PORT_MAX="${PREVIEW_UDP_PORT_MAX}" \
   CFG_FIRST_INSTALL="${CONFIG_WAS_INSTALLED}" \
   python3 - <<'PY'
 import base64
@@ -662,6 +720,8 @@ camera_cidr = os.environ.get('CFG_CAMERA_CIDR', '').strip()
 camera_host_ip = os.environ.get('CFG_CAMERA_HOST_IP', '').strip()
 camera_dhcp_range_start = os.environ.get('CFG_CAMERA_DHCP_RANGE_START', '').strip()
 camera_dhcp_range_end = os.environ.get('CFG_CAMERA_DHCP_RANGE_END', '').strip()
+preview_udp_port_min = int(os.environ.get('CFG_PREVIEW_UDP_PORT_MIN', '41000') or '41000')
+preview_udp_port_max = int(os.environ.get('CFG_PREVIEW_UDP_PORT_MAX', '41031') or '41031')
 first_install = os.environ.get('CFG_FIRST_INSTALL', '0').strip() == '1'
 
 def looks_like_template_camera(camera: dict) -> bool:
@@ -734,6 +794,10 @@ camera_network['host_ip'] = camera_host_ip
 camera_network['dhcp_enabled'] = True
 camera_network['dhcp_range_start'] = camera_dhcp_range_start
 camera_network['dhcp_range_end'] = camera_dhcp_range_end
+
+live_preview = raw.setdefault('live_preview', {})
+live_preview['udp_port_min'] = preview_udp_port_min
+live_preview['udp_port_max'] = preview_udp_port_max
 
 if first_install or (
     isinstance(raw.get('cameras'), list)
@@ -828,6 +892,8 @@ if [[ "$APPLY_HARDENING" -eq 1 ]]; then
   fi
   run_sudo bash "$HARDEN_SCRIPT_SRC" "${harden_args[@]}"
 fi
+
+configure_live_preview_firewall "$PREVIEW_UDP_PORT_MIN" "$PREVIEW_UDP_PORT_MAX"
 
 log "installation complete"
 run_sudo systemctl --no-pager --full status "$SERVICE_NAME" | sed -n '1,20p' || true

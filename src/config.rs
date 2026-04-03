@@ -144,6 +144,23 @@ pub struct CameraNetworkConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LivePreviewConfig {
+    #[serde(default = "default_live_preview_udp_port_min")]
+    pub udp_port_min: u16,
+    #[serde(default = "default_live_preview_udp_port_max")]
+    pub udp_port_max: u16,
+}
+
+impl Default for LivePreviewConfig {
+    fn default() -> Self {
+        Self {
+            udp_port_min: default_live_preview_udp_port_min(),
+            udp_port_max: default_live_preview_udp_port_max(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UiModuleConfig {
     #[serde(default = "default_ui_repo")]
     pub repo: String,
@@ -204,6 +221,8 @@ pub struct Config {
     pub autoprovision: AutoProvisionConfig,
     #[serde(default)]
     pub camera_network: CameraNetworkConfig,
+    #[serde(default)]
+    pub live_preview: LivePreviewConfig,
     #[serde(default)]
     pub cameras: Vec<CameraConfig>,
 }
@@ -325,6 +344,7 @@ impl Config {
         }
 
         changed |= apply_camera_network_defaults(&mut self.camera_network);
+        changed |= apply_live_preview_defaults(&mut self.live_preview);
 
         if self.swarm.zones.is_empty() {
             self.swarm.zones.push(ZoneConfig {
@@ -402,6 +422,7 @@ impl Config {
             ui: UiModuleConfig::default(),
             autoprovision: AutoProvisionConfig::default(),
             camera_network: CameraNetworkConfig::default(),
+            live_preview: LivePreviewConfig::default(),
             cameras: Vec::new(),
         }
     }
@@ -463,6 +484,14 @@ fn default_update_script() -> String {
     "/usr/local/bin/constitute-nvr-self-update".to_string()
 }
 
+fn default_live_preview_udp_port_min() -> u16 {
+    41000
+}
+
+fn default_live_preview_udp_port_max() -> u16 {
+    41031
+}
+
 fn apply_camera_network_defaults(cfg: &mut CameraNetworkConfig) -> bool {
     let mut changed = false;
     if cfg.subnet_cidr.trim().is_empty() {
@@ -492,6 +521,23 @@ fn apply_camera_network_defaults(cfg: &mut CameraNetworkConfig) -> bool {
     }
     if cfg.dhcp_range_end.trim().is_empty() {
         cfg.dhcp_range_end = format!("{prefix}.199");
+        changed = true;
+    }
+    changed
+}
+
+fn apply_live_preview_defaults(cfg: &mut LivePreviewConfig) -> bool {
+    let mut changed = false;
+    if cfg.udp_port_min == 0 {
+        cfg.udp_port_min = default_live_preview_udp_port_min();
+        changed = true;
+    }
+    if cfg.udp_port_max == 0 {
+        cfg.udp_port_max = default_live_preview_udp_port_max();
+        changed = true;
+    }
+    if cfg.udp_port_max < cfg.udp_port_min {
+        cfg.udp_port_max = cfg.udp_port_min;
         changed = true;
     }
     changed
@@ -609,5 +655,21 @@ mod tests {
         assert_eq!(cfg.camera_network.host_ip, "192.168.250.1");
         assert_eq!(cfg.camera_network.dhcp_range_start, "192.168.250.50");
         assert_eq!(cfg.camera_network.dhcp_range_end, "192.168.250.199");
+    }
+
+    #[test]
+    fn apply_defaults_repairs_live_preview_port_range() {
+        let mut cfg = Config::default_generated();
+        cfg.live_preview.udp_port_min = 0;
+        cfg.live_preview.udp_port_max = 0;
+        cfg.apply_defaults();
+        assert_eq!(cfg.live_preview.udp_port_min, 41000);
+        assert_eq!(cfg.live_preview.udp_port_max, 41031);
+
+        cfg.live_preview.udp_port_min = 43000;
+        cfg.live_preview.udp_port_max = 42999;
+        cfg.apply_defaults();
+        assert_eq!(cfg.live_preview.udp_port_min, 43000);
+        assert_eq!(cfg.live_preview.udp_port_max, 43000);
     }
 }
