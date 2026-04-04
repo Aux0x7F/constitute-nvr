@@ -18,6 +18,7 @@ use webrtc::api::setting_engine::SettingEngine;
 use webrtc::ice::mdns::MulticastDnsMode;
 use webrtc::ice::network_type::NetworkType;
 use webrtc::ice::udp_network::{EphemeralUDP, UDPNetwork};
+use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -44,6 +45,8 @@ pub struct ManagedOfferRequest {
     pub offer: Value,
     #[serde(rename = "iceServers", default)]
     pub ice_servers: ManagedIceServerHints,
+    #[serde(default)]
+    pub candidates: Vec<RTCIceCandidateInit>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -71,6 +74,21 @@ pub struct ManagedOfferResponse {
     #[serde(rename = "sessionId")]
     pub session_id: String,
     pub sources: Vec<ManagedSourceInfo>,
+    #[serde(default)]
+    pub candidates: Vec<RTCIceCandidateInit>,
+}
+
+fn push_unique_ice_candidate(into: &mut Vec<RTCIceCandidateInit>, candidate: &RTCIceCandidateInit) {
+    if candidate.candidate.trim().is_empty() {
+        return;
+    }
+    if into
+        .iter()
+        .any(|existing| ice_candidates_equal(existing, candidate))
+    {
+        return;
+    }
+    into.push(candidate.clone());
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +206,7 @@ impl PreviewManager {
         let offer = parse_offer_description(&request.offer)?;
         let preview_codec = select_preview_codec(&request.offer)?;
         let selected = select_sources(cfg, source_ids_from_offer(&request.offer))?;
+        let remote_candidates = request_candidates(&request);
         if selected.is_empty() {
             return Err(anyhow!("no enabled camera sources available for live preview"));
         }
@@ -202,6 +221,24 @@ impl PreviewManager {
                 .new_peer_connection(build_rtc_configuration(&request.ice_servers))
                 .await?,
         );
+        let gathered_candidates: Arc<Mutex<Vec<RTCIceCandidateInit>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let gathered_candidates_handle = Arc::clone(&gathered_candidates);
+        pc.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
+            let gathered_candidates = Arc::clone(&gathered_candidates_handle);
+            Box::pin(async move {
+                let Some(candidate) = candidate else {
+                    return;
+                };
+                let Ok(json) = candidate.to_json() else {
+                    return;
+                };
+                let mut candidates = gathered_candidates.lock().await;
+                if !candidates.iter().any(|existing| ice_candidates_equal(existing, &json)) {
+                    candidates.push(json);
+                }
+            })
+        }));
         let session_id = format!("nvr-preview-{}", token.launch_nonce);
         let cleanup_sessions = Arc::clone(&self.sessions);
         let cleanup_key = session_key.clone();
@@ -224,6 +261,7 @@ impl PreviewManager {
         }));
 
         pc.set_remote_description(offer).await?;
+        apply_remote_candidates(&pc, &remote_candidates).await?;
 
         let mut stops = Vec::new();
         let mut response_sources = Vec::new();
@@ -258,6 +296,7 @@ impl PreviewManager {
             .local_description()
             .await
             .ok_or_else(|| anyhow!("missing local description"))?;
+        let response_candidates = gathered_candidates.lock().await.clone();
 
         self.sessions.lock().await.insert(
             session_key,
@@ -273,6 +312,7 @@ impl PreviewManager {
             answer: local_desc,
             session_id,
             sources: response_sources,
+            candidates: response_candidates,
         })
     }
 
@@ -334,6 +374,28 @@ fn dedup_urls(values: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+fn ice_candidates_equal(left: &RTCIceCandidateInit, right: &RTCIceCandidateInit) -> bool {
+    left.candidate == right.candidate
+        && left.sdp_mid == right.sdp_mid
+        && left.sdp_mline_index == right.sdp_mline_index
+        && left.username_fragment == right.username_fragment
+}
+
+async fn apply_remote_candidates(
+    pc: &Arc<RTCPeerConnection>,
+    candidates: &[RTCIceCandidateInit],
+) -> Result<()> {
+    for candidate in candidates {
+        if candidate.candidate.trim().is_empty() {
+            continue;
+        }
+        pc.add_ice_candidate(candidate.clone())
+            .await
+            .context("remote ice candidate rejected")?;
+    }
+    Ok(())
 }
 
 fn validate_launch_token(cfg: &Config, token: &str) -> Result<ManagedLaunchTokenPayload> {
@@ -403,6 +465,37 @@ fn source_ids_from_offer(value: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn collect_offer_candidates(value: &Value) -> Vec<RTCIceCandidateInit> {
+    let mut out = Vec::new();
+    for candidate_set in [
+        value.get("candidates"),
+        value.get("description")
+            .and_then(|description| description.get("candidates")),
+    ] {
+        let Some(entries) = candidate_set.and_then(|item| item.as_array()) else {
+            continue;
+        };
+        for entry in entries {
+            let Ok(candidate) = serde_json::from_value::<RTCIceCandidateInit>(entry.clone()) else {
+                continue;
+            };
+            push_unique_ice_candidate(&mut out, &candidate);
+        }
+    }
+    out
+}
+
+fn request_candidates(request: &ManagedOfferRequest) -> Vec<RTCIceCandidateInit> {
+    let mut out = Vec::new();
+    for candidate in &request.candidates {
+        push_unique_ice_candidate(&mut out, candidate);
+    }
+    for candidate in collect_offer_candidates(&request.offer) {
+        push_unique_ice_candidate(&mut out, &candidate);
+    }
+    out
 }
 
 fn offer_description_sdp(value: &Value) -> Option<&str> {
@@ -678,6 +771,38 @@ mod tests {
         let desc = parse_offer_description(&offer).expect("desc");
         assert_eq!(desc.sdp_type.to_string(), "offer");
         assert_eq!(source_ids_from_offer(&offer), vec!["cam-1".to_string()]);
+    }
+
+    #[test]
+    fn request_candidates_accept_top_level_and_nested_offer_candidates() {
+        let request = ManagedOfferRequest {
+            launch_token: "token".to_string(),
+            offer: json!({
+                "description": {
+                    "type": "offer",
+                    "sdp": "v=0\r\n"
+                },
+                "candidates": [
+                    {
+                        "candidate": "candidate:2 1 udp 2122260223 10.0.229.73 54548 typ host",
+                        "sdpMid": "0",
+                        "sdpMLineIndex": 0
+                    }
+                ]
+            }),
+            ice_servers: ManagedIceServerHints::default(),
+            candidates: vec![RTCIceCandidateInit {
+                candidate: "candidate:1 1 udp 2122260223 10.0.229.73 54547 typ host".to_string(),
+                sdp_mid: Some("0".to_string()),
+                sdp_mline_index: Some(0),
+                username_fragment: None,
+            }],
+        };
+
+        let out = request_candidates(&request);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().any(|candidate| candidate.candidate.contains("54547")));
+        assert!(out.iter().any(|candidate| candidate.candidate.contains("54548")));
     }
 
     #[test]
