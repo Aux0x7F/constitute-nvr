@@ -55,12 +55,24 @@ pub struct UpdateConfig {
     pub enabled: bool,
     #[serde(default = "default_update_interval_secs")]
     pub interval_secs: u64,
+    #[serde(default)]
+    pub mode: UpdateMode,
     #[serde(default = "default_update_source_dir")]
     pub source_dir: String,
     #[serde(default = "default_update_branch")]
     pub branch: String,
     #[serde(default = "default_update_script")]
     pub script_path: String,
+    #[serde(default)]
+    pub build_user: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateMode {
+    #[default]
+    ReleaseArtifact,
+    SourceBuild,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -113,6 +125,41 @@ pub struct CameraConfig {
     pub segment_secs: u64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CameraNetworkConfig {
+    #[serde(default)]
+    pub managed: bool,
+    #[serde(default)]
+    pub interface: String,
+    #[serde(default)]
+    pub subnet_cidr: String,
+    #[serde(default)]
+    pub host_ip: String,
+    #[serde(default)]
+    pub dhcp_enabled: bool,
+    #[serde(default)]
+    pub dhcp_range_start: String,
+    #[serde(default)]
+    pub dhcp_range_end: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LivePreviewConfig {
+    #[serde(default = "default_live_preview_udp_port_min")]
+    pub udp_port_min: u16,
+    #[serde(default = "default_live_preview_udp_port_max")]
+    pub udp_port_max: u16,
+}
+
+impl Default for LivePreviewConfig {
+    fn default() -> Self {
+        Self {
+            udp_port_min: default_live_preview_udp_port_min(),
+            udp_port_max: default_live_preview_udp_port_max(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UiModuleConfig {
     #[serde(default = "default_ui_repo")]
@@ -134,6 +181,12 @@ impl Default for UiModuleConfig {
             entry: default_ui_entry(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GatewayConfig {
+    #[serde(default)]
+    pub host_gateway_pk: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -161,9 +214,15 @@ pub struct Config {
     #[serde(default = "default_pair_request_attempts")]
     pub pair_request_attempts: u32,
     #[serde(default)]
+    pub gateway: GatewayConfig,
+    #[serde(default)]
     pub ui: UiModuleConfig,
     #[serde(default)]
     pub autoprovision: AutoProvisionConfig,
+    #[serde(default)]
+    pub camera_network: CameraNetworkConfig,
+    #[serde(default)]
+    pub live_preview: LivePreviewConfig,
     #[serde(default)]
     pub cameras: Vec<CameraConfig>,
 }
@@ -279,9 +338,13 @@ impl Config {
         }
 
         if self.autoprovision.reolink_discover_timeout_secs == 0 {
-            self.autoprovision.reolink_discover_timeout_secs = default_reolink_discover_timeout_secs();
+            self.autoprovision.reolink_discover_timeout_secs =
+                default_reolink_discover_timeout_secs();
             changed = true;
         }
+
+        changed |= apply_camera_network_defaults(&mut self.camera_network);
+        changed |= apply_live_preview_defaults(&mut self.live_preview);
 
         if self.swarm.zones.is_empty() {
             self.swarm.zones.push(ZoneConfig {
@@ -344,17 +407,22 @@ impl Config {
             update: UpdateConfig {
                 enabled: default_update_enabled(),
                 interval_secs: default_update_interval_secs(),
+                mode: UpdateMode::default(),
                 source_dir: default_update_source_dir(),
                 branch: default_update_branch(),
                 script_path: default_update_script(),
+                build_user: String::new(),
             },
             pair_identity_label: String::new(),
             pair_code: String::new(),
             pair_code_hash: String::new(),
             pair_request_interval_secs: default_pair_request_interval_secs(),
             pair_request_attempts: default_pair_request_attempts(),
+            gateway: GatewayConfig::default(),
             ui: UiModuleConfig::default(),
             autoprovision: AutoProvisionConfig::default(),
+            camera_network: CameraNetworkConfig::default(),
+            live_preview: LivePreviewConfig::default(),
             cameras: Vec::new(),
         }
     }
@@ -414,6 +482,65 @@ fn default_update_branch() -> String {
 
 fn default_update_script() -> String {
     "/usr/local/bin/constitute-nvr-self-update".to_string()
+}
+
+fn default_live_preview_udp_port_min() -> u16 {
+    41000
+}
+
+fn default_live_preview_udp_port_max() -> u16 {
+    41031
+}
+
+fn apply_camera_network_defaults(cfg: &mut CameraNetworkConfig) -> bool {
+    let mut changed = false;
+    if cfg.subnet_cidr.trim().is_empty() {
+        return false;
+    }
+
+    let Some(network) = cfg.subnet_cidr.split('/').next().map(str::trim) else {
+        return false;
+    };
+    let octets = network
+        .split('.')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if octets.len() != 4 {
+        return false;
+    }
+
+    let prefix = format!("{}.{}.{}", octets[0], octets[1], octets[2]);
+    if cfg.host_ip.trim().is_empty() {
+        cfg.host_ip = format!("{prefix}.1");
+        changed = true;
+    }
+    if cfg.dhcp_range_start.trim().is_empty() {
+        cfg.dhcp_range_start = format!("{prefix}.50");
+        changed = true;
+    }
+    if cfg.dhcp_range_end.trim().is_empty() {
+        cfg.dhcp_range_end = format!("{prefix}.199");
+        changed = true;
+    }
+    changed
+}
+
+fn apply_live_preview_defaults(cfg: &mut LivePreviewConfig) -> bool {
+    let mut changed = false;
+    if cfg.udp_port_min == 0 {
+        cfg.udp_port_min = default_live_preview_udp_port_min();
+        changed = true;
+    }
+    if cfg.udp_port_max == 0 {
+        cfg.udp_port_max = default_live_preview_udp_port_max();
+        changed = true;
+    }
+    if cfg.udp_port_max < cfg.udp_port_min {
+        cfg.udp_port_max = cfg.udp_port_min;
+        changed = true;
+    }
+    changed
 }
 
 fn default_pair_request_interval_secs() -> u64 {
@@ -515,5 +642,34 @@ mod tests {
         cfg.apply_defaults();
         assert_eq!(cfg.pair_request_interval_secs, 15);
         assert_eq!(cfg.pair_request_attempts, 24);
+    }
+
+    #[test]
+    fn apply_defaults_derives_camera_network_ranges() {
+        let mut cfg = Config::default_generated();
+        cfg.camera_network.subnet_cidr = "192.168.250.0/24".to_string();
+        cfg.camera_network.host_ip.clear();
+        cfg.camera_network.dhcp_range_start.clear();
+        cfg.camera_network.dhcp_range_end.clear();
+        cfg.apply_defaults();
+        assert_eq!(cfg.camera_network.host_ip, "192.168.250.1");
+        assert_eq!(cfg.camera_network.dhcp_range_start, "192.168.250.50");
+        assert_eq!(cfg.camera_network.dhcp_range_end, "192.168.250.199");
+    }
+
+    #[test]
+    fn apply_defaults_repairs_live_preview_port_range() {
+        let mut cfg = Config::default_generated();
+        cfg.live_preview.udp_port_min = 0;
+        cfg.live_preview.udp_port_max = 0;
+        cfg.apply_defaults();
+        assert_eq!(cfg.live_preview.udp_port_min, 41000);
+        assert_eq!(cfg.live_preview.udp_port_max, 41031);
+
+        cfg.live_preview.udp_port_min = 43000;
+        cfg.live_preview.udp_port_max = 42999;
+        cfg.apply_defaults();
+        assert_eq!(cfg.live_preview.udp_port_min, 43000);
+        assert_eq!(cfg.live_preview.udp_port_max, 43000);
     }
 }

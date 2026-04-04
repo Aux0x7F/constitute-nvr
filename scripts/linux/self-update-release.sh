@@ -7,6 +7,8 @@ INSTALL_PREFIX="${INSTALL_PREFIX:-/opt/constitute-nvr}"
 SERVICE_NAME="${SERVICE_NAME:-constitute-nvr}"
 TRY_RESTART=0
 FORCE=0
+MODE="${MODE:-release_artifact}"
+BUILD_USER="${BUILD_USER:-}"
 
 # Compatibility with source-based updater invocation args.
 SOURCE_DIR=""
@@ -30,6 +32,8 @@ Options:
   --repo-name <name>         GitHub repo (default: constitute-nvr)
   --install-prefix <path>    Install prefix (default: /opt/constitute-nvr)
   --service-name <name>      systemd service name (default: constitute-nvr)
+  --mode <name>              Update mode hint (default: release_artifact)
+  --build-user <name>        Compatibility no-op
   --try-restart              Restart service when binary changed
   --force                    Reinstall even if binary hash is unchanged
   --proxy-url <url>          Use HTTP(S) proxy for release fetches
@@ -127,6 +131,14 @@ while [[ $# -gt 0 ]]; do
       SERVICE_NAME="${2:?missing value for --service-name}"
       shift 2
       ;;
+    --mode)
+      MODE="${2:-}"
+      shift 2
+      ;;
+    --build-user)
+      BUILD_USER="${2:-}"
+      shift 2
+      ;;
     --try-restart)
       TRY_RESTART=1
       shift
@@ -179,6 +191,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -n "$MODE" && "$MODE" != "release_artifact" ]]; then
+  echo "[self-update] mode=${MODE}; release updater is a no-op"
+  exit 0
+fi
 
 require_cmd curl
 require_cmd grep
