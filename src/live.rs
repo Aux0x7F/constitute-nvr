@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, watch};
 use tracing::{info, warn};
 use util::Unmarshal;
 use webrtc::api::APIBuilder;
-use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
+use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_VP8, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::ice::mdns::MulticastDnsMode;
 use webrtc::ice::network_type::NetworkType;
@@ -95,6 +95,39 @@ struct ManagedLaunchTokenPayload {
     expires_at: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewCodec {
+    H264,
+    Vp8,
+}
+
+impl PreviewCodec {
+    fn label(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Vp8 => "vp8",
+        }
+    }
+
+    fn capability(self) -> RTCRtpCodecCapability {
+        match self {
+            Self::H264 => RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_H264.to_owned(),
+                clock_rate: 90_000,
+                sdp_fmtp_line:
+                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                        .to_string(),
+                ..Default::default()
+            },
+            Self::Vp8 => RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_VP8.to_owned(),
+                clock_rate: 90_000,
+                ..Default::default()
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PreviewSessionHandle {
     session_id: String,
@@ -153,6 +186,7 @@ impl PreviewManager {
     ) -> Result<ManagedOfferResponse> {
         let token = validate_launch_token(cfg, &request.launch_token)?;
         let offer = parse_offer_description(&request.offer)?;
+        let preview_codec = select_preview_codec(&request.offer)?;
         let selected = select_sources(cfg, source_ids_from_offer(&request.offer))?;
         if selected.is_empty() {
             return Err(anyhow!("no enabled camera sources available for live preview"));
@@ -194,16 +228,8 @@ impl PreviewManager {
         let mut stops = Vec::new();
         let mut response_sources = Vec::new();
         for camera in &selected {
-            let codec = RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_H264.to_owned(),
-                clock_rate: 90_000,
-                sdp_fmtp_line:
-                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                        .to_string(),
-                ..Default::default()
-            };
             let track = Arc::new(TrackLocalStaticRTP::new(
-                codec,
+                preview_codec.capability(),
                 camera.source_id.clone(),
                 session_id.clone(),
             ));
@@ -211,7 +237,12 @@ impl PreviewManager {
                 .await?;
             let (stop_tx, stop_rx) = watch::channel(false);
             stops.push(stop_tx);
-            tokio::spawn(run_camera_forwarder(camera.clone(), track, stop_rx));
+            tokio::spawn(run_camera_forwarder(
+                camera.clone(),
+                track,
+                stop_rx,
+                preview_codec,
+            ));
             response_sources.push(ManagedSourceInfo {
                 source_id: camera.source_id.clone(),
                 name: camera.name.clone(),
@@ -374,6 +405,30 @@ fn source_ids_from_offer(value: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn offer_description_sdp(value: &Value) -> Option<&str> {
+    value.get("sdp")
+        .and_then(|item| item.as_str())
+        .or_else(|| {
+            value
+                .get("description")
+                .and_then(|item| item.get("sdp"))
+                .and_then(|item| item.as_str())
+        })
+}
+
+fn select_preview_codec(value: &Value) -> Result<PreviewCodec> {
+    let sdp = offer_description_sdp(value).unwrap_or_default();
+    if sdp.contains("H264/90000") {
+        return Ok(PreviewCodec::H264);
+    }
+    if sdp.contains("VP8/90000") {
+        return Ok(PreviewCodec::Vp8);
+    }
+    Err(anyhow!(
+        "browser offer does not advertise a supported preview codec (need H264 or VP8)"
+    ))
+}
+
 fn select_sources(cfg: &Config, requested: Vec<String>) -> Result<Vec<CameraConfig>> {
     let enabled = cfg
         .cameras
@@ -414,6 +469,7 @@ async fn run_camera_forwarder(
     camera: CameraConfig,
     track: Arc<TrackLocalStaticRTP>,
     mut stop_rx: watch::Receiver<bool>,
+    codec: PreviewCodec,
 ) {
     let preview_url = preview_rtsp_url(&camera);
     let std_socket = match std::net::UdpSocket::bind("127.0.0.1:0") {
@@ -442,7 +498,8 @@ async fn run_camera_forwarder(
         }
     };
 
-    let mut child = match Command::new("ffmpeg")
+    let mut ffmpeg = Command::new("ffmpeg");
+    ffmpeg
         .arg("-nostdin")
         .arg("-loglevel")
         .arg("error")
@@ -450,9 +507,36 @@ async fn run_camera_forwarder(
         .arg("tcp")
         .arg("-i")
         .arg(&preview_url)
-        .arg("-an")
-        .arg("-c:v")
-        .arg("copy")
+        .arg("-an");
+
+    match codec {
+        PreviewCodec::H264 => {
+            ffmpeg.arg("-c:v").arg("copy");
+        }
+        PreviewCodec::Vp8 => {
+            ffmpeg
+                .arg("-c:v")
+                .arg("libvpx")
+                .arg("-deadline")
+                .arg("realtime")
+                .arg("-cpu-used")
+                .arg("8")
+                .arg("-pix_fmt")
+                .arg("yuv420p")
+                .arg("-g")
+                .arg("30")
+                .arg("-keyint_min")
+                .arg("30")
+                .arg("-b:v")
+                .arg("1M")
+                .arg("-maxrate")
+                .arg("1M")
+                .arg("-bufsize")
+                .arg("2M");
+        }
+    }
+
+    let mut child = match ffmpeg
         .arg("-f")
         .arg("rtp")
         .arg("-payload_type")
@@ -469,7 +553,12 @@ async fn run_camera_forwarder(
         }
     };
 
-    info!(source = %camera.source_id, url = %preview_url, "live preview forwarder started");
+    info!(
+        source = %camera.source_id,
+        url = %preview_url,
+        codec = codec.label(),
+        "live preview forwarder started"
+    );
     let mut buf = vec![0u8; 1600];
     loop {
         tokio::select! {
@@ -589,6 +678,28 @@ mod tests {
         let desc = parse_offer_description(&offer).expect("desc");
         assert_eq!(desc.sdp_type.to_string(), "offer");
         assert_eq!(source_ids_from_offer(&offer), vec!["cam-1".to_string()]);
+    }
+
+    #[test]
+    fn select_preview_codec_prefers_h264_when_available() {
+        let offer = json!({
+            "description": {
+                "type": "offer",
+                "sdp": "m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\na=rtpmap:96 VP8/90000\r\na=rtpmap:97 H264/90000\r\n"
+            }
+        });
+        assert_eq!(select_preview_codec(&offer).expect("codec"), PreviewCodec::H264);
+    }
+
+    #[test]
+    fn select_preview_codec_falls_back_to_vp8() {
+        let offer = json!({
+            "description": {
+                "type": "offer",
+                "sdp": "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP8/90000\r\n"
+            }
+        });
+        assert_eq!(select_preview_codec(&offer).expect("codec"), PreviewCodec::Vp8);
     }
 
     #[test]
