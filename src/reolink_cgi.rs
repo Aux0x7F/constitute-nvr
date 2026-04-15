@@ -10,11 +10,13 @@ use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
 use md5::{Digest, Md5};
 use rand::Rng;
 use reqwest::{Client, header};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{error::Error, fmt};
 
 const HTTP_TIMEOUT_SECS: u64 = 10;
 const HTTP_ENDPOINTS: [(&str, u16); 2] = [("http", 80), ("https", 443)];
+const HTTPS_FIRST_ENDPOINTS: [(&str, u16); 2] = [("https", 443), ("http", 80)];
 const ZERO_BLOCK: usize = 16;
 
 type Aes128CfbEnc = cfb_mode::Encryptor<Aes128>;
@@ -212,6 +214,48 @@ enum ReolinkLoginOutcome {
     Uninitialized { client: Client, base_url: String },
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReolinkPresentationState {
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub time_mode: String,
+    #[serde(default)]
+    pub ntp_server: String,
+    #[serde(default)]
+    pub manual_time: String,
+    #[serde(default)]
+    pub timezone: String,
+    #[serde(default)]
+    pub overlay_text: String,
+    #[serde(default)]
+    pub overlay_timestamp: Option<bool>,
+    #[serde(default)]
+    pub time: Value,
+    #[serde(default)]
+    pub osd: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReolinkPresentationApplyRequest {
+    #[serde(flatten)]
+    pub connection: crate::reolink::ReolinkConnectRequest,
+    #[serde(default)]
+    pub time_mode: Option<String>,
+    #[serde(default)]
+    pub ntp_server: Option<String>,
+    #[serde(default)]
+    pub manual_time: Option<String>,
+    #[serde(default)]
+    pub timezone: Option<String>,
+    #[serde(default)]
+    pub overlay_text: Option<String>,
+    #[serde(default)]
+    pub overlay_timestamp: Option<bool>,
+}
+
 #[derive(Clone, Debug)]
 struct ReolinkCgiCommandError {
     cmd: String,
@@ -240,14 +284,28 @@ impl Error for ReolinkCgiCommandError {}
 
 impl ReolinkHttpSession {
     async fn login(ip: &str, username: &str, password: &str) -> Result<ReolinkLoginOutcome> {
-        let client = Client::builder()
-            .danger_accept_invalid_certs(true)
-            .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
-            .build()
-            .context("failed building Reolink HTTP client")?;
+        let client = build_http_client()?;
+        Self::login_with_endpoints(&client, &HTTP_ENDPOINTS, ip, username, password).await
+    }
 
+    async fn login_prefer_https(
+        ip: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<ReolinkLoginOutcome> {
+        let client = build_http_client()?;
+        Self::login_with_endpoints(&client, &HTTPS_FIRST_ENDPOINTS, ip, username, password).await
+    }
+
+    async fn login_with_endpoints(
+        client: &Client,
+        endpoints: &[(&str, u16)],
+        ip: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<ReolinkLoginOutcome> {
         let mut last_error = None;
-        for (scheme, port) in HTTP_ENDPOINTS {
+        for (scheme, port) in endpoints {
             let base_url = format!("{scheme}://{ip}:{port}");
             match Self::login_on(&client, &base_url, username, password).await {
                 Ok(LoginOnOutcome::Session(session)) => {
@@ -740,6 +798,105 @@ pub async fn apply_state(request: &ReolinkStateApplyRequest) -> Result<ReolinkSt
     })
 }
 
+pub async fn read_presentation_state(
+    request: &crate::reolink::ReolinkConnectRequest,
+) -> Result<ReolinkPresentationState> {
+    let mut session = login_existing_session(request).await?;
+    let time_entry = session.send_command("GetTime", json!({})).await.ok();
+    let osd_entry = session.send_command("GetOsd", json!({})).await.ok();
+    Ok(build_presentation_state(
+        time_entry.as_ref(),
+        osd_entry.as_ref(),
+    ))
+}
+
+pub async fn apply_presentation_state(
+    request: &ReolinkPresentationApplyRequest,
+) -> Result<ReolinkPresentationState> {
+    let mut session = login_existing_session(&request.connection).await?;
+    let time_entry = session.send_command("GetTime", json!({})).await.ok();
+    let osd_entry = session.send_command("GetOsd", json!({})).await.ok();
+    let mut errors = Vec::new();
+
+    if request.time_mode.is_some()
+        || request.ntp_server.is_some()
+        || request.manual_time.is_some()
+        || request.timezone.is_some()
+    {
+        if let Some(mut time_value) = time_entry
+            .as_ref()
+            .and_then(|entry| entry.get("value"))
+            .and_then(|value| value.get("Time"))
+            .cloned()
+        {
+            mutate_time_value(&mut time_value, request);
+            if let Err(error) = session
+                .send_command("SetTime", json!({ "Time": time_value }))
+                .await
+            {
+                errors.push(format!("Reolink CGI SetTime failed: {error}"));
+            }
+        }
+    }
+
+    if request.overlay_text.is_some() || request.overlay_timestamp.is_some() {
+        if let Some(mut osd_value) = osd_entry
+            .as_ref()
+            .and_then(|entry| entry.get("value"))
+            .and_then(|value| value.get("Osd"))
+            .cloned()
+        {
+            mutate_osd_value(&mut osd_value, request);
+            if let Err(error) = session
+                .send_command("SetOsd", json!({ "Osd": osd_value }))
+                .await
+            {
+                errors.push(format!("Reolink CGI SetOsd failed: {error}"));
+            }
+        }
+    }
+
+    let state = read_presentation_state(&request.connection).await?;
+    if errors.is_empty() {
+        Ok(state)
+    } else {
+        Err(anyhow!(errors.join(" | ")))
+    }
+}
+
+pub async fn ptz_command(
+    request: &crate::reolink::ReolinkConnectRequest,
+    op: &str,
+    speed: i32,
+) -> Result<()> {
+    let mut session = login_existing_session_prefer_https(request).await?;
+    session
+        .send_command(
+            "PtzCtrl",
+            json!({
+                "channel": request.channel.max(0),
+                "op": op,
+                "speed": speed.max(1),
+            }),
+        )
+        .await?;
+    Ok(())
+}
+
+pub async fn ptz_stop(request: &crate::reolink::ReolinkConnectRequest) -> Result<()> {
+    let mut session = login_existing_session_prefer_https(request).await?;
+    session
+        .send_command(
+            "PtzCtrl",
+            json!({
+                "channel": request.channel.max(0),
+                "op": "Stop",
+            }),
+        )
+        .await?;
+    Ok(())
+}
+
 async fn login_existing_session(
     request: &crate::reolink::ReolinkConnectRequest,
 ) -> Result<ReolinkHttpSession> {
@@ -749,6 +906,27 @@ async fn login_existing_session(
             "Reolink CGI fallback cannot initialize a factory-reset device; use the proprietary 9000 provisioning path first"
         )),
     }
+}
+
+async fn login_existing_session_prefer_https(
+    request: &crate::reolink::ReolinkConnectRequest,
+) -> Result<ReolinkHttpSession> {
+    match ReolinkHttpSession::login_prefer_https(&request.ip, &request.username, &request.password)
+        .await?
+    {
+        ReolinkLoginOutcome::Session(session) => Ok(session),
+        ReolinkLoginOutcome::Uninitialized { .. } => Err(anyhow!(
+            "Reolink CGI fallback cannot initialize a factory-reset device; use the proprietary 9000 provisioning path first"
+        )),
+    }
+}
+
+fn build_http_client() -> Result<Client> {
+    Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .build()
+        .context("failed building Reolink HTTP client")
 }
 
 async fn bootstrap_user(
@@ -879,6 +1057,236 @@ fn merge_p2p(requested: Option<&ReolinkP2PConfig>) -> ReolinkP2PConfig {
         i_port: 0,
         server_domain_name: String::new(),
     })
+}
+
+fn build_presentation_state(
+    time_entry: Option<&Value>,
+    osd_entry: Option<&Value>,
+) -> ReolinkPresentationState {
+    let time_value = time_entry
+        .and_then(|entry| entry.get("value"))
+        .and_then(|value| value.get("Time"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let osd_value = osd_entry
+        .and_then(|entry| entry.get("value"))
+        .and_then(|value| value.get("Osd"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    ReolinkPresentationState {
+        model: string_at_any(&osd_value, &["channelName", "name"]),
+        time_mode: if bool_at_any(&time_value, &["ntpEnable", "NtpEnable", "ntp_enabled"])
+            .unwrap_or(false)
+        {
+            "ntp".to_string()
+        } else {
+            "manual".to_string()
+        },
+        ntp_server: string_at_any(&time_value, &["ntpServer", "NtpServer", "server"]),
+        manual_time: manual_time_from_value(&time_value),
+        timezone: string_at_any(&time_value, &["timeZone", "TimeZone", "zone"]),
+        overlay_text: overlay_text_from_value(&osd_value),
+        overlay_timestamp: overlay_timestamp_from_value(&osd_value),
+        time: time_value,
+        osd: osd_value,
+    }
+}
+
+fn mutate_time_value(value: &mut Value, request: &ReolinkPresentationApplyRequest) {
+    if let Some(mode) = &request.time_mode {
+        let use_ntp = mode.trim().eq_ignore_ascii_case("ntp");
+        set_bool_at_any(value, &["ntpEnable", "NtpEnable", "ntp_enabled"], use_ntp);
+    }
+    if let Some(server) = &request.ntp_server {
+        set_string_at_any(value, &["ntpServer", "NtpServer", "server"], server);
+    }
+    if let Some(zone) = &request.timezone {
+        set_string_at_any(value, &["timeZone", "TimeZone", "zone"], zone);
+    }
+    if let Some(manual_time) = &request.manual_time {
+        if let Some((year, month, day, hour, minute, second)) =
+            parse_manual_datetime(manual_time.trim())
+        {
+            set_i64_at_any(value, &["year", "Year"], year);
+            set_i64_at_any(value, &["mon", "Mon", "month"], month);
+            set_i64_at_any(value, &["day", "Day"], day);
+            set_i64_at_any(value, &["hour", "Hour"], hour);
+            set_i64_at_any(value, &["min", "Min", "minute"], minute);
+            set_i64_at_any(value, &["sec", "Sec", "second"], second);
+        }
+    }
+}
+
+fn mutate_osd_value(value: &mut Value, request: &ReolinkPresentationApplyRequest) {
+    if let Some(text) = &request.overlay_text {
+        if let Some(channel) = value.get_mut("osdChannel").and_then(Value::as_object_mut) {
+            channel.insert("name".to_string(), Value::String(text.trim().to_string()));
+            set_object_bool_like(channel, "enable", !text.trim().is_empty());
+        }
+        set_string_at_any(value, &["channelName", "name"], text);
+    }
+    if let Some(show_timestamp) = request.overlay_timestamp {
+        if let Some(time_value) = value.get_mut("osdTime").and_then(Value::as_object_mut) {
+            set_object_bool_like(time_value, "enable", show_timestamp);
+        }
+        set_bool_at_any(value, &["timeEnable", "showTime", "enable"], show_timestamp);
+    }
+}
+
+fn overlay_text_from_value(value: &Value) -> String {
+    if let Some(name) = value
+        .get("osdChannel")
+        .and_then(|channel| channel.get("name"))
+        .and_then(Value::as_str)
+    {
+        return name.trim().to_string();
+    }
+    string_at_any(value, &["channelName", "name"])
+}
+
+fn overlay_timestamp_from_value(value: &Value) -> Option<bool> {
+    if let Some(enabled) = value.get("osdTime").and_then(|time| time.get("enable")) {
+        if let Some(boolean) = enabled.as_bool() {
+            return Some(boolean);
+        }
+        if let Some(integer) = enabled.as_i64() {
+            return Some(integer != 0);
+        }
+    }
+    bool_at_any(value, &["timeEnable", "showTime", "enable"])
+}
+
+fn manual_time_from_value(value: &Value) -> String {
+    let Some(year) = int_at_any(value, &["year", "Year"]) else {
+        return String::new();
+    };
+    let Some(month) = int_at_any(value, &["mon", "Mon", "month"]) else {
+        return String::new();
+    };
+    let Some(day) = int_at_any(value, &["day", "Day"]) else {
+        return String::new();
+    };
+    let Some(hour) = int_at_any(value, &["hour", "Hour"]) else {
+        return String::new();
+    };
+    let Some(minute) = int_at_any(value, &["min", "Min", "minute"]) else {
+        return String::new();
+    };
+    let second = int_at_any(value, &["sec", "Sec", "second"]).unwrap_or(0);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}")
+}
+
+fn string_at_any(value: &Value, keys: &[&str]) -> String {
+    for key in keys {
+        if let Some(raw) = value.get(*key).and_then(Value::as_str) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+fn bool_at_any(value: &Value, keys: &[&str]) -> Option<bool> {
+    for key in keys {
+        if let Some(raw) = value.get(*key).and_then(Value::as_bool) {
+            return Some(raw);
+        }
+        if let Some(raw) = value.get(*key).and_then(Value::as_i64) {
+            return Some(raw != 0);
+        }
+    }
+    None
+}
+
+fn int_at_any(value: &Value, keys: &[&str]) -> Option<i64> {
+    for key in keys {
+        if let Some(raw) = value.get(*key).and_then(Value::as_i64) {
+            return Some(raw);
+        }
+    }
+    None
+}
+
+fn set_string_at_any(value: &mut Value, keys: &[&str], next: &str) {
+    if let Some(map) = value.as_object_mut() {
+        for key in keys {
+            if map.contains_key(*key) {
+                map.insert((*key).to_string(), Value::String(next.trim().to_string()));
+                return;
+            }
+        }
+        if let Some(key) = keys.first() {
+            map.insert((*key).to_string(), Value::String(next.trim().to_string()));
+        }
+    }
+}
+
+fn set_bool_at_any(value: &mut Value, keys: &[&str], next: bool) {
+    if let Some(map) = value.as_object_mut() {
+        for key in keys {
+            if map.contains_key(*key) {
+                let replacement = match map.get(*key) {
+                    Some(existing) if existing.is_i64() || existing.is_u64() => {
+                        json!(i32::from(next))
+                    }
+                    _ => Value::Bool(next),
+                };
+                map.insert((*key).to_string(), replacement);
+                return;
+            }
+        }
+        if let Some(key) = keys.first() {
+            map.insert((*key).to_string(), Value::Bool(next));
+        }
+    }
+}
+
+fn set_object_bool_like(map: &mut serde_json::Map<String, Value>, key: &str, next: bool) {
+    let replacement = match map.get(key) {
+        Some(existing) if existing.is_i64() || existing.is_u64() => json!(i32::from(next)),
+        _ => Value::Bool(next),
+    };
+    map.insert(key.to_string(), replacement);
+}
+
+fn set_i64_at_any(value: &mut Value, keys: &[&str], next: i64) {
+    if let Some(map) = value.as_object_mut() {
+        for key in keys {
+            if map.contains_key(*key) {
+                map.insert((*key).to_string(), Value::Number(next.into()));
+                return;
+            }
+        }
+        if let Some(key) = keys.first() {
+            map.insert((*key).to_string(), Value::Number(next.into()));
+        }
+    }
+}
+
+fn parse_manual_datetime(value: &str) -> Option<(i64, i64, i64, i64, i64, i64)> {
+    let (date, time) = value.split_once('T')?;
+    let date_parts = date
+        .split('-')
+        .map(|part| part.trim().parse::<i64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    let time_parts = time
+        .split(':')
+        .map(|part| part.trim().parse::<i64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if date_parts.len() != 3 || !(time_parts.len() == 2 || time_parts.len() == 3) {
+        return None;
+    }
+    Some((
+        date_parts[0],
+        date_parts[1],
+        date_parts[2],
+        time_parts[0],
+        time_parts[1],
+        *time_parts.get(2).unwrap_or(&0),
+    ))
 }
 
 fn response_entry(cmd: &str, body: &str, crypto: Option<&ReolinkHttpCrypto>) -> Result<Value> {

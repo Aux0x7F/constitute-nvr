@@ -25,7 +25,7 @@
 - [x] gateway-issued launch/session authorization
 - [x] WebRTC signaling and session admission
 - [x] H.264 live preview path for camera grid
-- [ ] recorded retrieval preserved alongside live preview
+- [ ] recorded retrieval preserved alongside live preview (`docs/issues/nvr-history-incomplete.md`)
 - [ ] same-LAN and NAT-friendly path validation
 
 ## Iteration 4: Productionization

@@ -583,15 +583,20 @@ if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
 fi
 
 run_sudo install -d -o "$SERVICE_USER" -g "$SERVICE_USER" /var/lib/constitute-nvr
-run_sudo install -d /etc/constitute-nvr
+run_sudo install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" /etc/constitute-nvr
 run_sudo install -d "$STORAGE_ROOT"
 run_sudo chown "$SERVICE_USER":"$SERVICE_USER" "$STORAGE_ROOT"
 
 CONFIG_WAS_INSTALLED=0
 if [[ ! -f /etc/constitute-nvr/config.json && -n "$CONFIG_TEMPLATE_SRC" ]]; then
   log "installing config template to /etc/constitute-nvr/config.json"
-  run_sudo install -m 0644 "$CONFIG_TEMPLATE_SRC" /etc/constitute-nvr/config.json
+  run_sudo install -m 0640 -o "$SERVICE_USER" -g "$SERVICE_USER" "$CONFIG_TEMPLATE_SRC" /etc/constitute-nvr/config.json
   CONFIG_WAS_INSTALLED=1
+fi
+
+if [[ -f /etc/constitute-nvr/config.json ]]; then
+  run_sudo chown "$SERVICE_USER":"$SERVICE_USER" /etc/constitute-nvr/config.json
+  run_sudo chmod 0640 /etc/constitute-nvr/config.json
 fi
 
 if [[ -f /etc/constitute-nvr/config.json && ( -z "$CAMERA_IFACE" || -z "$CAMERA_CIDR" ) ]]; then

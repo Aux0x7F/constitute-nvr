@@ -10,6 +10,7 @@ HOST_IP=""
 DHCP_RANGE_START=""
 DHCP_RANGE_END=""
 DNSMASQ_CONF="/etc/dnsmasq.d/constitute-nvr-camera.conf"
+CHRONY_DROPIN=""
 
 usage() {
   cat <<'EOF'
@@ -19,6 +20,8 @@ Provision a dedicated constitute-nvr camera network:
 - choose or confirm a dedicated camera NIC
 - assign a persistent static IPv4 on that NIC
 - install/configure dnsmasq DHCP bound only to that NIC
+- advertise the managed host as the camera-network NTP source
+- enable a local chrony/chronyd service for the camera subnet
 
 Options:
   --apply                     Apply changes (default is dry selection only)
@@ -263,6 +266,61 @@ ensure_dnsmasq() {
   exit 1
 }
 
+ensure_chrony() {
+  if command -v chronyd >/dev/null 2>&1 || command -v chronyc >/dev/null 2>&1; then
+    return
+  fi
+
+  if command -v dnf >/dev/null 2>&1; then
+    log "installing chrony via dnf"
+    run_sudo dnf install -y chrony >/dev/null
+    return
+  fi
+  if command -v yum >/dev/null 2>&1; then
+    log "installing chrony via yum"
+    run_sudo yum install -y chrony >/dev/null
+    return
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    log "installing chrony via apt-get"
+    run_sudo apt-get update >/dev/null
+    run_sudo apt-get install -y chrony >/dev/null
+    return
+  fi
+
+  echo "unable to install chrony automatically; install chrony/chronyd manually" >&2
+  exit 1
+}
+
+detect_chrony_dropin() {
+  if [[ -d /etc/chrony/conf.d ]]; then
+    CHRONY_DROPIN="/etc/chrony/conf.d/constitute-nvr-camera.conf"
+    return
+  fi
+  if [[ -d /etc/chrony.d ]]; then
+    CHRONY_DROPIN="/etc/chrony.d/constitute-nvr-camera.conf"
+    return
+  fi
+  CHRONY_DROPIN="/etc/chrony.d/constitute-nvr-camera.conf"
+}
+
+restart_chrony() {
+  local unit=""
+  if systemctl list-unit-files chronyd.service --no-legend >/dev/null 2>&1; then
+    unit="chronyd.service"
+  elif systemctl list-unit-files chrony.service --no-legend >/dev/null 2>&1; then
+    unit="chrony.service"
+  fi
+
+  if [[ -z "$unit" ]]; then
+    echo "chrony service unit not found after installation" >&2
+    exit 1
+  fi
+
+  run_sudo systemctl enable --now "$unit" >/dev/null
+  run_sudo systemctl restart "$unit" >/dev/null
+}
+
 apply_networkmanager_config() {
   require_cmd nmcli
   local connection_name="constitute-camera-${CAMERA_IFACE}"
@@ -295,14 +353,28 @@ apply_networkmanager_config() {
 write_dnsmasq_config() {
   run_sudo mkdir -p "$(dirname "$DNSMASQ_CONF")"
   cat <<EOF | run_sudo tee "$DNSMASQ_CONF" >/dev/null
-port=0
 bind-interfaces
 interface=${CAMERA_IFACE}
 dhcp-authoritative
+domain-needed
+bogus-priv
 dhcp-range=${DHCP_RANGE_START},${DHCP_RANGE_END},255.255.255.0,12h
+dhcp-option=option:dns-server,${HOST_IP}
+dhcp-option=option:ntp-server,${HOST_IP}
 EOF
   run_sudo systemctl enable --now dnsmasq >/dev/null
   run_sudo systemctl restart dnsmasq >/dev/null
+}
+
+write_chrony_config() {
+  detect_chrony_dropin
+  run_sudo mkdir -p "$(dirname "$CHRONY_DROPIN")"
+  cat <<EOF | run_sudo tee "$CHRONY_DROPIN" >/dev/null
+# Managed by constitute-nvr camera bootstrap.
+allow ${CAMERA_CIDR}
+local stratum 10
+EOF
+  restart_chrony
 }
 
 emit_env() {
@@ -322,11 +394,14 @@ log "camera iface: ${CAMERA_IFACE}"
 log "camera subnet: ${CAMERA_CIDR}"
 log "camera host ip: ${HOST_IP}"
 log "camera dhcp range: ${DHCP_RANGE_START}-${DHCP_RANGE_END}"
+log "camera ntp source: ${HOST_IP}"
 
 if [[ "$APPLY" -eq 1 ]]; then
   ensure_dnsmasq
+  ensure_chrony
   apply_networkmanager_config
   write_dnsmasq_config
+  write_chrony_config
 fi
 
 if [[ "$PRINT_ENV" -eq 1 ]]; then

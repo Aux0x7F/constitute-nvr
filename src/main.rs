@@ -2,8 +2,11 @@ mod api;
 mod camera;
 mod config;
 mod crypto;
+mod drivers;
+mod hosted_registry;
 mod live;
 mod nostr;
+mod onvif;
 mod reolink;
 mod reolink_cgi;
 #[allow(dead_code)]
@@ -16,6 +19,7 @@ mod util;
 use anyhow::Result;
 use clap::Parser;
 use config::{CameraConfig, Config};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
@@ -59,6 +63,14 @@ struct Args {
     bootstrap_reolink_target_mac: Option<String>,
     #[arg(long, default_value_t = 20)]
     bootstrap_reolink_timeout_secs: u64,
+    #[arg(long)]
+    read_camera_source: Option<String>,
+    #[arg(long)]
+    probe_camera_source: Option<String>,
+    #[arg(long)]
+    apply_camera_source: Option<String>,
+    #[arg(long)]
+    apply_camera_desired_json: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -174,6 +186,56 @@ async fn main() -> Result<()> {
 
     if let Err(err) = run_reolink_autoprovision(&mut cfg, &cfg_path).await {
         warn!(error = %err, "reolink auto-provision failed");
+    }
+
+    if let Err(err) = hosted_registry::persist_hosted_service_manifest(&cfg) {
+        warn!(error = %err, "failed writing hosted-service manifest");
+    }
+
+    if let Some(source_id) = &args.read_camera_source {
+        let mounted = drivers::read_camera(&cfg, source_id).await?;
+        println!("{}", serde_json::to_string_pretty(&mounted)?);
+        return Ok(());
+    }
+
+    if let Some(source_id) = &args.probe_camera_source {
+        let result = drivers::probe_camera(
+            &cfg,
+            drivers::ProbeCameraRequest {
+                source_id: source_id.trim().to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    if let Some(source_id) = &args.apply_camera_source {
+        let desired_path = args.apply_camera_desired_json.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("--apply-camera-desired-json is required with --apply-camera-source")
+        })?;
+        let desired: config::CameraDesiredConfig =
+            serde_json::from_str(&fs::read_to_string(desired_path)?)?;
+        let applied = drivers::apply_mounted_camera(
+            &cfg,
+            drivers::ApplyMountedCameraRequest {
+                source_id: source_id.trim().to_string(),
+                desired,
+            },
+        )
+        .await?;
+        if let Some(existing) = cfg
+            .cameras
+            .iter_mut()
+            .find(|camera| camera.source_id.trim() == source_id.trim())
+        {
+            *existing = applied.configured.clone();
+        }
+        cfg.persist(&cfg_path)?;
+        let _ = hosted_registry::persist_hosted_service_manifest(&cfg);
+        println!("{}", serde_json::to_string_pretty(&applied.mounted)?);
+        return Ok(());
     }
 
     let storage =
@@ -413,8 +475,24 @@ async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<
                 rtsp_url: rtsp_url.clone(),
                 username: username.clone(),
                 password: effective_password.clone(),
+                driver_id: drivers::DRIVER_ID_REOLINK.to_string(),
+                vendor: "Reolink".to_string(),
+                model: device.model.clone(),
+                mac_address: device.mac.clone(),
+                rtsp_port: rtsp_port as u16,
+                ptz_capable: device.model.to_ascii_lowercase().contains("e1")
+                    || device.model.to_ascii_lowercase().contains("ptz"),
                 enabled: true,
                 segment_secs: 10,
+                desired: config::CameraDesiredConfig {
+                    display_name: source_name.clone(),
+                    ntp_server: cfg.camera_network.ntp_server.clone(),
+                    timezone: "UTC".to_string(),
+                    overlay_text: source_name.clone(),
+                    overlay_timestamp: true,
+                    ..Default::default()
+                },
+                credentials: Default::default(),
             });
             changed = true;
         }

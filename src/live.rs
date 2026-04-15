@@ -57,6 +57,28 @@ pub struct ManagedCloseRequest {
     pub payload: Value,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ManagedControlRequest {
+    #[serde(rename = "launchToken")]
+    pub launch_token: String,
+    #[serde(default)]
+    pub payload: Value,
+    #[serde(rename = "controlLease", default)]
+    pub control_lease: Value,
+    #[serde(default)]
+    pub preempted: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ManagedAdminRequest {
+    #[serde(rename = "launchToken")]
+    pub launch_token: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub payload: Value,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ManagedSourceInfo {
     #[serde(rename = "sourceId")]
@@ -105,6 +127,12 @@ struct ManagedLaunchTokenPayload {
     #[serde(rename = "devicePk")]
     device_pk: String,
     capability: String,
+    #[serde(default)]
+    owner: bool,
+    #[serde(rename = "viewSources", default)]
+    view_sources: Vec<String>,
+    #[serde(rename = "controlSources", default)]
+    control_sources: Vec<String>,
     #[serde(rename = "launchNonce")]
     launch_nonce: String,
     #[serde(rename = "issuedAt")]
@@ -182,10 +210,8 @@ impl PreviewManager {
     pub fn new(cfg: &Config) -> Result<Self> {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
-        let mut setting_engine = build_setting_engine(
-            &cfg.live_preview,
-            cfg.camera_network.interface.trim(),
-        )?;
+        let mut setting_engine =
+            build_setting_engine(&cfg.live_preview, cfg.camera_network.interface.trim())?;
         setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::QueryOnly);
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
@@ -205,10 +231,12 @@ impl PreviewManager {
         let token = validate_launch_token(cfg, &request.launch_token)?;
         let offer = parse_offer_description(&request.offer)?;
         let preview_codec = select_preview_codec(&request.offer)?;
-        let selected = select_sources(cfg, source_ids_from_offer(&request.offer))?;
+        let selected = select_sources(cfg, source_ids_from_offer(&request.offer), &token)?;
         let remote_candidates = request_candidates(&request);
         if selected.is_empty() {
-            return Err(anyhow!("no enabled camera sources available for live preview"));
+            return Err(anyhow!(
+                "no enabled camera sources available for live preview"
+            ));
         }
 
         let session_key = session_key_for_token(&token);
@@ -234,7 +262,10 @@ impl PreviewManager {
                     return;
                 };
                 let mut candidates = gathered_candidates.lock().await;
-                if !candidates.iter().any(|existing| ice_candidates_equal(existing, &json)) {
+                if !candidates
+                    .iter()
+                    .any(|existing| ice_candidates_equal(existing, &json))
+                {
                     candidates.push(json);
                 }
             })
@@ -248,8 +279,10 @@ impl PreviewManager {
             let key = cleanup_key.clone();
             let pc = Arc::clone(&cleanup_pc);
             Box::pin(async move {
-                if matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed)
-                {
+                if matches!(
+                    state,
+                    RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+                ) {
                     let handle = sessions.lock().await.remove(&key);
                     if let Some(handle) = handle {
                         handle.close().await;
@@ -328,6 +361,37 @@ impl PreviewManager {
             "reason": request.payload.get("reason").cloned().unwrap_or_else(|| json!("closed")),
         }))
     }
+}
+
+pub fn resolve_control_camera(
+    cfg: &Config,
+    request: &ManagedControlRequest,
+) -> Result<CameraConfig> {
+    let token = validate_launch_token(cfg, &request.launch_token)?;
+    let source_id = request
+        .payload
+        .get("sourceId")
+        .or_else(|| request.payload.get("source_id"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if source_id.is_empty() {
+        return Err(anyhow!("control request is missing sourceId"));
+    }
+    if !token.owner
+        && !token
+            .control_sources
+            .iter()
+            .any(|allowed| allowed.trim() == source_id.trim())
+    {
+        return Err(anyhow!("control is not granted for this camera"));
+    }
+    cfg.cameras
+        .iter()
+        .find(|camera| camera.enabled && camera.source_id.trim() == source_id.trim())
+        .cloned()
+        .ok_or_else(|| anyhow!("camera source is not available for control"))
 }
 
 fn build_setting_engine(cfg: &LivePreviewConfig, camera_iface: &str) -> Result<SettingEngine> {
@@ -457,7 +521,8 @@ fn source_ids_from_offer(value: &Value) -> Vec<String> {
                             return Some(trimmed.to_string());
                         }
                     }
-                    entry.get("sourceId")
+                    entry
+                        .get("sourceId")
                         .and_then(|v| v.as_str())
                         .map(|v| v.trim().to_string())
                         .filter(|v| !v.is_empty())
@@ -467,11 +532,22 @@ fn source_ids_from_offer(value: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+pub fn resolve_admin_token(cfg: &Config, token: &str) -> Result<()> {
+    let payload = validate_launch_token(cfg, token)?;
+    if !payload.owner {
+        return Err(anyhow!(
+            "owner launch is required for camera administration"
+        ));
+    }
+    Ok(())
+}
+
 fn collect_offer_candidates(value: &Value) -> Vec<RTCIceCandidateInit> {
     let mut out = Vec::new();
     for candidate_set in [
         value.get("candidates"),
-        value.get("description")
+        value
+            .get("description")
             .and_then(|description| description.get("candidates")),
     ] {
         let Some(entries) = candidate_set.and_then(|item| item.as_array()) else {
@@ -499,14 +575,12 @@ fn request_candidates(request: &ManagedOfferRequest) -> Vec<RTCIceCandidateInit>
 }
 
 fn offer_description_sdp(value: &Value) -> Option<&str> {
-    value.get("sdp")
-        .and_then(|item| item.as_str())
-        .or_else(|| {
-            value
-                .get("description")
-                .and_then(|item| item.get("sdp"))
-                .and_then(|item| item.as_str())
-        })
+    value.get("sdp").and_then(|item| item.as_str()).or_else(|| {
+        value
+            .get("description")
+            .and_then(|item| item.get("sdp"))
+            .and_then(|item| item.as_str())
+    })
 }
 
 fn select_preview_codec(value: &Value) -> Result<PreviewCodec> {
@@ -522,19 +596,40 @@ fn select_preview_codec(value: &Value) -> Result<PreviewCodec> {
     ))
 }
 
-fn select_sources(cfg: &Config, requested: Vec<String>) -> Result<Vec<CameraConfig>> {
+fn select_sources(
+    cfg: &Config,
+    requested: Vec<String>,
+    token: &ManagedLaunchTokenPayload,
+) -> Result<Vec<CameraConfig>> {
     let enabled = cfg
         .cameras
         .iter()
         .filter(|camera| camera.enabled)
         .cloned()
         .collect::<Vec<_>>();
+    let allowed_ids = if token.owner || token.view_sources.is_empty() {
+        enabled
+            .iter()
+            .map(|camera| camera.source_id.clone())
+            .collect::<Vec<_>>()
+    } else {
+        token.view_sources.clone()
+    };
+    let allowed = enabled
+        .iter()
+        .filter(|camera| {
+            allowed_ids
+                .iter()
+                .any(|source_id| source_id == &camera.source_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     if requested.is_empty() {
-        return Ok(enabled);
+        return Ok(allowed);
     }
     let mut out = Vec::new();
     for source_id in requested {
-        if let Some(camera) = enabled.iter().find(|camera| camera.source_id == source_id) {
+        if let Some(camera) = allowed.iter().find(|camera| camera.source_id == source_id) {
             out.push(camera.clone());
         }
     }
@@ -634,7 +729,10 @@ async fn run_camera_forwarder(
         .arg("rtp")
         .arg("-payload_type")
         .arg("96")
-        .arg(format!("rtp://127.0.0.1:{}?pkt_size=1200", local_addr.port()))
+        .arg(format!(
+            "rtp://127.0.0.1:{}?pkt_size=1200",
+            local_addr.port()
+        ))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -707,8 +805,23 @@ mod tests {
             rtsp_url: "rtsp://admin:pw@10.0.0.10:554/h264Preview_01_main".to_string(),
             username: "admin".to_string(),
             password: "pw".to_string(),
+            driver_id: "reolink".to_string(),
+            vendor: "Reolink".to_string(),
+            model: "E1 Outdoor".to_string(),
+            mac_address: String::new(),
+            rtsp_port: 554,
+            ptz_capable: true,
             enabled: true,
             segment_secs: 10,
+            desired: crate::config::CameraDesiredConfig {
+                display_name: "Front".to_string(),
+                ntp_server: "10.0.0.1".to_string(),
+                timezone: "UTC".to_string(),
+                overlay_text: "Front".to_string(),
+                overlay_timestamp: true,
+                ..Default::default()
+            },
+            credentials: Default::default(),
         });
         cfg
     }
@@ -724,6 +837,9 @@ mod tests {
             identity_id: cfg.api.identity_id.clone(),
             device_pk: "device-pk".to_string(),
             capability: "nvr.view".to_string(),
+            owner: true,
+            view_sources: vec!["cam-1".to_string()],
+            control_sources: vec!["cam-1".to_string()],
             launch_nonce: "nonce-1".to_string(),
             issued_at: crate::util::now_ms(),
             expires_at: crate::util::now_ms() + 60_000,
@@ -754,7 +870,22 @@ mod tests {
     #[test]
     fn select_sources_defaults_to_enabled() {
         let cfg = sample_config();
-        let selected = select_sources(&cfg, Vec::new()).expect("sources");
+        let token = ManagedLaunchTokenPayload {
+            kind: "managed_launch_token".to_string(),
+            gateway_pk: "gateway".to_string(),
+            service_pk: cfg.nostr_pubkey.clone(),
+            service: "nvr".to_string(),
+            identity_id: cfg.api.identity_id.clone(),
+            device_pk: "device".to_string(),
+            capability: "nvr.view".to_string(),
+            owner: true,
+            view_sources: vec!["cam-1".to_string()],
+            control_sources: vec!["cam-1".to_string()],
+            launch_nonce: "nonce".to_string(),
+            issued_at: crate::util::now_ms(),
+            expires_at: crate::util::now_ms() + 60_000,
+        };
+        let selected = select_sources(&cfg, Vec::new(), &token).expect("sources");
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].source_id, "cam-1");
     }
@@ -801,8 +932,14 @@ mod tests {
 
         let out = request_candidates(&request);
         assert_eq!(out.len(), 2);
-        assert!(out.iter().any(|candidate| candidate.candidate.contains("54547")));
-        assert!(out.iter().any(|candidate| candidate.candidate.contains("54548")));
+        assert!(
+            out.iter()
+                .any(|candidate| candidate.candidate.contains("54547"))
+        );
+        assert!(
+            out.iter()
+                .any(|candidate| candidate.candidate.contains("54548"))
+        );
     }
 
     #[test]
@@ -813,7 +950,10 @@ mod tests {
                 "sdp": "m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\na=rtpmap:96 VP8/90000\r\na=rtpmap:97 H264/90000\r\n"
             }
         });
-        assert_eq!(select_preview_codec(&offer).expect("codec"), PreviewCodec::H264);
+        assert_eq!(
+            select_preview_codec(&offer).expect("codec"),
+            PreviewCodec::H264
+        );
     }
 
     #[test]
@@ -824,7 +964,10 @@ mod tests {
                 "sdp": "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP8/90000\r\n"
             }
         });
-        assert_eq!(select_preview_codec(&offer).expect("codec"), PreviewCodec::Vp8);
+        assert_eq!(
+            select_preview_codec(&offer).expect("codec"),
+            PreviewCodec::Vp8
+        );
     }
 
     #[test]
