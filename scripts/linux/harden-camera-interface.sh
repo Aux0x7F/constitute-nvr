@@ -4,7 +4,7 @@ set -euo pipefail
 APPLY=0
 IFACE=""
 CAMERA_CIDR=""
-ONVIF_PORTS="80,443,8000,8080,8899"
+ONVIF_PORTS="80,443,8000,8080,8899,9000"
 RTSP_PORTS="554"
 ALLOW_NTP_HOST=1
 ALLOW_ONVIF_DISCOVERY=1
@@ -20,14 +20,14 @@ Audit/apply camera-network hardening for constitute-nvr.
 
 Goals:
 - bind the camera NIC to a drop-by-default firewalld zone
-- allow only explicit camera->host ingress (optional NTP)
-- lock host egress over that NIC to ONVIF/RTSP (+ optional WS-Discovery + NTP)
+- allow only explicit camera->host ingress (DHCP + optional NTP)
+- lock host egress over that NIC to DHCP/camera-control/RTSP (+ Reolink discovery, optional WS-Discovery + NTP)
 
 Options:
   --apply                     Apply changes (default is audit-only)
   --iface <name>              Camera network interface (required with --apply)
   --camera-cidr <CIDR>        Camera subnet CIDR (required with --apply)
-  --onvif-ports <csv>         ONVIF TCP port list (default: 80,443,8000,8080,8899)
+  --onvif-ports <csv>         Camera control TCP port list (default: 80,443,8000,8080,8899,9000)
   --rtsp-ports <csv>          RTSP TCP port list (default: 554)
   --no-ntp-host               Do not allow camera->host UDP/123
   --no-onvif-discovery        Do not allow host->camera UDP/3702
@@ -169,7 +169,8 @@ fi
 log "mode: $([[ "$APPLY" -eq 1 ]] && echo apply || echo audit)"
 log "iface: ${IFACE:-<unset>}"
 log "camera-cidr: ${CAMERA_CIDR:-<unset>}"
-log "allowed tcp ports (ONVIF+RTSP): $ALLOWED_TCP_PORTS"
+log "allowed tcp ports (camera-control+RTSP): $ALLOWED_TCP_PORTS"
+log "camera->host DHCP: enabled"
 log "camera->host ntp: $([[ "$ALLOW_NTP_HOST" -eq 1 ]] && echo enabled || echo disabled)"
 log "host->camera ws-discovery (udp/3702): $([[ "$ALLOW_ONVIF_DISCOVERY" -eq 1 ]] && echo enabled || echo disabled)"
 log "egress lock: $([[ "$NO_EGRESS_LOCK" -eq 0 ]] && echo enabled || echo disabled)"
@@ -227,6 +228,16 @@ if ! run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --query-interface="$I
 fi
 
 ntp_rule="rule family=\"ipv4\" source address=\"${CAMERA_CIDR}\" port protocol=\"udp\" port=\"123\" accept"
+while IFS= read -r existing_rule; do
+  [[ -z "$existing_rule" ]] && continue
+  if [[ "$existing_rule" == *'port port="67" protocol="udp"'* || "$existing_rule" == *'port port="123" protocol="udp"'* ]]; then
+    run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --remove-rich-rule="$existing_rule" >/dev/null 2>&1 || true
+  fi
+done < <(run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --list-rich-rules 2>/dev/null || true)
+
+log "allowing camera->host DHCP bootstrap (udp/67) on $IFACE"
+run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --add-port=67/udp >/dev/null 2>&1 || true
+
 run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --remove-rich-rule="$ntp_rule" >/dev/null 2>&1 || true
 if [[ "$ALLOW_NTP_HOST" -eq 1 ]]; then
   log "allowing camera->host NTP (udp/123) from $CAMERA_CIDR"
@@ -242,6 +253,8 @@ run_sudo nft "delete chain inet ${NFT_TABLE} output" >/dev/null 2>&1 || true
 run_sudo nft "add chain inet ${NFT_TABLE} output { type filter hook output priority 0; policy accept; }"
 
 run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${CAMERA_CIDR} tcp dport { ${ALLOWED_TCP_PORTS//,/ , } } accept"
+run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${CAMERA_CIDR} udp dport 68 accept"
+run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${CAMERA_CIDR} udp dport { 2000, 3000 } accept"
 if [[ "$ALLOW_ONVIF_DISCOVERY" -eq 1 ]]; then
   run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${CAMERA_CIDR} udp dport 3702 accept"
 fi
@@ -255,4 +268,3 @@ fi
 log "applied"
 run_sudo firewall-cmd --zone="$ZONE_NAME" --list-all || true
 run_sudo nft list table inet "$NFT_TABLE" || true
-

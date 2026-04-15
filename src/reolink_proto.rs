@@ -1,7 +1,11 @@
 use aes::Aes128;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
 use md5::{Digest, Md5};
+
+type Aes128CfbEnc = cfb_mode::Encryptor<Aes128>;
+type Aes128CfbDec = cfb_mode::Decryptor<Aes128>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReolinkFrameHeader {
@@ -207,6 +211,9 @@ pub const SDK_CMD_SET_SMART_TRACK_TASK_CFG: u32 = 2369;
 pub const SDK_CMD_PTZ_3DLOCATION: u32 = 2374;
 pub const SDK_CMD_GET_LOGIN_AUTH_CODE: u32 = 2432;
 pub const SDK_CMD_SET_PTZ_POS: u32 = 2453;
+pub const NATIVE_OP_GET_PTZ_CUR_POS: u32 = 0x1b1;
+pub const NATIVE_OP_SET_PTZ_POS: u32 = 0x1d4;
+pub const NATIVE_SESSION_LOGIN_TOKEN: &str = "system, network, alarm, record, video, image";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReolinkRemoteCommand {
@@ -571,6 +578,31 @@ impl ReolinkFrameHeader {
     pub fn op(&self) -> u32 {
         match self {
             Self::Short { op, .. } | Self::Extended { op, .. } => *op,
+        }
+    }
+
+    pub fn payload_len(&self) -> u32 {
+        match self {
+            Self::Short { payload_len, .. } | Self::Extended { payload_len, .. } => *payload_len,
+        }
+    }
+
+    pub fn field_c(&self) -> u32 {
+        match self {
+            Self::Short { field_c, .. } | Self::Extended { field_c, .. } => *field_c,
+        }
+    }
+
+    pub fn field_d(&self) -> u32 {
+        match self {
+            Self::Short { field_d, .. } | Self::Extended { field_d, .. } => *field_d,
+        }
+    }
+
+    pub fn field_e(&self) -> Option<u32> {
+        match self {
+            Self::Short { .. } => None,
+            Self::Extended { field_e, .. } => Some(*field_e),
         }
     }
 
@@ -1303,6 +1335,196 @@ pub fn build_ptz_position(value: &ReolinkPtzPosition) -> Vec<u8> {
     out[PTZ_POSITION_Z_OFFSET..PTZ_POSITION_Z_OFFSET + 4]
         .copy_from_slice(&value.zoom.to_le_bytes());
     out
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+pub fn build_native_extension_xml(channel_id: u32, include_chn_type: bool) -> String {
+    if include_chn_type {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n\
+<Extension version=\"1.1\">\n\
+<channelId>{channel_id}</channelId>\n\
+<chnType>0</chnType>\n\
+</Extension>\n"
+        )
+    } else {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n\
+<Extension version=\"1.1\">\n\
+<channelId>{channel_id}</channelId>\n\
+</Extension>\n"
+        )
+    }
+}
+
+pub fn build_native_user_extension_xml(username: &str, token: Option<&str>) -> String {
+    let user = xml_escape(username);
+    if let Some(token) = token {
+        let token = xml_escape(token);
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n\
+<Extension version=\"1.1\">\n\
+<userName>{user}</userName>\n\
+<token>{token}</token>\n\
+</Extension>\n"
+        )
+    } else {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n\
+<Extension version=\"1.1\">\n\
+<userName>{user}</userName>\n\
+</Extension>\n"
+        )
+    }
+}
+
+pub fn build_native_ptz_position_xml(value: ReolinkPtzPosition) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n\
+<body>\n\
+<ptzCurPos version=\"1.1\">\n\
+<pPos>{}</pPos>\n\
+<tPos>{}</tPos>\n\
+<zPos>{}</zPos>\n\
+</ptzCurPos>\n\
+</body>\n",
+        value.pan, value.tilt, value.zoom
+    )
+}
+
+pub fn derive_native_aes_key(nonce: &str, password: &str) -> [u8; 16] {
+    let mut hasher = Md5::new();
+    hasher.update(format!("{nonce}-{password}").as_bytes());
+    let digest = hasher.finalize();
+    let mut material = hex::encode_upper(digest).into_bytes();
+    material.push(0);
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&material[..16]);
+    key
+}
+
+pub fn encrypt_native_payload(key: &[u8; 16], payload: &[u8]) -> Vec<u8> {
+    let mut out = payload.to_vec();
+    let cipher = Aes128CfbEnc::new(key.as_slice().into(), BAICHUAN_IV.as_slice().into());
+    cipher.encrypt(&mut out);
+    out
+}
+
+pub fn decrypt_native_payload(key: &[u8; 16], payload: &[u8]) -> Vec<u8> {
+    let mut out = payload.to_vec();
+    let cipher = Aes128CfbDec::new(key.as_slice().into(), BAICHUAN_IV.as_slice().into());
+    cipher.decrypt(&mut out);
+    out
+}
+
+pub fn build_native_header_only_frame(op: u32, request_id: u32) -> Vec<u8> {
+    build_extended_frame(op, request_id, OBSERVED_CLIENT_FIELD_D, 0, &[])
+}
+
+pub fn build_native_extension_frame(
+    op: u32,
+    request_id: u32,
+    xml: &str,
+    key: &[u8; 16],
+) -> Vec<u8> {
+    let payload = encrypt_native_payload(key, xml.as_bytes());
+    build_extended_frame(
+        op,
+        request_id,
+        OBSERVED_CLIENT_FIELD_D,
+        payload.len() as u32,
+        &payload,
+    )
+}
+
+pub fn build_native_session_login_frame(
+    request_id: u32,
+    username: &str,
+    key: &[u8; 16],
+) -> Vec<u8> {
+    build_native_extension_frame(
+        ReolinkTransportOp::Login as u32,
+        request_id,
+        &build_native_user_extension_xml(username, Some(NATIVE_SESSION_LOGIN_TOKEN)),
+        key,
+    )
+}
+
+pub fn build_native_session_bind_frame(request_id: u32, username: &str, key: &[u8; 16]) -> Vec<u8> {
+    build_native_extension_frame(
+        ReolinkTransportOp::SessionBind as u32,
+        request_id,
+        &build_native_user_extension_xml(username, None),
+        key,
+    )
+}
+
+pub fn build_native_prepare_ptz_frame(request_id: u32, channel_id: u32, key: &[u8; 16]) -> Vec<u8> {
+    build_native_extension_frame(
+        ReolinkTransportOp::ApplyConfig as u32,
+        request_id,
+        &build_native_extension_xml(channel_id, true),
+        key,
+    )
+}
+
+pub fn build_native_ptz_get_frame(request_id: u32, channel_id: u32, key: &[u8; 16]) -> Vec<u8> {
+    let extension =
+        encrypt_native_payload(key, build_native_extension_xml(channel_id, true).as_bytes());
+    build_extended_frame(
+        NATIVE_OP_GET_PTZ_CUR_POS,
+        request_id,
+        OBSERVED_CLIENT_FIELD_D,
+        extension.len() as u32,
+        &extension,
+    )
+}
+
+pub fn build_native_ptz_set_frame(
+    request_id: u32,
+    channel_id: u32,
+    position: ReolinkPtzPosition,
+    key: &[u8; 16],
+) -> Vec<u8> {
+    let extension = encrypt_native_payload(
+        key,
+        build_native_extension_xml(channel_id, false).as_bytes(),
+    );
+    let body = encrypt_native_payload(key, build_native_ptz_position_xml(position).as_bytes());
+    let mut payload = Vec::with_capacity(extension.len() + body.len());
+    payload.extend_from_slice(&extension);
+    payload.extend_from_slice(&body);
+    build_extended_frame(
+        NATIVE_OP_SET_PTZ_POS,
+        request_id,
+        OBSERVED_CLIENT_FIELD_D,
+        extension.len() as u32,
+        &payload,
+    )
+}
+
+fn parse_xml_tag_i32(xml: &str, tag: &str) -> Option<i32> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    xml[start..end].trim().parse().ok()
+}
+
+pub fn parse_native_ptz_position_xml(xml: &str) -> Option<ReolinkPtzPosition> {
+    Some(ReolinkPtzPosition {
+        pan: parse_xml_tag_i32(xml, "pPos")?,
+        tilt: parse_xml_tag_i32(xml, "tPos")?,
+        zoom: parse_xml_tag_i32(xml, "zPos")?,
+    })
 }
 
 pub fn parse_ptz_3d_location(buf: &[u8]) -> Option<ReolinkPtz3DLocation> {
@@ -2828,6 +3050,108 @@ mod tests {
                 0x00, 0x00, 0x00, 0x00, // field c
                 0x12, 0xdc, 0x14, 0x65, // field d
             ]
+        );
+    }
+
+    #[test]
+    fn derives_expected_native_aes_key() {
+        let key = derive_native_aes_key("69e00658-r6VKbALDLgV79bIJbVCw", "Test1234");
+        assert_eq!(hex::encode_upper(key), "33464638353135443233444146454137");
+    }
+
+    #[test]
+    fn native_ptz_position_xml_roundtrips() {
+        let position = ReolinkPtzPosition {
+            pan: 1200,
+            tilt: 150,
+            zoom: 20,
+        };
+        let xml = build_native_ptz_position_xml(position);
+        assert_eq!(parse_native_ptz_position_xml(&xml), Some(position));
+    }
+
+    #[test]
+    fn builds_observed_native_ptz_get_frame() {
+        let key = derive_native_aes_key("69e00658-r6VKbALDLgV79bIJbVCw", "Test1234");
+        let frame = build_native_ptz_get_frame(13, 0, &key);
+        assert_eq!(
+            hex::encode(frame),
+            "f0debc0ab10100007d0000000d000000000014647d000000e7e49bf3a5aa96dc8f3ba2b0d9f5d8a3bd2392e2485648b2f524f0197ed5ff5426083d95249947c5effc643e719781780af8a599f4ab4f811683be06433d476f58fb30e2ff0241d7dd4772d15a3a6f7b0244664e18c124724fa762b3414f574dd96478788843311a1587e236cab7e6607e49f1d9f69732f347e5f3e442"
+        );
+    }
+
+    #[test]
+    fn builds_observed_native_ptz_set_frame() {
+        let key = derive_native_aes_key("69e00658-r6VKbALDLgV79bIJbVCw", "Test1234");
+        let frame = build_native_ptz_set_frame(
+            14,
+            0,
+            ReolinkPtzPosition {
+                pan: 600,
+                tilt: 50,
+                zoom: 0,
+            },
+            &key,
+        );
+        assert_eq!(
+            hex::encode(frame),
+            "f0debc0ad4010000f60000000e0000000000146468000000e7e49bf3a5aa96dc8f3ba2b0d9f5d8a3bd2392e2485648b2f524f0197ed5ff5426083d95249947c5effc643e719781780af8a599f4ab4f811683be06433d476f58fb30e2ff0241d7dd4772d15a3a6f7b0244664e18c124724fa762b30d62416d239fde3a752d9227e7e49bf3a5aa96dc8f3ba2b0d9f5d8a3bd2392e2485648b2f524f0197ed5ff5426083d95249947c5efdb732e6dc7f82d9d9d1ed82a595ccfb868fff4e382b81958ce5dfaafeadbc389b4de7b7ae608dafff93ad4dd3f6e1fea31338ac90949ae5f6acfa4bbd2ef02caa119c823643d756253c238a4f368631a9ed20ee1fafb222b2adb1a977b44df8f98c531ea52"
+        );
+    }
+
+    #[test]
+    fn builds_observed_native_session_login_frame() {
+        let key = derive_native_aes_key("69e005cb-Bg1MR1hzCrHeb0WxIQKN", "Test1234");
+        let frame = build_native_session_login_frame(1, "admin", &key);
+        let header = parse_frame_header(&frame).expect("header");
+        assert_eq!(header.op(), ReolinkTransportOp::Login as u32);
+        assert_eq!(header.field_c(), 1);
+        let body = decrypt_native_payload(&key, &frame[header.header_len()..header.total_len()]);
+        let xml = String::from_utf8(body).expect("utf8");
+        assert!(xml.contains("<userName>admin</userName>"));
+        assert!(xml.contains(NATIVE_SESSION_LOGIN_TOKEN));
+    }
+
+    #[test]
+    fn builds_observed_native_session_bind_frame() {
+        let key = derive_native_aes_key("69e005cb-Bg1MR1hzCrHeb0WxIQKN", "Test1234");
+        let frame = build_native_session_bind_frame(2, "admin", &key);
+        let header = parse_frame_header(&frame).expect("header");
+        assert_eq!(header.op(), ReolinkTransportOp::SessionBind as u32);
+        assert_eq!(header.field_c(), 2);
+        let body = decrypt_native_payload(&key, &frame[header.header_len()..header.total_len()]);
+        let xml = String::from_utf8(body).expect("utf8");
+        assert!(xml.contains("<userName>admin</userName>"));
+        assert!(!xml.contains("<token>"));
+    }
+
+    #[test]
+    fn builds_observed_native_prepare_ptz_frame() {
+        let key = derive_native_aes_key("69e005cb-Bg1MR1hzCrHeb0WxIQKN", "Test1234");
+        let frame = build_native_prepare_ptz_frame(9, 0, &key);
+        let header = parse_frame_header(&frame).expect("header");
+        assert_eq!(header.op(), ReolinkTransportOp::ApplyConfig as u32);
+        assert_eq!(header.field_c(), 9);
+        let body = decrypt_native_payload(&key, &frame[header.header_len()..header.total_len()]);
+        let xml = String::from_utf8(body).expect("utf8");
+        assert!(xml.contains("<channelId>0</channelId>"));
+        assert!(xml.contains("<chnType>0</chnType>"));
+    }
+
+    #[test]
+    fn decrypts_observed_native_ptz_get_response() {
+        let key = derive_native_aes_key("69e00658-r6VKbALDLgV79bIJbVCw", "Test1234");
+        let frame = hex::decode("f0debc0ab10100008e0000000d000000c800000000000000e7e49bf3a5aa96dc8f3ba2b0d9f5d8a3bd2392e2485648b2f524f0197ed5ff5426083d95249947c5efdb732e6dc7f82d9d9d1ed82a595ccfb868fff4e382b81958ce5dfaafeadbc389b4de7b7ae608d994308caa82f95b2df126707b1e4d5bfc9f69d1c10628e7c69d0949bd5297092010272f93a11079fb14a2dc06a5ded089eb0725912d9b5f8e4646a11dd6d8").expect("frame");
+        let header = parse_frame_header(&frame).expect("header");
+        let body = &frame[header.header_len()..header.total_len()];
+        let xml = String::from_utf8(decrypt_native_payload(&key, body)).expect("xml");
+        assert_eq!(
+            parse_native_ptz_position_xml(&xml),
+            Some(ReolinkPtzPosition {
+                pan: 561,
+                tilt: 51,
+                zoom: 0,
+            })
         );
     }
 }

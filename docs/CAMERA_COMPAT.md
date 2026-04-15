@@ -17,6 +17,7 @@
 - RTSP port observed on `554/tcp` after native enablement
 - Reolink cloud/P2P endpoint behavior observed: yes (`p2p.reolink.com`, `devices-apis.reolink.com`)
 - RTSP ingest path: pending sustained validation in this repo
+- Interim PTZ status: native `9000` pose readback works, but native `SetPtzPos` is still not a trustworthy actuation path on the lab `E1 Outdoor SE`; the attempted CGI pulse fallback is also currently hitting camera-side login/session exhaustion (`rspCode -5: max session`), so PTZ UI is hidden for now while session reuse/cleanup and real fulfillment are sorted out
 - Current automation status: native DHCP bootstrap is implemented; configured-camera control can fall back to native CGI for ports/P2P, but first-boot provisioning still depends on the proprietary 9000 path and remains the blocking native-Rust gap
 - Recommended status: test candidate with camera-jail policy enabled
 

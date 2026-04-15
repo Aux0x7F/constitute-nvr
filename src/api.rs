@@ -1,15 +1,22 @@
 use crate::camera;
 use crate::camera::RecorderManager;
-use crate::config::{CameraConfig, Config};
+use crate::config::{CameraConfig, CameraDesiredConfig, Config};
 use crate::crypto;
+use crate::drivers;
+use crate::hosted_registry;
+use crate::live::{
+    ManagedAdminRequest, ManagedCloseRequest, ManagedControlRequest, ManagedOfferRequest,
+    PreviewManager, resolve_admin_token, resolve_control_camera,
+};
 use crate::reolink;
 use crate::storage::StorageManager;
 use crate::util;
 use anyhow::{Result, anyhow};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
@@ -21,7 +28,8 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-const INSECURE_HELLO_SECRET_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const INSECURE_HELLO_SECRET_HEX: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -29,6 +37,38 @@ pub struct ApiState {
     pub cfg_path: PathBuf,
     pub storage: StorageManager,
     pub recorder: RecorderManager,
+    pub preview: PreviewManager,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HealthCameraView {
+    source_id: String,
+    name: String,
+    onvif_host: String,
+    onvif_port: u16,
+    enabled: bool,
+    segment_secs: u64,
+    rtsp_configured: bool,
+    ptz_capable: bool,
+    driver_id: String,
+    vendor: String,
+    model: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HealthCameraNetworkView {
+    managed: bool,
+    interface: String,
+    subnet_cidr: String,
+    host_ip: String,
+    dhcp_enabled: bool,
+    dhcp_range_start: String,
+    dhcp_range_end: String,
+    ntp_enabled: bool,
+    ntp_server: String,
+    dns_server: String,
 }
 
 pub async fn run(
@@ -39,6 +79,7 @@ pub async fn run(
 ) -> Result<()> {
     let bind = cfg.api.bind.clone();
     let state = Arc::new(ApiState {
+        preview: PreviewManager::new(&cfg)?,
         cfg: Arc::new(Mutex::new(cfg)),
         cfg_path,
         storage,
@@ -48,6 +89,10 @@ pub async fn run(
     let app = Router::new()
         .route("/health", get(health))
         .route("/session", get(ws_session))
+        .route("/managed/offer", post(managed_offer))
+        .route("/managed/control", post(managed_control))
+        .route("/managed/admin", post(managed_admin))
+        .route("/managed/close", post(managed_close))
         .with_state(state);
 
     let listener = TcpListener::bind(&bind).await?;
@@ -57,16 +102,56 @@ pub async fn run(
 }
 
 async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
-    let sources = state.storage.list_sources().await.unwrap_or_default();
+    let retained_sources = state.storage.list_sources().await.unwrap_or_default();
     let runtime = state.recorder.list_states().await;
     let cfg = state.cfg.lock().await.clone();
+    let sources = cfg
+        .cameras
+        .iter()
+        .map(|cam| cam.source_id.clone())
+        .collect::<Vec<_>>();
+    let cameras = cfg
+        .cameras
+        .iter()
+        .map(|cam| HealthCameraView {
+            source_id: cam.source_id.clone(),
+            name: cam.name.clone(),
+            onvif_host: cam.onvif_host.clone(),
+            onvif_port: cam.onvif_port,
+            enabled: cam.enabled,
+            segment_secs: cam.segment_secs,
+            rtsp_configured: !cam.rtsp_url.trim().is_empty(),
+            ptz_capable: cam.ptz_capable,
+            driver_id: cam.driver_id.clone(),
+            vendor: cam.vendor.clone(),
+            model: cam.model.clone(),
+        })
+        .collect::<Vec<_>>();
+    let camera_network = HealthCameraNetworkView {
+        managed: cfg.camera_network.managed,
+        interface: cfg.camera_network.interface.clone(),
+        subnet_cidr: cfg.camera_network.subnet_cidr.clone(),
+        host_ip: cfg.camera_network.host_ip.clone(),
+        dhcp_enabled: cfg.camera_network.dhcp_enabled,
+        dhcp_range_start: cfg.camera_network.dhcp_range_start.clone(),
+        dhcp_range_end: cfg.camera_network.dhcp_range_end.clone(),
+        ntp_enabled: cfg.camera_network.ntp_enabled,
+        ntp_server: cfg.camera_network.ntp_server.clone(),
+        dns_server: cfg.camera_network.dns_server.clone(),
+    };
     Json(json!({
         "ok": true,
         "service": "nvr",
+        "deviceKind": "service",
         "version": cfg.service_version,
         "nodeRole": cfg.node_role,
         "identityId": cfg.api.identity_id,
+        "devicePk": cfg.nostr_pubkey,
+        "hostGatewayPk": cfg.gateway.host_gateway_pk,
         "sources": sources,
+        "retainedSources": retained_sources,
+        "cameras": cameras,
+        "cameraNetwork": camera_network,
         "sourceRuntime": runtime,
         "configuredSources": cfg.cameras.len(),
     }))
@@ -74,6 +159,255 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
 
 async fn ws_session(ws: WebSocketUpgrade, State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws(socket, state))
+}
+
+async fn managed_offer(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<ManagedOfferRequest>,
+) -> impl IntoResponse {
+    let cfg = state.cfg.lock().await.clone();
+    match state.preview.handle_offer(&cfg, request).await {
+        Ok(response) => Json(json!({
+            "signalType": response.signal_type,
+            "payload": response.answer,
+            "answer": response.answer,
+            "sessionId": response.session_id,
+            "sources": response.sources,
+        }))
+        .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": err.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn managed_close(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<ManagedCloseRequest>,
+) -> impl IntoResponse {
+    let cfg = state.cfg.lock().await.clone();
+    match state.preview.handle_close(&cfg, request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": err.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn managed_control(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<ManagedControlRequest>,
+) -> impl IntoResponse {
+    let cfg = state.cfg.lock().await.clone();
+    let camera = match resolve_control_camera(&cfg, &request) {
+        Ok(camera) => camera,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let ptz_payload = request
+        .payload
+        .get("ptz")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let ptz_capable = camera.ptz_capable;
+    if !ptz_capable {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "camera does not advertise PTZ control",
+            })),
+        )
+            .into_response();
+    }
+
+    match drivers::control_mounted_camera(&camera, &ptz_payload).await {
+        Ok(result) => Json(json!({
+            "signalType": "control_ack",
+            "sourceId": camera.source_id,
+            "preempted": request.preempted,
+            "controlLease": request.control_lease,
+            "ptz": ptz_payload,
+            "currentPose": result.current_pose,
+            "desiredPose": result.desired_pose,
+            "poseStatus": result.pose_status,
+            "managementPlane": result.management_plane,
+            "ptzDiagnostics": result.ptz_diagnostics,
+            "ok": true,
+        }))
+        .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": err.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn managed_admin(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<ManagedAdminRequest>,
+) -> impl IntoResponse {
+    let cfg = state.cfg.lock().await.clone();
+    if let Err(err) = resolve_admin_token(&cfg, &request.launch_token) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    let action = request.action.trim().to_ascii_lowercase();
+    let response = match action.as_str() {
+        "list_inventory" => {
+            let inventory = match drivers::list_inventory(&cfg).await {
+                Ok(inventory) => inventory,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": err.to_string() })),
+                    )
+                        .into_response();
+                }
+            };
+            json!({ "action": action, "inventory": inventory })
+        }
+        "mount_candidate" => {
+            let mount_request: drivers::MountCameraRequest =
+                match serde_json::from_value(request.payload.clone()) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({ "error": format!("invalid mount request: {err}") })),
+                        )
+                            .into_response();
+                    }
+                };
+            let mounted = match drivers::mount_candidate(&cfg, mount_request).await {
+                Ok(result) => result,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": err.to_string() })),
+                    )
+                        .into_response();
+                }
+            };
+            if let Err(err) =
+                persist_camera_source(state.as_ref(), mounted.configured.clone()).await
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+            json!({ "action": action, "mounted": mounted.mounted })
+        }
+        "apply_camera_config" => {
+            let apply_request: drivers::ApplyMountedCameraRequest =
+                match serde_json::from_value(request.payload.clone()) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({ "error": format!("invalid apply request: {err}") })),
+                        )
+                            .into_response();
+                    }
+                };
+            let applied = match drivers::apply_mounted_camera(&cfg, apply_request).await {
+                Ok(result) => result,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": err.to_string() })),
+                    )
+                        .into_response();
+                }
+            };
+            if let Err(err) =
+                persist_camera_source(state.as_ref(), applied.configured.clone()).await
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+            json!({ "action": action, "mounted": applied.mounted })
+        }
+        "read_camera" => {
+            let source_id = request
+                .payload
+                .get("sourceId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let mounted = match drivers::read_camera(&cfg, &source_id).await {
+                Ok(result) => result,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": err.to_string() })),
+                    )
+                        .into_response();
+                }
+            };
+            json!({ "action": action, "mounted": mounted })
+        }
+        "probe_camera" => {
+            let probe_request: drivers::ProbeCameraRequest =
+                match serde_json::from_value(request.payload.clone()) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({ "error": format!("invalid probe request: {err}") })),
+                        )
+                            .into_response();
+                    }
+                };
+            let result = match drivers::probe_camera(&cfg, probe_request).await {
+                Ok(result) => result,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": err.to_string() })),
+                    )
+                        .into_response();
+                }
+            };
+            json!({ "action": action, "result": result })
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "unsupported admin action" })),
+            )
+                .into_response();
+        }
+    };
+    Json(response).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,8 +526,27 @@ impl SourceUpsert {
             rtsp_url: self.rtsp_url.trim().to_string(),
             username: self.username,
             password: self.password,
+            driver_id: if self.source_id.trim().starts_with("reolink-") {
+                drivers::DRIVER_ID_REOLINK.to_string()
+            } else {
+                drivers::DRIVER_ID_GENERIC_ONVIF_RTSP.to_string()
+            },
+            vendor: String::new(),
+            model: String::new(),
+            mac_address: String::new(),
+            rtsp_port: 554,
+            ptz_capable: self.source_id.trim().starts_with("reolink-"),
             enabled: self.enabled,
             segment_secs: self.segment_secs.max(2),
+            desired: CameraDesiredConfig {
+                display_name: if self.name.trim().is_empty() {
+                    self.source_id.trim().to_string()
+                } else {
+                    self.name.trim().to_string()
+                },
+                ..Default::default()
+            },
+            credentials: Default::default(),
         })
     }
 }
@@ -544,9 +897,10 @@ async fn handle_command(
             } else {
                 model
             };
+            let ntp_server = { state.cfg.lock().await.camera_network.ntp_server.clone() };
             let camera_cfg = CameraConfig {
                 source_id: source_id.clone(),
-                name: source_name,
+                name: source_name.clone(),
                 onvif_host: request.ip.clone(),
                 onvif_port,
                 rtsp_url: format!(
@@ -555,8 +909,29 @@ async fn handle_command(
                 ),
                 username: request.username.clone(),
                 password: effective_password,
+                driver_id: drivers::DRIVER_ID_REOLINK.to_string(),
+                vendor: "Reolink".to_string(),
+                model: discovered_entry
+                    .as_ref()
+                    .map(|entry| entry.model.clone())
+                    .unwrap_or_default(),
+                mac_address: discovered_entry
+                    .as_ref()
+                    .map(|entry| entry.mac.clone())
+                    .unwrap_or_default(),
+                rtsp_port,
+                ptz_capable: source_id.contains("e1") || source_id.contains("ptz"),
                 enabled: true,
                 segment_secs: 10,
+                desired: CameraDesiredConfig {
+                    display_name: source_name.clone(),
+                    ntp_server,
+                    timezone: "UTC".to_string(),
+                    overlay_text: source_name.clone(),
+                    overlay_timestamp: true,
+                    ..Default::default()
+                },
+                credentials: Default::default(),
             };
 
             persist_camera_source(state, camera_cfg.clone()).await?;
@@ -690,32 +1065,34 @@ async fn handle_command(
 }
 
 async fn persist_camera_source(state: &ApiState, camera_cfg: CameraConfig) -> Result<()> {
-    let storage_root = {
-        let mut guard = state.cfg.lock().await;
-        if let Some(existing) = guard
-            .cameras
-            .iter_mut()
-            .find(|c| c.source_id == camera_cfg.source_id || c.onvif_host == camera_cfg.onvif_host)
+    let storage_root =
         {
-            *existing = camera_cfg.clone();
-        } else {
-            guard.cameras.push(camera_cfg.clone());
-        }
-        let snapshot = guard.clone();
-        snapshot.persist(&state.cfg_path)?;
-        snapshot.storage_root()
-    };
+            let mut guard = state.cfg.lock().await;
+            if let Some(existing) = guard.cameras.iter_mut().find(|c| {
+                c.source_id == camera_cfg.source_id || c.onvif_host == camera_cfg.onvif_host
+            }) {
+                *existing = camera_cfg.clone();
+            } else {
+                guard.cameras.push(camera_cfg.clone());
+            }
+            guard.apply_defaults();
+            let snapshot = guard.clone();
+            snapshot.persist(&state.cfg_path)?;
+            let _ = hosted_registry::persist_hosted_service_manifest(&snapshot);
+            snapshot.storage_root()
+        };
 
-    state
-        .recorder
-        .upsert_camera(storage_root, camera_cfg)
-        .await;
+    state.recorder.upsert_camera(storage_root, camera_cfg).await;
 
     Ok(())
 }
 
 fn build_reolink_source_id(uid: &str, ip: &str) -> String {
-    let key = if uid.trim().is_empty() { ip.trim() } else { uid.trim() };
+    let key = if uid.trim().is_empty() {
+        ip.trim()
+    } else {
+        uid.trim()
+    };
     let sanitized = key
         .chars()
         .map(|ch| {

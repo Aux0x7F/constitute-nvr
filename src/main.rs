@@ -2,7 +2,11 @@ mod api;
 mod camera;
 mod config;
 mod crypto;
+mod drivers;
+mod hosted_registry;
+mod live;
 mod nostr;
+mod onvif;
 mod reolink;
 mod reolink_cgi;
 #[allow(dead_code)]
@@ -15,7 +19,9 @@ mod util;
 use anyhow::Result;
 use clap::Parser;
 use config::{CameraConfig, Config};
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -57,6 +63,14 @@ struct Args {
     bootstrap_reolink_target_mac: Option<String>,
     #[arg(long, default_value_t = 20)]
     bootstrap_reolink_timeout_secs: u64,
+    #[arg(long)]
+    read_camera_source: Option<String>,
+    #[arg(long)]
+    probe_camera_source: Option<String>,
+    #[arg(long)]
+    apply_camera_source: Option<String>,
+    #[arg(long)]
+    apply_camera_desired_json: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -167,8 +181,61 @@ async fn main() -> Result<()> {
         );
     }
 
+    warn_if_camera_network_not_ready(&cfg);
+    warn_if_template_cameras(&cfg);
+
     if let Err(err) = run_reolink_autoprovision(&mut cfg, &cfg_path).await {
         warn!(error = %err, "reolink auto-provision failed");
+    }
+
+    if let Err(err) = hosted_registry::persist_hosted_service_manifest(&cfg) {
+        warn!(error = %err, "failed writing hosted-service manifest");
+    }
+
+    if let Some(source_id) = &args.read_camera_source {
+        let mounted = drivers::read_camera(&cfg, source_id).await?;
+        println!("{}", serde_json::to_string_pretty(&mounted)?);
+        return Ok(());
+    }
+
+    if let Some(source_id) = &args.probe_camera_source {
+        let result = drivers::probe_camera(
+            &cfg,
+            drivers::ProbeCameraRequest {
+                source_id: source_id.trim().to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    if let Some(source_id) = &args.apply_camera_source {
+        let desired_path = args.apply_camera_desired_json.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("--apply-camera-desired-json is required with --apply-camera-source")
+        })?;
+        let desired: config::CameraDesiredConfig =
+            serde_json::from_str(&fs::read_to_string(desired_path)?)?;
+        let applied = drivers::apply_mounted_camera(
+            &cfg,
+            drivers::ApplyMountedCameraRequest {
+                source_id: source_id.trim().to_string(),
+                desired,
+            },
+        )
+        .await?;
+        if let Some(existing) = cfg
+            .cameras
+            .iter_mut()
+            .find(|camera| camera.source_id.trim() == source_id.trim())
+        {
+            *existing = applied.configured.clone();
+        }
+        cfg.persist(&cfg_path)?;
+        let _ = hosted_registry::persist_hosted_service_manifest(&cfg);
+        println!("{}", serde_json::to_string_pretty(&applied.mounted)?);
+        return Ok(());
     }
 
     let storage =
@@ -210,6 +277,85 @@ async fn main() -> Result<()> {
     api::run(cfg, cfg_path, storage, recorder).await
 }
 
+fn warn_if_camera_network_not_ready(cfg: &Config) {
+    if !cfg.camera_network.managed {
+        return;
+    }
+
+    let iface = cfg.camera_network.interface.trim();
+    if iface.is_empty() {
+        warn!("camera_network is managed but interface is not configured");
+        return;
+    }
+
+    let link = Command::new("ip").args(["link", "show", iface]).output();
+    match link {
+        Ok(output) if output.status.success() => {}
+        Ok(_) => {
+            warn!(interface = iface, "configured camera interface not present");
+            return;
+        }
+        Err(err) => {
+            warn!(interface = iface, error = %err, "failed inspecting camera interface");
+            return;
+        }
+    }
+
+    let host_ip = cfg.camera_network.host_ip.trim();
+    if host_ip.is_empty() {
+        warn!(
+            interface = iface,
+            "camera_network host_ip is not configured"
+        );
+        return;
+    }
+
+    let addr = Command::new("ip")
+        .args(["-4", "-o", "addr", "show", "dev", iface])
+        .output();
+    match addr {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if !text.contains(host_ip) {
+                warn!(
+                    interface = iface,
+                    host_ip = host_ip,
+                    subnet = %cfg.camera_network.subnet_cidr,
+                    "camera network address is not present on configured interface"
+                );
+            }
+        }
+        Ok(_) => {
+            warn!(
+                interface = iface,
+                "failed reading configured camera interface addresses"
+            );
+        }
+        Err(err) => {
+            warn!(interface = iface, error = %err, "failed reading configured camera interface addresses");
+        }
+    }
+}
+
+fn warn_if_template_cameras(cfg: &Config) {
+    for cam in &cfg.cameras {
+        if looks_like_template_camera(cam) {
+            warn!(
+                source = %cam.source_id,
+                onvif_host = %cam.onvif_host,
+                "camera source still matches template defaults; replace it with discovered camera config"
+            );
+        }
+    }
+}
+
+fn looks_like_template_camera(cam: &CameraConfig) -> bool {
+    cam.onvif_host.trim() == "10.60.0.11"
+        || cam.rtsp_url.contains("@10.60.0.11:")
+        || (cam.source_id.trim() == "cam-reolink-e1"
+            && cam.username.trim() == "user"
+            && cam.password.trim() == "pass")
+}
 
 async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<()> {
     if !cfg.autoprovision.reolink_enabled {
@@ -300,10 +446,7 @@ async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<
         };
         let rtsp_url = format!(
             "rtsp://{}:{}@{}:{}/h264Preview_01_main",
-            username,
-            effective_password,
-            ip,
-            rtsp_port
+            username, effective_password, ip, rtsp_port
         );
 
         let mut found = false;
@@ -332,8 +475,24 @@ async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<
                 rtsp_url: rtsp_url.clone(),
                 username: username.clone(),
                 password: effective_password.clone(),
+                driver_id: drivers::DRIVER_ID_REOLINK.to_string(),
+                vendor: "Reolink".to_string(),
+                model: device.model.clone(),
+                mac_address: device.mac.clone(),
+                rtsp_port: rtsp_port as u16,
+                ptz_capable: device.model.to_ascii_lowercase().contains("e1")
+                    || device.model.to_ascii_lowercase().contains("ptz"),
                 enabled: true,
                 segment_secs: 10,
+                desired: config::CameraDesiredConfig {
+                    display_name: source_name.clone(),
+                    ntp_server: cfg.camera_network.ntp_server.clone(),
+                    timezone: "UTC".to_string(),
+                    overlay_text: source_name.clone(),
+                    overlay_timestamp: true,
+                    ..Default::default()
+                },
+                credentials: Default::default(),
             });
             changed = true;
         }
@@ -350,10 +509,20 @@ async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<
 }
 
 fn reolink_source_id(uid: &str, ip: &str) -> String {
-    let key = if uid.trim().is_empty() { ip.trim() } else { uid.trim() };
+    let key = if uid.trim().is_empty() {
+        ip.trim()
+    } else {
+        uid.trim()
+    };
     let sanitized = key
         .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_lowercase() } else { '-' })
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect::<String>();
     format!("reolink-{}", sanitized.trim_matches('-'))
 }
@@ -369,4 +538,3 @@ fn init_logging(level: &str) {
         .compact()
         .init();
 }
-

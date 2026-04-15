@@ -57,7 +57,9 @@ struct DeviceRecordPayload {
     updated_at: u64,
     expires_at: u64,
     role: String,
+    device_kind: String,
     service: String,
+    host_gateway_pk: String,
     service_version: String,
     ingest_protocols: Vec<String>,
     capabilities: Vec<String>,
@@ -189,7 +191,9 @@ async fn announce_loop(
     };
 
     if !pair_identity_label.is_empty() && pair_code_hash.is_empty() {
-        warn!("pair_identity_label configured but no pair_code/pair_code_hash available; enrollment publish disabled");
+        warn!(
+            "pair_identity_label configured but no pair_code/pair_code_hash available; enrollment publish disabled"
+        );
     }
 
     let pair_enabled = !pair_identity_label.is_empty() && !pair_code_hash.is_empty();
@@ -410,7 +414,9 @@ fn build_device_record(cfg: &Config, metrics: &DeviceMetricsPayload) -> Result<N
         updated_at: now,
         expires_at: now + 24 * 60 * 60 * 1000,
         role: cfg.node_role.clone(),
+        device_kind: "service".to_string(),
         service: "nvr".to_string(),
+        host_gateway_pk: cfg.gateway.host_gateway_pk.clone(),
         service_version: cfg.service_version.clone(),
         ingest_protocols: vec!["onvif".to_string(), "rtsp".to_string()],
         capabilities: vec!["camera".to_string()],
@@ -477,7 +483,6 @@ fn build_zone_presence(cfg: &Config, zone: &str) -> Result<NostrEvent> {
     nostr::sign_event(&unsigned, &cfg.nostr_sk_hex)
 }
 
-
 fn build_pair_request_event(
     cfg: &Config,
     zone: &str,
@@ -518,7 +523,6 @@ fn build_pair_request_event(
     nostr::sign_event(&unsigned, &cfg.nostr_sk_hex)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,12 +541,31 @@ mod tests {
         let ev = build_pair_request_event(&cfg, "zone-test", "Identity", "123456", "hash123")
             .expect("pair request event");
         assert_eq!(ev.kind, APP_KIND);
-        assert!(ev.tags.iter().any(|t| t.get(0).map(String::as_str) == Some("t") && t.get(1).map(String::as_str) == Some("constitute")));
-        assert!(ev.tags.iter().any(|t| t.get(0).map(String::as_str) == Some("z") && t.get(1).map(String::as_str) == Some("zone-test")));
+        assert!(
+            ev.tags
+                .iter()
+                .any(|t| t.get(0).map(String::as_str) == Some("t")
+                    && t.get(1).map(String::as_str) == Some("constitute"))
+        );
+        assert!(
+            ev.tags
+                .iter()
+                .any(|t| t.get(0).map(String::as_str) == Some("z")
+                    && t.get(1).map(String::as_str) == Some("zone-test"))
+        );
 
         let payload: serde_json::Value = serde_json::from_str(&ev.content).expect("json payload");
-        assert_eq!(payload.get("type").and_then(|v| v.as_str()), Some("pair_request"));
-        assert_eq!(payload.get("identity").and_then(|v| v.as_str()), Some("Identity"));
-        assert_eq!(payload.get("codeHash").and_then(|v| v.as_str()), Some("hash123"));
+        assert_eq!(
+            payload.get("type").and_then(|v| v.as_str()),
+            Some("pair_request")
+        );
+        assert_eq!(
+            payload.get("identity").and_then(|v| v.as_str()),
+            Some("Identity")
+        );
+        assert_eq!(
+            payload.get("codeHash").and_then(|v| v.as_str()),
+            Some("hash123")
+        );
     }
 }

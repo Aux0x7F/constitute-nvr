@@ -9,7 +9,7 @@ NON_INTERACTIVE=0
 APPLY_HARDENING="ask"
 CAMERA_IFACE=""
 CAMERA_CIDR=""
-ONVIF_PORTS="80,443,8000,8080,8899"
+ONVIF_PORTS="80,443,8000,8080,8899,9000"
 RTSP_PORTS="554"
 ALLOW_NTP_HOST=1
 INSTALL_PREFIX="/opt/constitute-nvr"
@@ -40,13 +40,21 @@ REOLINK_PASSWORD=""
 REOLINK_DESIRED_PASSWORD=""
 REOLINK_GENERATE_PASSWORD=0
 REOLINK_HINT_IP=""
+CAMERA_HOST_IP=""
+CAMERA_DHCP_RANGE_START=""
+CAMERA_DHCP_RANGE_END=""
+PREVIEW_UDP_PORT_MIN=41000
+PREVIEW_UDP_PORT_MAX=41031
+UPDATE_MODE="release_artifact"
+UPDATE_BUILD_USER="${SUDO_USER:-${USER:-}}"
 
 usage() {
   cat <<'EOF'
 Usage: install-wizard.sh [options]
 
 Build and install constitute-nvr as a Fedora/Linux systemd service,
-configure self-update timer, and optionally apply camera-interface hardening.
+configure self-update timer, bootstrap the camera subnet with DHCP,
+and optionally apply camera-interface hardening.
 
 Options:
   --repo-owner <owner>       GitHub owner (default: Aux0x7F)
@@ -63,9 +71,11 @@ Options:
   --apply-hardening          Apply camera hardening
   --skip-hardening           Skip camera hardening
   --camera-iface <iface>     Camera interface (e.g. enp2s0)
-  --camera-cidr <cidr>       Camera subnet (e.g. 10.60.0.0/24)
-  --onvif-ports <csv>        ONVIF TCP ports (default: 80,443,8000,8080,8899)
+  --camera-cidr <cidr>       Camera subnet (auto-selects non-colliding /24 when omitted)
+  --onvif-ports <csv>        Camera control TCP ports (default: 80,443,8000,8080,8899,9000)
   --rtsp-ports <csv>         RTSP TCP ports (default: 554)
+  --preview-udp-port-min <port> Lower bound for live preview ICE UDP ports (default: 41000)
+  --preview-udp-port-max <port> Upper bound for live preview ICE UDP ports (default: 41031)
   --no-ntp-host              Do not allow camera->host UDP/123
   --identity-id <id>         Bind NVR session auth to identity id
   --authorized-device-pk <pk> Add authorized identity device pk (repeatable)
@@ -128,6 +138,42 @@ confirm() {
     [Yy]|[Yy][Ee][Ss]) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+configure_live_preview_firewall() {
+  local port_min="$1"
+  local port_max="$2"
+
+  if ! command -v firewall-cmd >/dev/null 2>&1; then
+    log "firewall-cmd not found; skipping live preview firewall config"
+    return 0
+  fi
+  if ! run_sudo systemctl is-active --quiet firewalld; then
+    log "firewalld inactive; skipping live preview firewall config"
+    return 0
+  fi
+
+  local upstream_iface=""
+  upstream_iface="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')"
+  if [[ -z "$upstream_iface" ]]; then
+    log "no default-route interface found; skipping live preview firewall config"
+    return 0
+  fi
+
+  local zone=""
+  zone="$(run_sudo firewall-cmd --get-zone-of-interface="$upstream_iface" 2>/dev/null | tr -d '\r' | head -n 1)"
+  if [[ -z "$zone" ]]; then
+    zone="$(run_sudo firewall-cmd --get-default-zone 2>/dev/null | tr -d '\r' | head -n 1)"
+  fi
+  if [[ -z "$zone" ]]; then
+    log "unable to determine firewalld zone for $upstream_iface; skipping live preview firewall config"
+    return 0
+  fi
+
+  log "opening live preview UDP ports on ${upstream_iface} (${zone}): 5353 and ${port_min}-${port_max}"
+  run_sudo firewall-cmd --permanent --zone="$zone" --add-port=5353/udp >/dev/null 2>&1 || true
+  run_sudo firewall-cmd --permanent --zone="$zone" --add-port="${port_min}-${port_max}/udp" >/dev/null 2>&1 || true
+  run_sudo firewall-cmd --reload >/dev/null
 }
 
 while [[ $# -gt 0 ]]; do
@@ -198,6 +244,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --rtsp-ports)
       RTSP_PORTS="${2:?missing value for --rtsp-ports}"
+      shift 2
+      ;;
+    --preview-udp-port-min)
+      PREVIEW_UDP_PORT_MIN="${2:?missing value for --preview-udp-port-min}"
+      shift 2
+      ;;
+    --preview-udp-port-max)
+      PREVIEW_UDP_PORT_MAX="${2:?missing value for --preview-udp-port-max}"
       shift 2
       ;;
     --no-ntp-host)
@@ -326,19 +380,6 @@ if [[ "$NON_INTERACTIVE" -eq 0 ]]; then
   fi
 fi
 
-if [[ "$APPLY_HARDENING" -eq 1 ]]; then
-  if [[ -z "$CAMERA_IFACE" && "$NON_INTERACTIVE" -eq 0 ]]; then
-    read -r -p "Camera interface (e.g. enp2s0): " CAMERA_IFACE
-  fi
-  if [[ -z "$CAMERA_CIDR" && "$NON_INTERACTIVE" -eq 0 ]]; then
-    read -r -p "Camera subnet CIDR (e.g. 10.60.0.0/24): " CAMERA_CIDR
-  fi
-  if [[ -z "$CAMERA_IFACE" || -z "$CAMERA_CIDR" ]]; then
-    echo "camera interface and CIDR are required when hardening is enabled" >&2
-    exit 1
-  fi
-fi
-
 if [[ "$REOLINK_AUTOPROVISION" == "ask" ]]; then
   if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
     REOLINK_AUTOPROVISION=0
@@ -376,6 +417,14 @@ if ! [[ "$UPDATE_INTERVAL_SECS" =~ ^[0-9]+$ ]]; then
   echo "update interval must be integer seconds" >&2
   exit 1
 fi
+if ! [[ "$PREVIEW_UDP_PORT_MIN" =~ ^[0-9]+$ && "$PREVIEW_UDP_PORT_MAX" =~ ^[0-9]+$ ]]; then
+  echo "live preview UDP port bounds must be integers" >&2
+  exit 1
+fi
+if (( PREVIEW_UDP_PORT_MIN < 1024 || PREVIEW_UDP_PORT_MIN > 65535 || PREVIEW_UDP_PORT_MAX < PREVIEW_UDP_PORT_MIN || PREVIEW_UDP_PORT_MAX > 65535 )); then
+  echo "live preview UDP port bounds must describe a valid range within 1024-65535" >&2
+  exit 1
+fi
 
 if [[ -z "$IDENTITY_ID" ]]; then
   echo "identity id is required (use --identity-id or interactive prompt)" >&2
@@ -401,8 +450,10 @@ BIN_SRC=""
 UPDATE_SCRIPT_SRC=""
 CONFIG_TEMPLATE_SRC=""
 HARDEN_SCRIPT_SRC=""
+BOOTSTRAP_SCRIPT_SRC=""
 
 if [[ -n "$EXTERNAL_BINARY" ]]; then
+  UPDATE_MODE="release_artifact"
   if [[ ! -f "$EXTERNAL_BINARY" ]]; then
     echo "binary not found: $EXTERNAL_BINARY" >&2
     exit 1
@@ -437,9 +488,13 @@ if [[ -n "$EXTERNAL_BINARY" ]]; then
   if [[ -f "$(dirname "$0")/harden-camera-interface.sh" ]]; then
     HARDEN_SCRIPT_SRC="$(dirname "$0")/harden-camera-interface.sh"
   fi
+  if [[ -f "$(dirname "$0")/bootstrap-camera-network.sh" ]]; then
+    BOOTSTRAP_SCRIPT_SRC="$(dirname "$0")/bootstrap-camera-network.sh"
+  fi
 
   log "using provided binary: $BIN_SRC"
 else
+  UPDATE_MODE="source_build"
   require_cmd git
   if ! command -v cargo >/dev/null 2>&1; then
     log "cargo not found"
@@ -490,6 +545,7 @@ else
   UPDATE_SCRIPT_SRC="$SRC_DIR/scripts/linux/self-update.sh"
   CONFIG_TEMPLATE_SRC="$SRC_DIR/config.example.json"
   HARDEN_SCRIPT_SRC="$SRC_DIR/scripts/linux/harden-camera-interface.sh"
+  BOOTSTRAP_SCRIPT_SRC="$SRC_DIR/scripts/linux/bootstrap-camera-network.sh"
 fi
 
 if [[ ! -x "$BIN_SRC" ]]; then
@@ -508,6 +564,10 @@ if [[ "$APPLY_HARDENING" -eq 1 && ( -z "$HARDEN_SCRIPT_SRC" || ! -f "$HARDEN_SCR
   echo "hardening script source missing" >&2
   exit 1
 fi
+if [[ -z "$BOOTSTRAP_SCRIPT_SRC" || ! -f "$BOOTSTRAP_SCRIPT_SRC" ]]; then
+  echo "camera bootstrap script source missing" >&2
+  exit 1
+fi
 
 log "installing binary to ${INSTALL_PREFIX}"
 run_sudo install -d "$INSTALL_PREFIX/bin"
@@ -523,14 +583,65 @@ if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
 fi
 
 run_sudo install -d -o "$SERVICE_USER" -g "$SERVICE_USER" /var/lib/constitute-nvr
-run_sudo install -d /etc/constitute-nvr
+run_sudo install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" /etc/constitute-nvr
 run_sudo install -d "$STORAGE_ROOT"
 run_sudo chown "$SERVICE_USER":"$SERVICE_USER" "$STORAGE_ROOT"
 
+CONFIG_WAS_INSTALLED=0
 if [[ ! -f /etc/constitute-nvr/config.json && -n "$CONFIG_TEMPLATE_SRC" ]]; then
   log "installing config template to /etc/constitute-nvr/config.json"
-  run_sudo install -m 0644 "$CONFIG_TEMPLATE_SRC" /etc/constitute-nvr/config.json
+  run_sudo install -m 0640 -o "$SERVICE_USER" -g "$SERVICE_USER" "$CONFIG_TEMPLATE_SRC" /etc/constitute-nvr/config.json
+  CONFIG_WAS_INSTALLED=1
 fi
+
+if [[ -f /etc/constitute-nvr/config.json ]]; then
+  run_sudo chown "$SERVICE_USER":"$SERVICE_USER" /etc/constitute-nvr/config.json
+  run_sudo chmod 0640 /etc/constitute-nvr/config.json
+fi
+
+if [[ -f /etc/constitute-nvr/config.json && ( -z "$CAMERA_IFACE" || -z "$CAMERA_CIDR" ) ]]; then
+  existing_camera="$(
+    run_sudo python3 - <<'PY'
+import json
+from pathlib import Path
+
+path = Path('/etc/constitute-nvr/config.json')
+raw = json.loads(path.read_text(encoding='utf-8'))
+camera = raw.get('camera_network') or {}
+print((camera.get('interface') or '').strip())
+print((camera.get('subnet_cidr') or '').strip())
+PY
+  )"
+  if [[ -z "$CAMERA_IFACE" ]]; then
+    CAMERA_IFACE="$(printf '%s\n' "$existing_camera" | sed -n '1p')"
+  fi
+  if [[ -z "$CAMERA_CIDR" ]]; then
+    CAMERA_CIDR="$(printf '%s\n' "$existing_camera" | sed -n '2p')"
+  fi
+fi
+
+log "bootstrapping camera network"
+bootstrap_args=(--apply --print-env)
+if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
+  bootstrap_args+=(--non-interactive)
+fi
+if [[ -n "$CAMERA_IFACE" ]]; then
+  bootstrap_args+=(--camera-iface "$CAMERA_IFACE")
+fi
+if [[ -n "$CAMERA_CIDR" ]]; then
+  bootstrap_args+=(--camera-cidr "$CAMERA_CIDR")
+fi
+
+bootstrap_output="$(run_sudo bash "$BOOTSTRAP_SCRIPT_SRC" "${bootstrap_args[@]}")"
+while IFS='=' read -r key value; do
+  case "$key" in
+    CAMERA_IFACE) CAMERA_IFACE="$value" ;;
+    CAMERA_CIDR) CAMERA_CIDR="$value" ;;
+    CAMERA_HOST_IP) CAMERA_HOST_IP="$value" ;;
+    CAMERA_DHCP_RANGE_START) CAMERA_DHCP_RANGE_START="$value" ;;
+    CAMERA_DHCP_RANGE_END) CAMERA_DHCP_RANGE_END="$value" ;;
+  esac
+done <<<"$bootstrap_output"
 
 log "patching config defaults"
 authorized_joined=""
@@ -549,9 +660,11 @@ fi
 run_sudo env \
   CFG_STORAGE_ROOT="${STORAGE_ROOT}" \
   CFG_UPDATE_INTERVAL="${UPDATE_INTERVAL_SECS}" \
+  CFG_UPDATE_MODE="${UPDATE_MODE}" \
   CFG_SOURCE_DIR="${SOURCE_DIR}" \
   CFG_REF="${REF}" \
   CFG_UPDATE_SCRIPT="${SELF_UPDATE_BIN}" \
+  CFG_UPDATE_BUILD_USER="${UPDATE_BUILD_USER}" \
   CFG_IDENTITY_ID="${IDENTITY_ID}" \
   CFG_PUBLIC_WS_URL="${PUBLIC_WS_URL}" \
   CFG_SWARM_PEERS="${swarm_peers_joined}" \
@@ -567,6 +680,14 @@ run_sudo env \
   CFG_REOLINK_DESIRED_PASSWORD="${REOLINK_DESIRED_PASSWORD}" \
   CFG_REOLINK_GENERATE_PASSWORD="${REOLINK_GENERATE_PASSWORD}" \
   CFG_REOLINK_HINT_IP="${REOLINK_HINT_IP}" \
+  CFG_CAMERA_IFACE="${CAMERA_IFACE}" \
+  CFG_CAMERA_CIDR="${CAMERA_CIDR}" \
+  CFG_CAMERA_HOST_IP="${CAMERA_HOST_IP}" \
+  CFG_CAMERA_DHCP_RANGE_START="${CAMERA_DHCP_RANGE_START}" \
+  CFG_CAMERA_DHCP_RANGE_END="${CAMERA_DHCP_RANGE_END}" \
+  CFG_PREVIEW_UDP_PORT_MIN="${PREVIEW_UDP_PORT_MIN}" \
+  CFG_PREVIEW_UDP_PORT_MAX="${PREVIEW_UDP_PORT_MAX}" \
+  CFG_FIRST_INSTALL="${CONFIG_WAS_INSTALLED}" \
   python3 - <<'PY'
 import base64
 import hashlib
@@ -579,9 +700,11 @@ raw = json.loads(path.read_text(encoding='utf-8'))
 
 storage_root = os.environ.get('CFG_STORAGE_ROOT', '').strip()
 update_interval = int(os.environ.get('CFG_UPDATE_INTERVAL', '300') or '300')
+update_mode = os.environ.get('CFG_UPDATE_MODE', 'release_artifact').strip() or 'release_artifact'
 source_dir = os.environ.get('CFG_SOURCE_DIR', '').strip()
 ref = os.environ.get('CFG_REF', '').strip()
 update_script = os.environ.get('CFG_UPDATE_SCRIPT', '').strip()
+update_build_user = os.environ.get('CFG_UPDATE_BUILD_USER', '').strip()
 identity_id = os.environ.get('CFG_IDENTITY_ID', '').strip()
 public_ws_url = os.environ.get('CFG_PUBLIC_WS_URL', '').strip()
 swarm_peers = [x.strip() for x in os.environ.get('CFG_SWARM_PEERS', '').split('|') if x.strip()]
@@ -597,13 +720,37 @@ reolink_password = os.environ.get('CFG_REOLINK_PASSWORD', '').strip()
 reolink_desired_password = os.environ.get('CFG_REOLINK_DESIRED_PASSWORD', '').strip()
 reolink_generate_password = os.environ.get('CFG_REOLINK_GENERATE_PASSWORD', '0').strip() == '1'
 reolink_hint_ip = os.environ.get('CFG_REOLINK_HINT_IP', '').strip()
+camera_iface = os.environ.get('CFG_CAMERA_IFACE', '').strip()
+camera_cidr = os.environ.get('CFG_CAMERA_CIDR', '').strip()
+camera_host_ip = os.environ.get('CFG_CAMERA_HOST_IP', '').strip()
+camera_dhcp_range_start = os.environ.get('CFG_CAMERA_DHCP_RANGE_START', '').strip()
+camera_dhcp_range_end = os.environ.get('CFG_CAMERA_DHCP_RANGE_END', '').strip()
+preview_udp_port_min = int(os.environ.get('CFG_PREVIEW_UDP_PORT_MIN', '41000') or '41000')
+preview_udp_port_max = int(os.environ.get('CFG_PREVIEW_UDP_PORT_MAX', '41031') or '41031')
+first_install = os.environ.get('CFG_FIRST_INSTALL', '0').strip() == '1'
+
+def looks_like_template_camera(camera: dict) -> bool:
+    if not isinstance(camera, dict):
+        return False
+    onvif_host = str(camera.get('onvif_host', '')).strip()
+    rtsp_url = str(camera.get('rtsp_url', '')).strip()
+    source_id = str(camera.get('source_id', '')).strip()
+    username = str(camera.get('username', '')).strip()
+    password = str(camera.get('password', '')).strip()
+    return (
+        onvif_host == '10.60.0.11'
+        or '@10.60.0.11:' in rtsp_url
+        or (source_id == 'cam-reolink-e1' and username == 'user' and password == 'pass')
+    )
 
 raw.setdefault('storage', {})['root'] = storage_root
 raw.setdefault('update', {})['enabled'] = True
 raw['update']['interval_secs'] = update_interval
+raw['update']['mode'] = update_mode
 raw['update']['source_dir'] = source_dir
 raw['update']['branch'] = ref
 raw['update']['script_path'] = update_script
+raw['update']['build_user'] = update_build_user
 
 raw.setdefault('api', {})['identity_id'] = identity_id
 raw['api']['allow_unsigned_hello_mvp'] = allow_unsigned
@@ -643,6 +790,26 @@ autop['reolink_desired_password'] = reolink_desired_password
 autop['reolink_generate_password'] = reolink_generate_password
 autop.setdefault('reolink_discover_timeout_secs', 3)
 autop['reolink_hint_ip'] = reolink_hint_ip
+
+camera_network = raw.setdefault('camera_network', {})
+camera_network['managed'] = True
+camera_network['interface'] = camera_iface
+camera_network['subnet_cidr'] = camera_cidr
+camera_network['host_ip'] = camera_host_ip
+camera_network['dhcp_enabled'] = True
+camera_network['dhcp_range_start'] = camera_dhcp_range_start
+camera_network['dhcp_range_end'] = camera_dhcp_range_end
+
+live_preview = raw.setdefault('live_preview', {})
+live_preview['udp_port_min'] = preview_udp_port_min
+live_preview['udp_port_max'] = preview_udp_port_max
+
+if first_install or (
+    isinstance(raw.get('cameras'), list)
+    and raw['cameras']
+    and all(looks_like_template_camera(item) for item in raw['cameras'])
+):
+    raw['cameras'] = []
 
 path.write_text(json.dumps(raw, indent=2) + '\n', encoding='utf-8')
 PY
@@ -685,7 +852,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=${SELF_UPDATE_BIN} --source-dir ${SOURCE_DIR} --branch ${REF} --service-name ${SERVICE_NAME} --try-restart
+ExecStart=${SELF_UPDATE_BIN} --mode ${UPDATE_MODE} --build-user ${UPDATE_BUILD_USER} --source-dir ${SOURCE_DIR} --branch ${REF} --service-name ${SERVICE_NAME} --try-restart
 EOF
 
 cat <<EOF | run_sudo tee "$UPD_TIMER" >/dev/null
@@ -703,8 +870,18 @@ WantedBy=timers.target
 EOF
 
 run_sudo systemctl daemon-reload
-run_sudo systemctl enable --now "$SERVICE_NAME"
-run_sudo systemctl enable --now "${SERVICE_NAME}-update.timer"
+run_sudo systemctl enable "$SERVICE_NAME"
+if run_sudo systemctl is-active --quiet "$SERVICE_NAME"; then
+  run_sudo systemctl restart "$SERVICE_NAME"
+else
+  run_sudo systemctl start "$SERVICE_NAME"
+fi
+run_sudo systemctl enable "${SERVICE_NAME}-update.timer"
+if run_sudo systemctl is-active --quiet "${SERVICE_NAME}-update.timer"; then
+  run_sudo systemctl restart "${SERVICE_NAME}-update.timer"
+else
+  run_sudo systemctl start "${SERVICE_NAME}-update.timer"
+fi
 
 if [[ "$APPLY_HARDENING" -eq 1 ]]; then
   log "applying camera hardening"
@@ -720,6 +897,8 @@ if [[ "$APPLY_HARDENING" -eq 1 ]]; then
   fi
   run_sudo bash "$HARDEN_SCRIPT_SRC" "${harden_args[@]}"
 fi
+
+configure_live_preview_firewall "$PREVIEW_UDP_PORT_MIN" "$PREVIEW_UDP_PORT_MAX"
 
 log "installation complete"
 run_sudo systemctl --no-pager --full status "$SERVICE_NAME" | sed -n '1,20p' || true

@@ -29,6 +29,8 @@ const REOLINK_PROPRIETARY_PORT: u16 = 9000;
 const REOLINK_NATIVE_CONNECT_TIMEOUT_SECS: u64 = 5;
 const REOLINK_NATIVE_IO_TIMEOUT_SECS: u64 = 5;
 const REOLINK_NATIVE_MAX_PAYLOAD_LEN: usize = 1 << 20;
+const REOLINK_NATIVE_PTZ_SET_RESPONSE_CODE: u32 = 405;
+const REOLINK_NATIVE_PTZ_AFTER_READ_DELAY_MS: u64 = 250;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -307,6 +309,52 @@ pub struct ReolinkStateApplyResult {
     pub active_password: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReolinkNativePtzPosition {
+    #[serde(alias = "pPos")]
+    pub pan: i32,
+    #[serde(alias = "tPos")]
+    pub tilt: i32,
+    #[serde(alias = "zPos")]
+    pub zoom: i32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReolinkNativePtzSetResult {
+    #[serde(default)]
+    pub before: ReolinkNativePtzPosition,
+    #[serde(default)]
+    pub target: ReolinkNativePtzPosition,
+    #[serde(default)]
+    pub after: ReolinkNativePtzPosition,
+    #[serde(default)]
+    pub cmd_idx: i32,
+    #[serde(default)]
+    pub ack: Value,
+}
+
+impl From<ReolinkNativePtzPosition> for reolink_proto::ReolinkPtzPosition {
+    fn from(value: ReolinkNativePtzPosition) -> Self {
+        Self {
+            pan: value.pan,
+            tilt: value.tilt,
+            zoom: value.zoom,
+        }
+    }
+}
+
+impl From<reolink_proto::ReolinkPtzPosition> for ReolinkNativePtzPosition {
+    fn from(value: reolink_proto::ReolinkPtzPosition) -> Self {
+        Self {
+            pan: value.pan,
+            tilt: value.tilt,
+            zoom: value.zoom,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReolinkSetupBridgeResult {
@@ -337,6 +385,17 @@ struct ReolinkPasswordRecoveryNote {
     desired_password: String,
     generated: bool,
     note: &'static str,
+}
+
+#[derive(Debug)]
+struct ReolinkNativeSession {
+    stream: TcpStream,
+    username: String,
+    session_key: [u8; 16],
+    channel: u32,
+    next_request_id: u32,
+    session_primed: bool,
+    ptz_channel_prepared: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -601,41 +660,297 @@ fn native_password_candidates(request: &ReolinkSetupRequest) -> Vec<String> {
     out
 }
 
-async fn try_native_9000_login(target: Ipv4Addr, username: &str, password: &str) -> Result<()> {
-    let addr = SocketAddrV4::new(target, REOLINK_PROPRIETARY_PORT);
-    let mut stream = timeout(
-        Duration::from_secs(REOLINK_NATIVE_CONNECT_TIMEOUT_SECS),
-        TcpStream::connect(addr),
-    )
-    .await
-    .context("timed out connecting to Reolink proprietary port")?
-    .with_context(|| format!("failed connecting to {addr}"))?;
+impl ReolinkNativeSession {
+    async fn connect(request: ReolinkConnectRequest) -> Result<Self> {
+        let target = parse_ipv4(&request.ip).context("invalid native PTZ ip")?;
+        let addr = SocketAddrV4::new(target, REOLINK_PROPRIETARY_PORT);
+        let mut stream = timeout(
+            Duration::from_secs(REOLINK_NATIVE_CONNECT_TIMEOUT_SECS),
+            TcpStream::connect(addr),
+        )
+        .await
+        .context("timed out connecting to Reolink proprietary port")?
+        .with_context(|| format!("failed connecting to {addr}"))?;
 
-    let _ = stream.set_nodelay(true);
+        let _ = stream.set_nodelay(true);
 
-    let probe = reolink_proto::build_handshake_probe_frame();
-    timed_write_all(&mut stream, &probe, "native handshake probe").await?;
+        let probe = reolink_proto::build_handshake_probe_frame();
+        timed_write_all(&mut stream, &probe, "native handshake probe").await?;
 
-    let handshake_frame = read_reolink_transport_frame(&mut stream).await?;
-    let handshake_body = reolink_proto::handshake_frame_body(&handshake_frame)
-        .ok_or_else(|| anyhow!("native handshake response missing handshake body"))?;
-    let nonce = reolink_proto::extract_nonce_from_handshake_body(handshake_body)
-        .ok_or_else(|| anyhow!("native handshake response missing nonce"))?;
+        let handshake_frame = read_reolink_transport_frame(&mut stream).await?;
+        let handshake_body = reolink_proto::handshake_frame_body(&handshake_frame)
+            .ok_or_else(|| anyhow!("native handshake response missing handshake body"))?;
+        let nonce = reolink_proto::extract_nonce_from_handshake_body(handshake_body)
+            .ok_or_else(|| anyhow!("native handshake response missing nonce"))?;
 
-    let login_frame = reolink_proto::build_login_frame(username, password, &nonce);
-    timed_write_all(&mut stream, &login_frame, "native login frame").await?;
+        let login_frame =
+            reolink_proto::build_login_frame(&request.username, &request.password, &nonce);
+        timed_write_all(&mut stream, &login_frame, "native login frame").await?;
 
-    let login_response = read_reolink_transport_frame(&mut stream).await?;
-    let login_header = reolink_proto::parse_frame_header(&login_response)
-        .ok_or_else(|| anyhow!("native login response is not a valid Reolink frame"))?;
-    if reolink_proto::ReolinkTransportOp::from_u32(login_header.op()).is_none() {
-        return Err(anyhow!(format!(
-            "native login response used unknown op {}",
-            login_header.op()
-        )));
+        let login_response = read_reolink_transport_frame(&mut stream).await?;
+        let login_header = reolink_proto::parse_frame_header(&login_response)
+            .ok_or_else(|| anyhow!("native login response is not a valid Reolink frame"))?;
+        if login_header.op() != reolink_proto::ReolinkTransportOp::Handshake as u32 {
+            return Err(anyhow!(format!(
+                "native login response used unexpected op {}",
+                login_header.op()
+            )));
+        }
+        if login_header.field_d() != reolink_proto::OBSERVED_SERVER_OK {
+            return Err(anyhow!(format!(
+                "native login failed with response code {}",
+                login_header.field_d()
+            )));
+        }
+
+        Ok(Self {
+            stream,
+            username: request.username,
+            session_key: reolink_proto::derive_native_aes_key(&nonce, &request.password),
+            channel: request.channel.max(0) as u32,
+            next_request_id: 1,
+            session_primed: false,
+            ptz_channel_prepared: false,
+        })
     }
 
-    Ok(())
+    fn next_request_id(&mut self) -> u32 {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        request_id
+    }
+
+    async fn read_matching_frame(
+        &mut self,
+        expected_op: u32,
+        expected_request_id: u32,
+        label: &str,
+    ) -> Result<(reolink_proto::ReolinkFrameHeader, Vec<u8>)> {
+        loop {
+            let frame = read_reolink_transport_frame(&mut self.stream)
+                .await
+                .with_context(|| format!("failed reading {label} response"))?;
+            let header = reolink_proto::parse_frame_header(&frame).ok_or_else(|| {
+                anyhow!("invalid Reolink frame while waiting for {label} response")
+            })?;
+            if header.op() == expected_op && header.field_c() == expected_request_id {
+                let body = frame[header.header_len()..header.total_len()].to_vec();
+                return Ok((header, body));
+            }
+        }
+    }
+
+    async fn send_bootstrap_frame(&mut self, frame: Vec<u8>, label: &str) -> Result<()> {
+        timed_write_all(&mut self.stream, &frame, label).await
+    }
+
+    async fn prime_session(&mut self) -> Result<()> {
+        if self.session_primed {
+            return Ok(());
+        }
+
+        let login_id = self.next_request_id();
+        self.send_bootstrap_frame(
+            reolink_proto::build_native_session_login_frame(
+                login_id,
+                &self.username,
+                &self.session_key,
+            ),
+            "native session login frame",
+        )
+        .await?;
+
+        let bind_id = self.next_request_id();
+        self.send_bootstrap_frame(
+            reolink_proto::build_native_session_bind_frame(
+                bind_id,
+                &self.username,
+                &self.session_key,
+            ),
+            "native session bind frame",
+        )
+        .await?;
+
+        for (label, op) in [
+            (
+                "native channel-ready frame",
+                reolink_proto::ReolinkTransportOp::ChannelReady as u32,
+            ),
+            (
+                "native common-ack frame",
+                reolink_proto::ReolinkTransportOp::CommonAck as u32,
+            ),
+            (
+                "native common-read-a frame",
+                reolink_proto::ReolinkTransportOp::CommonReadA as u32,
+            ),
+            (
+                "native common-read-b frame",
+                reolink_proto::ReolinkTransportOp::CommonReadB as u32,
+            ),
+            (
+                "native common-read-c frame",
+                reolink_proto::ReolinkTransportOp::CommonReadC as u32,
+            ),
+        ] {
+            let request_id = self.next_request_id();
+            self.send_bootstrap_frame(
+                reolink_proto::build_native_header_only_frame(op, request_id),
+                label,
+            )
+            .await?;
+        }
+
+        self.session_primed = true;
+        Ok(())
+    }
+
+    async fn read_ptz_position_once(&mut self) -> Result<ReolinkNativePtzPosition> {
+        let request_id = self.next_request_id();
+        let frame =
+            reolink_proto::build_native_ptz_get_frame(request_id, self.channel, &self.session_key);
+        timed_write_all(&mut self.stream, &frame, "native PTZ get-position frame").await?;
+
+        let (header, body) = self
+            .read_matching_frame(
+                reolink_proto::NATIVE_OP_GET_PTZ_CUR_POS,
+                request_id,
+                "native PTZ get-position",
+            )
+            .await?;
+        if header.field_d() != reolink_proto::OBSERVED_SERVER_OK {
+            return Err(anyhow!(format!(
+                "native PTZ get-position failed with response code {}",
+                header.field_d()
+            )));
+        }
+
+        let xml = String::from_utf8(reolink_proto::decrypt_native_payload(
+            &self.session_key,
+            &body,
+        ))
+        .context("native PTZ get-position reply was not valid UTF-8")?;
+        let position = reolink_proto::parse_native_ptz_position_xml(&xml)
+            .ok_or_else(|| anyhow!("native PTZ get-position reply did not contain ptzCurPos"))?;
+        Ok(position.into())
+    }
+
+    async fn prepare_ptz_channel(&mut self) -> Result<()> {
+        if self.ptz_channel_prepared {
+            return Ok(());
+        }
+
+        let telemetry_id = self.next_request_id();
+        self.send_bootstrap_frame(
+            reolink_proto::build_native_header_only_frame(
+                reolink_proto::ReolinkTransportOp::Telemetry as u32,
+                telemetry_id,
+            ),
+            "native telemetry frame",
+        )
+        .await?;
+
+        let prepare_id = self.next_request_id();
+        self.send_bootstrap_frame(
+            reolink_proto::build_native_prepare_ptz_frame(
+                prepare_id,
+                self.channel,
+                &self.session_key,
+            ),
+            "native PTZ prepare frame",
+        )
+        .await?;
+
+        let (header, _) = self
+            .read_matching_frame(
+                reolink_proto::ReolinkTransportOp::ApplyConfig as u32,
+                prepare_id,
+                "native PTZ prepare",
+            )
+            .await?;
+        if header.field_d() != reolink_proto::OBSERVED_SERVER_OK {
+            return Err(anyhow!(format!(
+                "native PTZ prepare failed with response code {}",
+                header.field_d()
+            )));
+        }
+
+        self.ptz_channel_prepared = true;
+        Ok(())
+    }
+
+    async fn read_ptz_position(&mut self) -> Result<ReolinkNativePtzPosition> {
+        self.prime_session().await?;
+        let position = self.read_ptz_position_once().await?;
+        if !self.ptz_channel_prepared {
+            self.prepare_ptz_channel().await?;
+        }
+        Ok(position)
+    }
+
+    async fn set_ptz_position(&mut self, target: ReolinkNativePtzPosition) -> Result<(u32, Value)> {
+        if !self.ptz_channel_prepared {
+            let _ = self.read_ptz_position().await?;
+        }
+        let request_id = self.next_request_id();
+        let frame = reolink_proto::build_native_ptz_set_frame(
+            request_id,
+            self.channel,
+            target.into(),
+            &self.session_key,
+        );
+        timed_write_all(&mut self.stream, &frame, "native PTZ set-position frame").await?;
+
+        let (header, body) = self
+            .read_matching_frame(
+                reolink_proto::NATIVE_OP_SET_PTZ_POS,
+                request_id,
+                "native PTZ set-position",
+            )
+            .await?;
+        if header.field_d() != REOLINK_NATIVE_PTZ_SET_RESPONSE_CODE
+            && header.field_d() != reolink_proto::OBSERVED_SERVER_OK
+        {
+            return Err(anyhow!(format!(
+                "native PTZ set-position failed with response code {}",
+                header.field_d()
+            )));
+        }
+
+        let response_body = if body.is_empty() {
+            Value::Null
+        } else {
+            Value::String(
+                String::from_utf8_lossy(&reolink_proto::decrypt_native_payload(
+                    &self.session_key,
+                    &body,
+                ))
+                .to_string(),
+            )
+        };
+
+        Ok((
+            request_id,
+            json!({
+                "requestId": request_id,
+                "responseCode": header.field_d(),
+                "payloadLen": header.payload_len(),
+                "payloadOffset": header.field_e().unwrap_or_default(),
+                "body": response_body,
+            }),
+        ))
+    }
+}
+
+async fn try_native_9000_login(target: Ipv4Addr, username: &str, password: &str) -> Result<()> {
+    ReolinkNativeSession::connect(ReolinkConnectRequest {
+        ip: target.to_string(),
+        username: username.to_string(),
+        channel: 0,
+        password: password.to_string(),
+    })
+    .await
+    .map(|_| ())
 }
 
 async fn timed_write_all(stream: &mut TcpStream, buf: &[u8], label: &str) -> Result<()> {
@@ -738,17 +1053,41 @@ fn sdk_bridge_script_path() -> PathBuf {
     }
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if let Some(workspace_root) = manifest_dir.ancestors().nth(2) {
-        return workspace_root
+    let candidates = [
+        manifest_dir
+            .join("..")
             .join("reolink-rev-eng")
-            .join("reolink-sdk-bridge.cjs");
+            .join("reolink-sdk-bridge.cjs"),
+        manifest_dir
+            .join("..")
+            .join("..")
+            .join("reolink-rev-eng")
+            .join("reolink-sdk-bridge.cjs"),
+    ];
+    for candidate in candidates {
+        if candidate.exists() {
+            return candidate;
+        }
     }
 
     manifest_dir
         .join("..")
-        .join("..")
         .join("reolink-rev-eng")
         .join("reolink-sdk-bridge.cjs")
+}
+
+#[allow(dead_code)]
+fn native_ptz_script_path() -> PathBuf {
+    if let Ok(raw) = env::var("CONSTITUTE_REOLINK_NATIVE_PTZ_SCRIPT") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("reolink-native-ptz.cjs")
 }
 
 fn should_persist_recovery_note(request: &ReolinkSetupRequest) -> bool {
@@ -781,7 +1120,12 @@ async fn write_password_recovery_note(request: &ReolinkSetupRequest) -> Result<P
 }
 
 fn sdk_bridge_available() -> bool {
-    cfg!(target_os = "windows") && sdk_bridge_script_path().exists()
+    sdk_bridge_script_path().exists()
+}
+
+#[allow(dead_code)]
+fn native_ptz_script_available() -> bool {
+    native_ptz_script_path().exists()
 }
 
 fn env_truthy(name: &str) -> bool {
@@ -823,6 +1167,39 @@ pub async fn read_state(request: ReolinkConnectRequest) -> Result<ReolinkStateRe
     }
 
     reolink_cgi::read_state(&request).await
+}
+
+pub async fn read_native_ptz_position(
+    request: ReolinkConnectRequest,
+) -> Result<ReolinkNativePtzPosition> {
+    let request = request.normalized()?;
+    let mut session = ReolinkNativeSession::connect(request).await?;
+    session.read_ptz_position().await
+}
+
+pub async fn set_native_ptz_position(
+    request: ReolinkConnectRequest,
+    target: ReolinkNativePtzPosition,
+) -> Result<ReolinkNativePtzSetResult> {
+    let request = request.normalized()?;
+    let mut session = ReolinkNativeSession::connect(request).await?;
+    let before = session.read_ptz_position().await?;
+    // Keep the native absolute set path available and instrumented even though the lab E1 still
+    // refuses to actuate SetPtzPos reliably; the driver uses this for diagnostics and will fall
+    // back to observed step control until true native absolute movement is confirmed.
+    let (request_id, ack) = session.set_ptz_position(target).await?;
+    sleep(Duration::from_millis(
+        REOLINK_NATIVE_PTZ_AFTER_READ_DELAY_MS,
+    ))
+    .await;
+    let after = session.read_ptz_position().await?;
+    Ok(ReolinkNativePtzSetResult {
+        before,
+        target,
+        after,
+        cmd_idx: request_id as i32,
+        ack,
+    })
 }
 
 pub async fn apply_state(request: ReolinkStateApplyRequest) -> Result<ReolinkStateApplyResult> {
@@ -877,16 +1254,32 @@ async fn setup_via_sdk_bridge(request: &ReolinkSetupRequest) -> Result<ReolinkSe
 }
 
 async fn run_sdk_bridge_value(payload: Value) -> Result<Value> {
-    let script = sdk_bridge_script_path();
-    if !script.exists() {
+    run_json_ipc_script_value(sdk_bridge_script_path(), payload, "Reolink SDK bridge").await
+}
+
+#[allow(dead_code)]
+async fn run_native_ptz_script_value(payload: Value) -> Result<Value> {
+    if !native_ptz_script_available() {
         return Err(anyhow!(
-            "Reolink SDK bridge script not found at {}",
-            script.display()
+            "native Reolink PTZ helper script not found at {}",
+            native_ptz_script_path().display()
         ));
+    }
+    run_json_ipc_script_value(
+        native_ptz_script_path(),
+        payload,
+        "native Reolink PTZ helper",
+    )
+    .await
+}
+
+async fn run_json_ipc_script_value(script: PathBuf, payload: Value, label: &str) -> Result<Value> {
+    if !script.exists() {
+        return Err(anyhow!("{label} script not found at {}", script.display()));
     }
 
     let response_path = env::temp_dir().join(format!(
-        "constitute-nvr-reolink-bridge-{}.json",
+        "constitute-nvr-reolink-script-{}.json",
         rand::thread_rng().r#gen::<u64>()
     ));
 
@@ -902,18 +1295,19 @@ async fn run_sdk_bridge_value(payload: Value) -> Result<Value> {
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(
-                &serde_json::to_vec(&payload).context("failed encoding Reolink bridge request")?,
+                &serde_json::to_vec(&payload)
+                    .with_context(|| format!("failed encoding {label} request"))?,
             )
             .await
-            .context("failed writing request to Reolink SDK bridge")?;
+            .with_context(|| format!("failed writing request to {label}"))?;
     } else {
-        return Err(anyhow!("failed opening stdin for Reolink SDK bridge"));
+        return Err(anyhow!("failed opening stdin for {label}"));
     }
 
     let output = child
         .wait_with_output()
         .await
-        .context("failed waiting for Reolink SDK bridge")?;
+        .with_context(|| format!("failed waiting for {label}"))?;
 
     let raw = fs::read(&response_path)
         .await
@@ -921,13 +1315,13 @@ async fn run_sdk_bridge_value(payload: Value) -> Result<Value> {
     let _ = fs::remove_file(&response_path).await;
 
     let value: Value =
-        serde_json::from_slice(&raw).context("failed parsing Reolink SDK bridge response")?;
+        serde_json::from_slice(&raw).with_context(|| format!("failed parsing {label} response"))?;
     let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
     if !output.status.success() || !ok {
         let bridge_error = value
             .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("unknown Reolink SDK bridge error");
+            .unwrap_or("unknown script error");
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if stderr.is_empty() {
             return Err(anyhow!(bridge_error.to_string()));

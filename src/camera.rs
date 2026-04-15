@@ -4,6 +4,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::process::Command;
@@ -132,6 +133,7 @@ async fn record_loop(
 
     loop {
         update_state(&state, "starting", restart_attempt, String::new(), Some(0)).await;
+        let baseline_segments = count_segment_files(&out_dir).await?;
 
         let mut cmd = Command::new("ffmpeg");
         cmd.arg("-hide_banner")
@@ -151,20 +153,28 @@ async fn record_loop(
             .arg("1")
             .arg("-strftime")
             .arg("1")
-            .arg(output_pattern.to_string_lossy().to_string());
+            .arg(output_pattern.to_string_lossy().to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
 
-        info!(source = %cam.source_id, rtsp = %cam.rtsp_url, "starting ffmpeg recorder");
-        update_state(&state, "running", restart_attempt, String::new(), Some(0)).await;
+        info!(
+            source = %cam.source_id,
+            onvif_host = %cam.onvif_host,
+            segment_secs = cam.segment_secs,
+            "starting ffmpeg recorder"
+        );
+        update_state(
+            &state,
+            "connecting",
+            restart_attempt,
+            String::new(),
+            Some(0),
+        )
+        .await;
 
-        match cmd.status().await {
-            Ok(status) => {
-                let message = format!("ffmpeg exited with code {:?}", status.code());
-                warn!(source = %cam.source_id, code = ?status.code(), "ffmpeg exited; restarting");
-                restart_attempt = restart_attempt.saturating_add(1);
-                let backoff = backoff_secs(restart_attempt);
-                update_state(&state, "backoff", restart_attempt, message, Some(backoff)).await;
-                sleep(Duration::from_secs(backoff)).await;
-            }
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::NotFound {
                     return Err(anyhow!("ffmpeg not found in PATH"));
@@ -176,9 +186,70 @@ async fn record_loop(
                 let backoff = backoff_secs(restart_attempt);
                 update_state(&state, "backoff", restart_attempt, message, Some(backoff)).await;
                 sleep(Duration::from_secs(backoff)).await;
+                continue;
+            }
+        };
+
+        let mut marked_running = false;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let message = format!("ffmpeg exited with code {:?}", status.code());
+                    warn!(source = %cam.source_id, code = ?status.code(), "ffmpeg exited; restarting");
+                    restart_attempt = restart_attempt.saturating_add(1);
+                    let backoff = backoff_secs(restart_attempt);
+                    update_state(&state, "backoff", restart_attempt, message, Some(backoff)).await;
+                    sleep(Duration::from_secs(backoff)).await;
+                    break;
+                }
+                Ok(None) => {
+                    if !marked_running {
+                        let current_segments = count_segment_files(&out_dir)
+                            .await
+                            .unwrap_or(baseline_segments);
+                        if current_segments > baseline_segments {
+                            marked_running = true;
+                            update_state(
+                                &state,
+                                "running",
+                                restart_attempt,
+                                String::new(),
+                                Some(0),
+                            )
+                            .await;
+                        }
+                    }
+                    sleep(Duration::from_secs(1)).await;
+                }
+                Err(err) => {
+                    let message = format!("ffmpeg status check failed: {}", err);
+                    warn!(source = %cam.source_id, error = %err, "failed to inspect ffmpeg status; retrying");
+                    restart_attempt = restart_attempt.saturating_add(1);
+                    let backoff = backoff_secs(restart_attempt);
+                    update_state(&state, "backoff", restart_attempt, message, Some(backoff)).await;
+                    sleep(Duration::from_secs(backoff)).await;
+                    break;
+                }
             }
         }
     }
+}
+
+async fn count_segment_files(out_dir: &PathBuf) -> Result<u64> {
+    let mut count = 0u64;
+    let mut reader = tokio::fs::read_dir(out_dir).await?;
+    while let Some(entry) = reader.next_entry().await? {
+        if entry
+            .path()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("mp4"))
+            .unwrap_or(false)
+        {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
 }
 
 fn backoff_secs(attempt: u64) -> u64 {

@@ -1,19 +1,18 @@
-# Protocol Notes (Iteration-1 Draft)
+# Protocol Notes (Active Draft)
 
 ## Purpose
-Define the active contract surface for `constitute-nvr` POC integration.
+Define the active contract surface for `constitute-nvr` managed integration.
 
 ## Service Identity
 - runtime role: `native`
 - service capability: `nvr`
-- swarm device record includes:
-  - `role`
-  - `service`
+- service-backed device fields:
+  - `deviceKind = service`
+  - `service = nvr`
+  - `hostGatewayPk`
   - `serviceVersion`
   - `ingestProtocols` (`onvif`, `rtsp`)
-  - `capabilities` (`camera`)
-  - UI module hints (`uiRepo`, `uiRef`, optional `uiManifestUrl`, `uiEntry`)
-  - optional `sessionWsUrl`
+  - `capabilities` (`nvr.view`, `nvr.manage`)
   - live service metrics (`uptimeSec`, peer counts, camera counts)
 
 ## Swarm Transport (Native)
@@ -38,7 +37,7 @@ Define the active contract surface for `constitute-nvr` POC integration.
 
 ### `record`
 Carries signed Nostr event payloads for:
-- device discovery (`kind=30078`, `t=swarm_discovery`, `type=device`, `role=native`, `service=nvr`)
+- device discovery (`kind=30078`, `t=swarm_discovery`, `type=device`, `role=native`, `deviceKind=service`, `service=nvr`)
 - zone presence (`kind=1`, `t=constitute`, `z=<zone>`)
 - optional install enrollment signal (`record_type=signal`, payload `type=pair_request`) when `pair_identity_label` + `pair_code_hash` are configured
 
@@ -52,7 +51,7 @@ Carries signed Nostr event payloads for:
   - `setup_reolink` (successful setup also auto-upserts/starts a source)
 - recorder state machine:
   - `starting` -> `running` -> `backoff` -> retry
-  - terminal `failed` on non-recoverable runtime failures (e.g., `ffmpeg` missing)
+  - terminal `failed` on non-recoverable runtime failures (for example, `ffmpeg` missing)
 
 ## Reolink Bootstrap (Current)
 - temporary DHCP lease responder on UDP/67 for first-boot cameras that only request DHCP
@@ -66,7 +65,36 @@ Carries signed Nostr event payloads for:
   - `8000/tcp` open
   - ONVIF XAddr resolves to `http://<ip>:8000/onvif/device_service`
 
-## Session Negotiation (`/session`)
+## Managed Live Preview Negotiation
+Canonical managed path:
+1. browser shell obtains gateway-issued launch authorization for the target NVR service
+2. Pages-hosted app surface redeems launch context
+3. gateway brokers signaling between browser and NVR
+4. NVR validates launch token and admits WebRTC session
+
+Launch token requirements:
+- signed by gateway
+- short-lived
+- bound to:
+  - `gatewayPk`
+  - `servicePk`
+  - `identityId`
+  - requesting `devicePk`
+  - requested capability
+
+Signaling message types:
+- `offer`
+- `answer`
+- `ice_candidate`
+- `ice_complete`
+- `session_close`
+
+Media direction:
+- WebRTC
+- H.264 preview
+- camera substream / low-resolution path preferred for grid viewing where available
+
+## Direct Debug Session Negotiation (`/session`)
 
 ### 1) Client hello (plaintext frame)
 ```json
@@ -138,4 +166,5 @@ Session key derivation:
 ## Compatibility Guardrail
 Any breaking changes to session/swarm payloads must be version-gated and coordinated with:
 - `constitute-gateway/docs/PROTOCOL.md`
-- `constitute` swarm client handling
+- `constitute` shell launch/signaling handling
+- `constitute-nvr-ui` managed launch/bootstrap handling
