@@ -68,6 +68,7 @@ struct HealthCameraNetworkView {
     dhcp_range_end: String,
     ntp_enabled: bool,
     ntp_server: String,
+    timezone: String,
     dns_server: String,
 }
 
@@ -137,6 +138,7 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
         dhcp_range_end: cfg.camera_network.dhcp_range_end.clone(),
         ntp_enabled: cfg.camera_network.ntp_enabled,
         ntp_server: cfg.camera_network.ntp_server.clone(),
+        timezone: cfg.camera_network.timezone.clone(),
         dns_server: cfg.camera_network.dns_server.clone(),
     };
     Json(json!({
@@ -897,7 +899,6 @@ async fn handle_command(
             } else {
                 model
             };
-            let ntp_server = { state.cfg.lock().await.camera_network.ntp_server.clone() };
             let camera_cfg = CameraConfig {
                 source_id: source_id.clone(),
                 name: source_name.clone(),
@@ -925,8 +926,6 @@ async fn handle_command(
                 segment_secs: 10,
                 desired: CameraDesiredConfig {
                     display_name: source_name.clone(),
-                    ntp_server,
-                    timezone: "UTC".to_string(),
                     overlay_text: source_name.clone(),
                     overlay_timestamp: true,
                     ..Default::default()

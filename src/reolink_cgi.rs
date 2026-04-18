@@ -13,11 +13,22 @@ use reqwest::{Client, header};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{error::Error, fmt};
+use tokio::time::{Duration, Instant, sleep};
+use tracing::warn;
 
 const HTTP_TIMEOUT_SECS: u64 = 10;
 const HTTP_ENDPOINTS: [(&str, u16); 2] = [("http", 80), ("https", 443)];
 const HTTPS_FIRST_ENDPOINTS: [(&str, u16); 2] = [("https", 443), ("http", 80)];
 const ZERO_BLOCK: usize = 16;
+const PRESENTATION_VERIFY_TIMEOUT_SECS: u64 = 8;
+const PRESENTATION_VERIFY_POLL_MILLIS: u64 = 500;
+const REOLINK_TIME_FMT_MM_DD_YYYY: i64 = 1;
+const REOLINK_TIME_FMT_MM_DD_YYYY_LABEL: &str = "MM/DD/YYYY";
+const REOLINK_TIME_FMT_YYYY_MM_DD_LABEL: &str = "YYYY/MM/DD";
+const REOLINK_TIME_FMT_DD_MM_YYYY_LABEL: &str = "DD/MM/YYYY";
+const REOLINK_HOUR_FMT_24H: i64 = 0;
+const REOLINK_TIMEZONE_UTC_SECONDS: i64 = 0;
+const REOLINK_TIMEZONE_PHOENIX_SECONDS: i64 = 25_200;
 
 type Aes128CfbEnc = cfb_mode::Encryptor<Aes128>;
 type Aes128CfbDec = cfb_mode::Decryptor<Aes128>;
@@ -228,6 +239,10 @@ pub struct ReolinkPresentationState {
     #[serde(default)]
     pub timezone: String,
     #[serde(default)]
+    pub clock_date_format: String,
+    #[serde(default)]
+    pub clock_hour_format: String,
+    #[serde(default)]
     pub overlay_text: String,
     #[serde(default)]
     pub overlay_timestamp: Option<bool>,
@@ -250,6 +265,8 @@ pub struct ReolinkPresentationApplyRequest {
     pub manual_time: Option<String>,
     #[serde(default)]
     pub timezone: Option<String>,
+    #[serde(default)]
+    pub enforce_clock_display: bool,
     #[serde(default)]
     pub overlay_text: Option<String>,
     #[serde(default)]
@@ -512,6 +529,32 @@ impl ReolinkHttpSession {
         Ok(())
     }
 
+    async fn logout(&mut self) -> Result<()> {
+        self.send_command("Logout", json!({})).await?;
+        Ok(())
+    }
+
+    async fn read_state_snapshot(&mut self) -> Result<ReolinkStateSnapshot> {
+        let net = self.get_net_port().await?;
+        let p2p = self.get_p2p().await?;
+        Ok(ReolinkStateSnapshot {
+            normal: serde_json::to_value(net.normal()).context("failed encoding CGI normal state")?,
+            advanced: serde_json::to_value(net.advanced())
+                .context("failed encoding CGI advanced state")?,
+            p2p: serde_json::to_value(p2p.config()).context("failed encoding CGI p2p state")?,
+            ..ReolinkStateSnapshot::default()
+        })
+    }
+
+    async fn read_presentation_state(&mut self) -> Result<ReolinkPresentationState> {
+        let time_entry = self.send_command("GetTime", json!({})).await.ok();
+        let osd_entry = self.send_command("GetOsd", json!({})).await.ok();
+        Ok(build_presentation_state(
+            time_entry.as_ref(),
+            osd_entry.as_ref(),
+        ))
+    }
+
     async fn send_command(&mut self, cmd: &str, param: Value) -> Result<Value> {
         let first = self.send_command_entry(cmd, param).await?;
         if let Some(error) = command_error(cmd, &first) {
@@ -665,63 +708,62 @@ pub async fn setup(request: &ReolinkSetupRequest) -> Result<ReolinkSetupBridgeRe
         }
     };
 
-    let before_net = session.get_net_port().await?;
-    let before_p2p = session.get_p2p().await?;
-    let before_normal = before_net.normal();
-    let before_advanced = before_net.advanced();
+    let result = async {
+        let before_net = session.get_net_port().await?;
+        let before_p2p = session.get_p2p().await?;
+        let before_normal = before_net.normal();
+        let before_advanced = before_net.advanced();
 
-    let target_normal = merge_normal(&before_normal, request.normal.as_ref());
-    let target_advanced = merge_advanced(&before_advanced, request.advanced.as_ref());
-    let target_p2p = merge_p2p(request.p2p.as_ref());
+        let target_normal = merge_normal(&before_normal, request.normal.as_ref());
+        let target_advanced = merge_advanced(&before_advanced, request.advanced.as_ref());
+        let target_p2p = merge_p2p(request.p2p.as_ref());
 
-    let target_net = ReolinkCgiNetPort::with_updates(&before_net, &target_normal, &target_advanced);
-    if target_net != before_net {
-        session.set_net_port(&target_net).await?;
+        let target_net =
+            ReolinkCgiNetPort::with_updates(&before_net, &target_normal, &target_advanced);
+        if target_net != before_net {
+            session.set_net_port(&target_net).await?;
+        }
+
+        let target_p2p_wire = ReolinkCgiP2P::with_updates(&before_p2p, &target_p2p);
+        if target_p2p_wire != before_p2p {
+            session.set_p2p(&target_p2p_wire).await?;
+        }
+
+        if !bootstrapped && !desired_password.is_empty() && desired_password != login_password {
+            session
+                .modify_user(&request.username, &login_password, desired_password)
+                .await?;
+        }
+
+        let after_net = session.get_net_port().await?;
+        let after_p2p = session.get_p2p().await?;
+
+        Ok::<ReolinkSetupBridgeResult, anyhow::Error>(ReolinkSetupBridgeResult {
+            ip: request.ip.clone(),
+            username: request.username.clone(),
+            before_normal,
+            before_advanced,
+            before_p2p: before_p2p.config(),
+            after_normal: after_net.normal(),
+            after_advanced: after_net.advanced(),
+            after_p2p: after_p2p.config(),
+        })
     }
-
-    let target_p2p_wire = ReolinkCgiP2P::with_updates(&before_p2p, &target_p2p);
-    if target_p2p_wire != before_p2p {
-        session.set_p2p(&target_p2p_wire).await?;
-    }
-
-    if !bootstrapped && !desired_password.is_empty() && desired_password != login_password {
-        session
-            .modify_user(&request.username, &login_password, desired_password)
-            .await?;
-    }
-
-    let after_net = session.get_net_port().await?;
-    let after_p2p = session.get_p2p().await?;
-
-    Ok(ReolinkSetupBridgeResult {
-        ip: request.ip.clone(),
-        username: request.username.clone(),
-        before_normal,
-        before_advanced,
-        before_p2p: before_p2p.config(),
-        after_normal: after_net.normal(),
-        after_advanced: after_net.advanced(),
-        after_p2p: after_p2p.config(),
-    })
+    .await;
+    best_effort_logout(&mut session, "setup").await;
+    result
 }
 
 pub async fn read_state(
     request: &crate::reolink::ReolinkConnectRequest,
 ) -> Result<ReolinkStateResult> {
     let mut session = login_existing_session(request).await?;
-    let net = session.get_net_port().await?;
-    let p2p = session.get_p2p().await?;
-    Ok(ReolinkStateResult {
-        state: ReolinkStateSnapshot {
-            normal: serde_json::to_value(net.normal())
-                .context("failed encoding CGI normal state")?,
-            advanced: serde_json::to_value(net.advanced())
-                .context("failed encoding CGI advanced state")?,
-            p2p: serde_json::to_value(p2p.config()).context("failed encoding CGI p2p state")?,
-            ..ReolinkStateSnapshot::default()
-        },
+    let result = session.read_state_snapshot().await.map(|state| ReolinkStateResult {
+        state,
         active_password: request.password.clone(),
-    })
+    });
+    best_effort_logout(&mut session, "read_state").await;
+    result
 }
 
 pub async fn apply_state(request: &ReolinkStateApplyRequest) -> Result<ReolinkStateApplyResult> {
@@ -739,75 +781,78 @@ pub async fn apply_state(request: &ReolinkStateApplyRequest) -> Result<ReolinkSt
     }
 
     let mut session = login_existing_session(&request.connection).await?;
-    let before_net = session.get_net_port().await?;
-    let before_p2p = session.get_p2p().await?;
+    let result = async {
+        let before_net = session.get_net_port().await?;
+        let before_p2p = session.get_p2p().await?;
 
-    let before_normal = before_net.normal();
-    let before_advanced = before_net.advanced();
-    let before_p2p_cfg = before_p2p.config();
+        let before_normal = before_net.normal();
+        let before_advanced = before_net.advanced();
+        let before_p2p_cfg = before_p2p.config();
 
-    let target_normal = match request.normal.as_ref() {
-        Some(value) => serde_json::from_value::<ReolinkNormalPortConfig>(value.clone())
-            .context("invalid CGI normal port state payload")?,
-        None => before_normal.clone(),
-    };
-    let target_advanced = match request.advanced.as_ref() {
-        Some(value) => serde_json::from_value::<ReolinkAdvancedPortConfig>(value.clone())
-            .context("invalid CGI advanced port state payload")?,
-        None => before_advanced.clone(),
-    };
-    let target_p2p_cfg = match request.p2p.as_ref() {
-        Some(value) => serde_json::from_value::<ReolinkP2PConfig>(value.clone())
-            .context("invalid CGI P2P state payload")?,
-        None => before_p2p_cfg.clone(),
-    };
+        let target_normal = match request.normal.as_ref() {
+            Some(value) => serde_json::from_value::<ReolinkNormalPortConfig>(value.clone())
+                .context("invalid CGI normal port state payload")?,
+            None => before_normal.clone(),
+        };
+        let target_advanced = match request.advanced.as_ref() {
+            Some(value) => serde_json::from_value::<ReolinkAdvancedPortConfig>(value.clone())
+                .context("invalid CGI advanced port state payload")?,
+            None => before_advanced.clone(),
+        };
+        let target_p2p_cfg = match request.p2p.as_ref() {
+            Some(value) => serde_json::from_value::<ReolinkP2PConfig>(value.clone())
+                .context("invalid CGI P2P state payload")?,
+            None => before_p2p_cfg.clone(),
+        };
 
-    let target_net = ReolinkCgiNetPort::with_updates(&before_net, &target_normal, &target_advanced);
-    if target_net != before_net {
-        session.set_net_port(&target_net).await?;
+        let target_net =
+            ReolinkCgiNetPort::with_updates(&before_net, &target_normal, &target_advanced);
+        if target_net != before_net {
+            session.set_net_port(&target_net).await?;
+        }
+
+        let target_p2p = ReolinkCgiP2P::with_updates(&before_p2p, &target_p2p_cfg);
+        if target_p2p != before_p2p {
+            session.set_p2p(&target_p2p).await?;
+        }
+
+        let after_net = session.get_net_port().await?;
+        let after_p2p = session.get_p2p().await?;
+
+        Ok::<ReolinkStateApplyResult, anyhow::Error>(ReolinkStateApplyResult {
+            before: ReolinkStateSnapshot {
+                normal: serde_json::to_value(before_normal)
+                    .context("failed encoding CGI pre-update normal state")?,
+                advanced: serde_json::to_value(before_advanced)
+                    .context("failed encoding CGI pre-update advanced state")?,
+                p2p: serde_json::to_value(before_p2p_cfg)
+                    .context("failed encoding CGI pre-update p2p state")?,
+                ..ReolinkStateSnapshot::default()
+            },
+            after: ReolinkStateSnapshot {
+                normal: serde_json::to_value(after_net.normal())
+                    .context("failed encoding CGI post-update normal state")?,
+                advanced: serde_json::to_value(after_net.advanced())
+                    .context("failed encoding CGI post-update advanced state")?,
+                p2p: serde_json::to_value(after_p2p.config())
+                    .context("failed encoding CGI post-update p2p state")?,
+                ..ReolinkStateSnapshot::default()
+            },
+            active_password: request.connection.password.clone(),
+        })
     }
-
-    let target_p2p = ReolinkCgiP2P::with_updates(&before_p2p, &target_p2p_cfg);
-    if target_p2p != before_p2p {
-        session.set_p2p(&target_p2p).await?;
-    }
-
-    let after_net = session.get_net_port().await?;
-    let after_p2p = session.get_p2p().await?;
-
-    Ok(ReolinkStateApplyResult {
-        before: ReolinkStateSnapshot {
-            normal: serde_json::to_value(before_normal)
-                .context("failed encoding CGI pre-update normal state")?,
-            advanced: serde_json::to_value(before_advanced)
-                .context("failed encoding CGI pre-update advanced state")?,
-            p2p: serde_json::to_value(before_p2p_cfg)
-                .context("failed encoding CGI pre-update p2p state")?,
-            ..ReolinkStateSnapshot::default()
-        },
-        after: ReolinkStateSnapshot {
-            normal: serde_json::to_value(after_net.normal())
-                .context("failed encoding CGI post-update normal state")?,
-            advanced: serde_json::to_value(after_net.advanced())
-                .context("failed encoding CGI post-update advanced state")?,
-            p2p: serde_json::to_value(after_p2p.config())
-                .context("failed encoding CGI post-update p2p state")?,
-            ..ReolinkStateSnapshot::default()
-        },
-        active_password: request.connection.password.clone(),
-    })
+    .await;
+    best_effort_logout(&mut session, "apply_state").await;
+    result
 }
 
 pub async fn read_presentation_state(
     request: &crate::reolink::ReolinkConnectRequest,
 ) -> Result<ReolinkPresentationState> {
     let mut session = login_existing_session(request).await?;
-    let time_entry = session.send_command("GetTime", json!({})).await.ok();
-    let osd_entry = session.send_command("GetOsd", json!({})).await.ok();
-    Ok(build_presentation_state(
-        time_entry.as_ref(),
-        osd_entry.as_ref(),
-    ))
+    let result = session.read_presentation_state().await;
+    best_effort_logout(&mut session, "read_presentation_state").await;
+    result
 }
 
 pub async fn apply_presentation_state(
@@ -822,6 +867,7 @@ pub async fn apply_presentation_state(
         || request.ntp_server.is_some()
         || request.manual_time.is_some()
         || request.timezone.is_some()
+        || request.enforce_clock_display
     {
         if let Some(mut time_value) = time_entry
             .as_ref()
@@ -856,12 +902,13 @@ pub async fn apply_presentation_state(
         }
     }
 
-    let state = read_presentation_state(&request.connection).await?;
-    if errors.is_empty() {
-        Ok(state)
+    let result = if errors.is_empty() {
+        verify_presentation_apply(&mut session, request).await
     } else {
         Err(anyhow!(errors.join(" | ")))
-    }
+    };
+    best_effort_logout(&mut session, "apply_presentation_state").await;
+    result
 }
 
 pub async fn ptz_command(
@@ -870,7 +917,7 @@ pub async fn ptz_command(
     speed: i32,
 ) -> Result<()> {
     let mut session = login_existing_session_prefer_https(request).await?;
-    session
+    let result = session
         .send_command(
             "PtzCtrl",
             json!({
@@ -879,13 +926,15 @@ pub async fn ptz_command(
                 "speed": speed.max(1),
             }),
         )
-        .await?;
-    Ok(())
+        .await
+        .map(|_| ());
+    best_effort_logout(&mut session, "ptz_command").await;
+    result
 }
 
 pub async fn ptz_stop(request: &crate::reolink::ReolinkConnectRequest) -> Result<()> {
     let mut session = login_existing_session_prefer_https(request).await?;
-    session
+    let result = session
         .send_command(
             "PtzCtrl",
             json!({
@@ -893,8 +942,10 @@ pub async fn ptz_stop(request: &crate::reolink::ReolinkConnectRequest) -> Result
                 "op": "Stop",
             }),
         )
-        .await?;
-    Ok(())
+        .await
+        .map(|_| ());
+    best_effort_logout(&mut session, "ptz_stop").await;
+    result
 }
 
 async fn login_existing_session(
@@ -1009,6 +1060,93 @@ async fn bootstrap_user(
     Ok(())
 }
 
+async fn best_effort_logout(session: &mut ReolinkHttpSession, context: &str) {
+    if let Err(error) = session.logout().await {
+        warn!(context, error = %error, "failed closing Reolink CGI session");
+    }
+}
+
+async fn verify_presentation_apply(
+    session: &mut ReolinkHttpSession,
+    request: &ReolinkPresentationApplyRequest,
+) -> Result<ReolinkPresentationState> {
+    let deadline = Instant::now() + Duration::from_secs(PRESENTATION_VERIFY_TIMEOUT_SECS);
+    let mut last_state = session.read_presentation_state().await?;
+    if presentation_verify_failures(&last_state, request).is_empty() {
+        return Ok(last_state);
+    }
+
+    loop {
+        if Instant::now() >= deadline {
+            let failures = presentation_verify_failures(&last_state, request);
+            return Err(anyhow!(
+                "requested presentation state did not verify: {} (observed overlay {:?}, timestamp {:?}, time mode {:?}, ntp {:?}, timezone {:?}, date format {:?}, hour format {:?})",
+                failures.join(", "),
+                last_state.overlay_text,
+                last_state.overlay_timestamp,
+                last_state.time_mode,
+                last_state.ntp_server,
+                last_state.timezone,
+                last_state.clock_date_format,
+                last_state.clock_hour_format,
+            ));
+        }
+        sleep(Duration::from_millis(PRESENTATION_VERIFY_POLL_MILLIS)).await;
+        last_state = session.read_presentation_state().await?;
+        if presentation_verify_failures(&last_state, request).is_empty() {
+            return Ok(last_state);
+        }
+    }
+}
+
+fn presentation_verify_failures(
+    observed: &ReolinkPresentationState,
+    request: &ReolinkPresentationApplyRequest,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if let Some(expected) = &request.time_mode
+        && !expected.trim().is_empty()
+        && observed.time_mode.trim() != expected.trim()
+    {
+        fields.push("time_mode");
+    }
+    if let Some(expected) = &request.ntp_server
+        && observed.ntp_server.trim() != expected.trim()
+    {
+        fields.push("ntp_server");
+    }
+    if let Some(expected) = &request.manual_time
+        && !expected.trim().is_empty()
+        && observed.manual_time.trim() != expected.trim()
+    {
+        fields.push("manual_time");
+    }
+    if let Some(expected) = &request.timezone
+        && observed.timezone.trim() != expected.trim()
+    {
+        fields.push("timezone");
+    }
+    if request.enforce_clock_display {
+        if observed.clock_date_format.trim() != "MM/DD/YYYY" {
+            fields.push("clock_date_format");
+        }
+        if observed.clock_hour_format.trim() != "24h" {
+            fields.push("clock_hour_format");
+        }
+    }
+    if let Some(expected) = &request.overlay_text
+        && observed.overlay_text.trim() != expected.trim()
+    {
+        fields.push("overlay_text");
+    }
+    if let Some(expected) = request.overlay_timestamp
+        && observed.overlay_timestamp != Some(expected)
+    {
+        fields.push("overlay_timestamp");
+    }
+    fields
+}
+
 fn merge_normal(
     current: &ReolinkNormalPortConfig,
     requested: Option<&ReolinkNormalPortConfig>,
@@ -1085,7 +1223,9 @@ fn build_presentation_state(
         },
         ntp_server: string_at_any(&time_value, &["ntpServer", "NtpServer", "server"]),
         manual_time: manual_time_from_value(&time_value),
-        timezone: string_at_any(&time_value, &["timeZone", "TimeZone", "zone"]),
+        timezone: reolink_timezone_label(&time_value),
+        clock_date_format: reolink_date_format_label(&time_value),
+        clock_hour_format: reolink_hour_format_label(&time_value),
         overlay_text: overlay_text_from_value(&osd_value),
         overlay_timestamp: overlay_timestamp_from_value(&osd_value),
         time: time_value,
@@ -1102,7 +1242,19 @@ fn mutate_time_value(value: &mut Value, request: &ReolinkPresentationApplyReques
         set_string_at_any(value, &["ntpServer", "NtpServer", "server"], server);
     }
     if let Some(zone) = &request.timezone {
-        set_string_at_any(value, &["timeZone", "TimeZone", "zone"], zone);
+        set_reolink_timezone_at_any(value, &["timeZone", "TimeZone", "zone"], zone);
+        if zone.trim().eq_ignore_ascii_case("America/Phoenix") {
+            set_i64_at_any(value, &["isDst", "IsDst"], 0);
+        }
+    }
+    if request.enforce_clock_display {
+        set_reolink_date_format_at_any(
+            value,
+            &["timeFmt", "TimeFmt"],
+            REOLINK_TIME_FMT_MM_DD_YYYY,
+            REOLINK_TIME_FMT_MM_DD_YYYY_LABEL,
+        );
+        set_i64_at_any(value, &["hourFmt", "HourFmt"], REOLINK_HOUR_FMT_24H);
     }
     if let Some(manual_time) = &request.manual_time {
         if let Some((year, month, day, hour, minute, second)) =
@@ -1475,5 +1627,212 @@ mod tests {
         .expect("entry");
         let error = command_error("Login", &entry).expect("error");
         assert!(error.is_rsp_code(-505));
+    }
+
+    #[test]
+    fn presentation_verify_failures_detect_requested_overlay_drift() {
+        let observed = ReolinkPresentationState {
+            overlay_text: "Reolink E1 Outdoor SE".to_string(),
+            overlay_timestamp: Some(true),
+            ..Default::default()
+        };
+        let request = ReolinkPresentationApplyRequest {
+            connection: crate::reolink::ReolinkConnectRequest {
+                ip: "192.168.0.10".to_string(),
+                username: "admin".to_string(),
+                password: "test".to_string(),
+                channel: 0,
+            },
+            overlay_text: Some("Carport".to_string()),
+            overlay_timestamp: Some(true),
+            time_mode: None,
+            ntp_server: None,
+            manual_time: None,
+            timezone: None,
+            enforce_clock_display: false,
+        };
+        assert_eq!(
+            presentation_verify_failures(&observed, &request),
+            vec!["overlay_text"]
+        );
+    }
+
+    #[test]
+    fn presentation_verify_failures_accept_matching_requested_fields() {
+        let observed = ReolinkPresentationState {
+            overlay_text: "Test".to_string(),
+            overlay_timestamp: Some(false),
+            time_mode: "ntp".to_string(),
+            ntp_server: "pool.ntp.org".to_string(),
+            timezone: "UTC".to_string(),
+            ..Default::default()
+        };
+        let request = ReolinkPresentationApplyRequest {
+            connection: crate::reolink::ReolinkConnectRequest {
+                ip: "192.168.0.10".to_string(),
+                username: "admin".to_string(),
+                password: "test".to_string(),
+                channel: 0,
+            },
+            overlay_text: Some("Test".to_string()),
+            overlay_timestamp: Some(false),
+            time_mode: Some("ntp".to_string()),
+            ntp_server: Some("pool.ntp.org".to_string()),
+            manual_time: None,
+            timezone: Some("UTC".to_string()),
+            enforce_clock_display: false,
+        };
+        assert!(presentation_verify_failures(&observed, &request).is_empty());
+    }
+
+    #[test]
+    fn reolink_date_format_label_accepts_string_payloads() {
+        let value = json!({
+            "timeFmt": "DD/MM/YYYY",
+            "hourFmt": 0
+        });
+        assert_eq!(reolink_date_format_label(&value), "DD/MM/YYYY");
+        assert_eq!(reolink_hour_format_label(&value), "24h");
+    }
+
+    #[test]
+    fn reolink_hour_format_label_maps_one_to_12h() {
+        let value = json!({
+            "hourFmt": 1
+        });
+        assert_eq!(reolink_hour_format_label(&value), "12h");
+    }
+
+    #[test]
+    fn set_reolink_date_format_preserves_string_wire_shape() {
+        let mut value = json!({
+            "timeFmt": "DD/MM/YYYY"
+        });
+        set_reolink_date_format_at_any(
+            &mut value,
+            &["timeFmt", "TimeFmt"],
+            REOLINK_TIME_FMT_MM_DD_YYYY,
+            REOLINK_TIME_FMT_MM_DD_YYYY_LABEL,
+        );
+        assert_eq!(
+            value.get("timeFmt").and_then(Value::as_str),
+            Some(REOLINK_TIME_FMT_MM_DD_YYYY_LABEL)
+        );
+    }
+
+    #[test]
+    fn reolink_timezone_label_accepts_numeric_payloads() {
+        let value = json!({
+            "timeZone": 25200,
+            "isDst": 0
+        });
+        assert_eq!(reolink_timezone_label(&value), "America/Phoenix");
+    }
+
+    #[test]
+    fn set_reolink_timezone_preserves_numeric_wire_shape() {
+        let mut value = json!({
+            "timeZone": 28800
+        });
+        set_reolink_timezone_at_any(&mut value, &["timeZone", "TimeZone", "zone"], "America/Phoenix");
+        assert_eq!(value.get("timeZone").and_then(Value::as_i64), Some(REOLINK_TIMEZONE_PHOENIX_SECONDS));
+    }
+}
+
+fn set_reolink_date_format_at_any(value: &mut Value, keys: &[&str], next_i64: i64, next_label: &str) {
+    if let Some(map) = value.as_object_mut() {
+        for key in keys {
+            if let Some(existing) = map.get(*key) {
+                let replacement = if existing.is_string() {
+                    Value::String(next_label.to_string())
+                } else {
+                    Value::Number(next_i64.into())
+                };
+                map.insert((*key).to_string(), replacement);
+                return;
+            }
+        }
+        if let Some(key) = keys.first() {
+            map.insert((*key).to_string(), Value::String(next_label.to_string()));
+        }
+    }
+}
+
+fn reolink_date_format_label(value: &Value) -> String {
+    let string_value = string_at_any(value, &["timeFmt", "TimeFmt"]);
+    match string_value.trim() {
+        REOLINK_TIME_FMT_MM_DD_YYYY_LABEL => return REOLINK_TIME_FMT_MM_DD_YYYY_LABEL.to_string(),
+        REOLINK_TIME_FMT_YYYY_MM_DD_LABEL => return REOLINK_TIME_FMT_YYYY_MM_DD_LABEL.to_string(),
+        REOLINK_TIME_FMT_DD_MM_YYYY_LABEL => return REOLINK_TIME_FMT_DD_MM_YYYY_LABEL.to_string(),
+        "" => {}
+        other => return format!("raw:{other}"),
+    }
+    match int_at_any(value, &["timeFmt", "TimeFmt"]) {
+        Some(REOLINK_TIME_FMT_MM_DD_YYYY) => REOLINK_TIME_FMT_MM_DD_YYYY_LABEL.to_string(),
+        Some(0) => REOLINK_TIME_FMT_YYYY_MM_DD_LABEL.to_string(),
+        Some(2) => REOLINK_TIME_FMT_DD_MM_YYYY_LABEL.to_string(),
+        Some(other) => format!("raw:{other}"),
+        None => String::new(),
+    }
+}
+
+fn reolink_hour_format_label(value: &Value) -> String {
+    match int_at_any(value, &["hourFmt", "HourFmt"]) {
+        Some(REOLINK_HOUR_FMT_24H) => "24h".to_string(),
+        Some(1) => "12h".to_string(),
+        Some(other) => format!("raw:{other}"),
+        None => String::new(),
+    }
+}
+
+fn reolink_timezone_label(value: &Value) -> String {
+    let string_value = string_at_any(value, &["timeZone", "TimeZone", "zone"]);
+    match string_value.trim() {
+        "UTC" => return "UTC".to_string(),
+        "America/Phoenix" | "MST7" | "UTC+07:00:00" | "GMT+07:00:00" => {
+            return "America/Phoenix".to_string();
+        }
+        "" => {}
+        other => return other.to_string(),
+    }
+    match int_at_any(value, &["timeZone", "TimeZone", "zone"]) {
+        Some(REOLINK_TIMEZONE_UTC_SECONDS) => "UTC".to_string(),
+        Some(REOLINK_TIMEZONE_PHOENIX_SECONDS) => "America/Phoenix".to_string(),
+        Some(other) => format!("raw:{other}"),
+        None => String::new(),
+    }
+}
+
+fn reolink_timezone_seconds(label: &str) -> Option<i64> {
+    match label.trim() {
+        "UTC" => Some(REOLINK_TIMEZONE_UTC_SECONDS),
+        "America/Phoenix" => Some(REOLINK_TIMEZONE_PHOENIX_SECONDS),
+        _ => None,
+    }
+}
+
+fn set_reolink_timezone_at_any(value: &mut Value, keys: &[&str], next_label: &str) {
+    let trimmed = next_label.trim();
+    let numeric = reolink_timezone_seconds(trimmed);
+    if let Some(map) = value.as_object_mut() {
+        for key in keys {
+            if let Some(existing) = map.get(*key) {
+                let replacement = if existing.is_i64() || existing.is_u64() {
+                    numeric
+                        .map(|seconds| Value::Number(seconds.into()))
+                        .unwrap_or_else(|| Value::String(trimmed.to_string()))
+                } else {
+                    Value::String(trimmed.to_string())
+                };
+                map.insert((*key).to_string(), replacement);
+                return;
+            }
+        }
+        if let Some(key) = keys.first() {
+            let replacement = numeric
+                .map(|seconds| Value::Number(seconds.into()))
+                .unwrap_or_else(|| Value::String(trimmed.to_string()));
+            map.insert((*key).to_string(), replacement);
+        }
     }
 }
