@@ -1,3 +1,13 @@
+//! Reolink driver lane.
+//!
+//! Driver-specific operational truth belongs here first, with shared docs kept to
+//! compatibility and operator-facing summaries.
+//!
+//! Active product boundary:
+//! - proprietary discovery/bootstrap and native transport live here
+//! - CGI/ONVIF presentation and site-time behavior are split by concern
+//! - PTZ remains model-sensitive and partially hidden pending full native actuation
+
 use crate::{camera, reolink_cgi, reolink_proto};
 use anyhow::{Context, Result, anyhow};
 use rand::Rng;

@@ -15,6 +15,7 @@ mod storage;
 mod swarm;
 mod update;
 mod util;
+mod xm;
 
 use anyhow::Result;
 use clap::Parser;
@@ -66,7 +67,17 @@ struct Args {
     #[arg(long)]
     read_camera_source: Option<String>,
     #[arg(long)]
+    list_inventory: bool,
+    #[arg(long)]
     probe_camera_source: Option<String>,
+    #[arg(long)]
+    probe_camera_ip: Option<String>,
+    #[arg(long, default_value = "admin")]
+    probe_camera_username: String,
+    #[arg(long)]
+    probe_camera_password: Option<String>,
+    #[arg(long)]
+    probe_camera_driver_id: Option<String>,
     #[arg(long)]
     apply_camera_source: Option<String>,
     #[arg(long)]
@@ -198,11 +209,33 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if args.list_inventory {
+        let inventory = drivers::list_inventory(&cfg).await?;
+        println!("{}", serde_json::to_string_pretty(&inventory)?);
+        return Ok(());
+    }
+
     if let Some(source_id) = &args.probe_camera_source {
         let result = drivers::probe_camera(
             &cfg,
             drivers::ProbeCameraRequest {
                 source_id: source_id.trim().to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    if let Some(ip) = &args.probe_camera_ip {
+        let result = drivers::probe_camera(
+            &cfg,
+            drivers::ProbeCameraRequest {
+                ip: ip.trim().to_string(),
+                username: args.probe_camera_username.clone(),
+                password: args.probe_camera_password.clone().unwrap_or_default(),
+                driver_id: args.probe_camera_driver_id.clone().unwrap_or_default(),
                 ..Default::default()
             },
         )

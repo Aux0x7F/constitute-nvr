@@ -1,4 +1,5 @@
 use crate::config::{CameraConfig, Config};
+use crate::drivers::driver_is_xm;
 use anyhow::{Result, anyhow};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -136,24 +137,7 @@ async fn record_loop(
         let baseline_segments = count_segment_files(&out_dir).await?;
 
         let mut cmd = Command::new("ffmpeg");
-        cmd.arg("-hide_banner")
-            .arg("-loglevel")
-            .arg("warning")
-            .arg("-rtsp_transport")
-            .arg("tcp")
-            .arg("-i")
-            .arg(&cam.rtsp_url)
-            .arg("-c")
-            .arg("copy")
-            .arg("-f")
-            .arg("segment")
-            .arg("-segment_time")
-            .arg(cam.segment_secs.to_string())
-            .arg("-reset_timestamps")
-            .arg("1")
-            .arg("-strftime")
-            .arg("1")
-            .arg(output_pattern.to_string_lossy().to_string())
+        cmd.args(build_ffmpeg_record_args(&cam, &output_pattern))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
@@ -256,6 +240,40 @@ fn backoff_secs(attempt: u64) -> u64 {
     let p = attempt.clamp(1, 6);
     let secs = 2_u64.pow(p as u32);
     secs.min(30)
+}
+
+fn build_ffmpeg_record_args(cam: &CameraConfig, output_pattern: &std::path::Path) -> Vec<String> {
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "warning".to_string(),
+        "-rtsp_transport".to_string(),
+        "tcp".to_string(),
+        "-i".to_string(),
+        cam.rtsp_url.clone(),
+    ];
+    if driver_is_xm(&cam.driver_id) {
+        args.extend([
+            "-map".to_string(),
+            "0:v:0".to_string(),
+            "-c:v".to_string(),
+            "copy".to_string(),
+        ]);
+    } else {
+        args.extend(["-c".to_string(), "copy".to_string()]);
+    }
+    args.extend([
+        "-f".to_string(),
+        "segment".to_string(),
+        "-segment_time".to_string(),
+        cam.segment_secs.to_string(),
+        "-reset_timestamps".to_string(),
+        "1".to_string(),
+        "-strftime".to_string(),
+        "1".to_string(),
+        output_pattern.to_string_lossy().to_string(),
+    ]);
+    args
 }
 
 async fn update_state(
@@ -380,5 +398,32 @@ mod tests {
         assert_eq!(backoff_secs(1), 2);
         assert_eq!(backoff_secs(2), 4);
         assert_eq!(backoff_secs(8), 30);
+    }
+
+    #[test]
+    fn xm_record_args_use_video_only_copy() {
+        let camera = CameraConfig {
+            source_id: "xm-1".to_string(),
+            name: "XM".to_string(),
+            onvif_host: "192.168.0.201".to_string(),
+            onvif_port: 8000,
+            rtsp_url: "rtsp://admin:123456@192.168.0.201:554/user=admin_password=123456_channel=1_stream=0.sdp?real_stream".to_string(),
+            username: "admin".to_string(),
+            password: "123456".to_string(),
+            driver_id: "xm_40e".to_string(),
+            vendor: "XM/NetSurveillance".to_string(),
+            model: "XM RTSP camera".to_string(),
+            mac_address: String::new(),
+            rtsp_port: 554,
+            ptz_capable: false,
+            enabled: true,
+            segment_secs: 10,
+            desired: Default::default(),
+            credentials: Default::default(),
+        };
+        let args = build_ffmpeg_record_args(&camera, &PathBuf::from("/tmp/out-%Y%m%dT%H%M%S.mp4"));
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:v:0"]));
+        assert!(args.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        assert!(!args.windows(2).any(|pair| pair == ["-c", "copy"]));
     }
 }

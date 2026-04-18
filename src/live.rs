@@ -1,4 +1,5 @@
 use crate::config::{CameraConfig, Config, LivePreviewConfig};
+use crate::drivers::driver_is_xm;
 use crate::nostr::{self, NostrEvent};
 use anyhow::{Context, Result, anyhow};
 use rtp::packet::Packet as RtpPacket;
@@ -25,6 +26,9 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
+use webrtc::rtp_transceiver::{RTCRtpTransceiver, RTCRtpTransceiverInit};
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::TrackLocalWriter;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
@@ -230,7 +234,6 @@ impl PreviewManager {
     ) -> Result<ManagedOfferResponse> {
         let token = validate_launch_token(cfg, &request.launch_token)?;
         let offer = parse_offer_description(&request.offer)?;
-        let preview_codec = select_preview_codec(&request.offer)?;
         let selected = select_sources(cfg, source_ids_from_offer(&request.offer), &token)?;
         let remote_candidates = request_candidates(&request);
         if selected.is_empty() {
@@ -295,17 +298,26 @@ impl PreviewManager {
 
         pc.set_remote_description(offer).await?;
         apply_remote_candidates(&pc, &remote_candidates).await?;
+        let mut offered_video_transceivers = available_offer_video_transceivers(&pc).await;
 
         let mut stops = Vec::new();
         let mut response_sources = Vec::new();
+        let mut answer_msid_tracks = Vec::new();
         for camera in &selected {
+            let preview_codec = select_preview_codec_for_camera(&request.offer, camera)?;
+            let media_stream_id = format!("{session_id}-{}", camera.source_id);
             let track = Arc::new(TrackLocalStaticRTP::new(
                 preview_codec.capability(),
                 camera.source_id.clone(),
-                session_id.clone(),
+                media_stream_id.clone(),
             ));
-            pc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
-                .await?;
+            answer_msid_tracks.push((media_stream_id, camera.source_id.clone()));
+            attach_preview_track(
+                &pc,
+                &mut offered_video_transceivers,
+                Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>,
+            )
+            .await?;
             let (stop_tx, stop_rx) = watch::channel(false);
             stops.push(stop_tx);
             tokio::spawn(run_camera_forwarder(
@@ -329,6 +341,10 @@ impl PreviewManager {
             .local_description()
             .await
             .ok_or_else(|| anyhow!("missing local description"))?;
+        let local_desc = RTCSessionDescription::answer(with_firefox_compatible_answer_msid(
+            &local_desc.sdp,
+            &answer_msid_tracks,
+        ))?;
         let response_candidates = gathered_candidates.lock().await.clone();
 
         self.sessions.lock().await.insert(
@@ -583,8 +599,16 @@ fn offer_description_sdp(value: &Value) -> Option<&str> {
     })
 }
 
-fn select_preview_codec(value: &Value) -> Result<PreviewCodec> {
+fn select_preview_codec_for_camera(value: &Value, camera: &CameraConfig) -> Result<PreviewCodec> {
     let sdp = offer_description_sdp(value).unwrap_or_default();
+    if driver_is_xm(&camera.driver_id) {
+        if sdp.contains("VP8/90000") {
+            return Ok(PreviewCodec::Vp8);
+        }
+        return Err(anyhow!(
+            "browser offer does not advertise VP8, which is required for XM live preview"
+        ));
+    }
     if sdp.contains("H264/90000") {
         return Ok(PreviewCodec::H264);
     }
@@ -643,14 +667,163 @@ fn session_key_for_token(token: &ManagedLaunchTokenPayload) -> String {
     format!("{}:{}", token.device_pk.trim(), token.launch_nonce.trim())
 }
 
+async fn available_offer_video_transceivers(
+    pc: &Arc<RTCPeerConnection>,
+) -> Vec<Arc<RTCRtpTransceiver>> {
+    pc.get_transceivers()
+        .await
+        .into_iter()
+        .filter(|transceiver| transceiver.kind() == RTPCodecType::Video)
+        .collect()
+}
+
+async fn attach_preview_track(
+    pc: &Arc<RTCPeerConnection>,
+    offered_video_transceivers: &mut Vec<Arc<RTCRtpTransceiver>>,
+    track: Arc<dyn TrackLocal + Send + Sync>,
+) -> Result<()> {
+    while let Some(transceiver) = offered_video_transceivers.first().cloned() {
+        offered_video_transceivers.remove(0);
+        let sender = transceiver.sender().await;
+        if sender.track().await.is_some() {
+            continue;
+        }
+        sender.replace_track(Some(track)).await?;
+        transceiver
+            .set_direction(RTCRtpTransceiverDirection::Sendonly)
+            .await;
+        return Ok(());
+    }
+
+    pc.add_transceiver_from_track(
+        track,
+        Some(RTCRtpTransceiverInit {
+            direction: RTCRtpTransceiverDirection::Sendonly,
+            send_encodings: vec![],
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+fn with_firefox_compatible_answer_msid(
+    sdp: &str,
+    media_stream_tracks: &[(String, String)],
+) -> String {
+    let has_msid_semantic = sdp.lines().any(|line| line.trim() == "a=msid-semantic:WMS *");
+    let mut out = Vec::new();
+    let mut in_video_section = false;
+    let mut video_index = 0usize;
+    let mut saw_msid_in_section = false;
+
+    for raw_line in sdp.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.starts_with("m=") {
+            in_video_section = line.starts_with("m=video ");
+            if in_video_section {
+                video_index = video_index.saturating_add(1);
+            }
+            saw_msid_in_section = false;
+            out.push(line.to_string());
+            continue;
+        }
+
+        out.push(line.to_string());
+        if !has_msid_semantic && line.starts_with("a=group:BUNDLE ") {
+            out.push("a=msid-semantic:WMS *".to_string());
+            continue;
+        }
+
+        if in_video_section && line.starts_with("a=msid:") {
+            saw_msid_in_section = true;
+            continue;
+        }
+
+        if in_video_section && !saw_msid_in_section && line.starts_with("a=mid:") {
+            if let Some((stream_id, track_id)) = media_stream_tracks.get(video_index.saturating_sub(1))
+            {
+                out.push(format!("a=msid:{stream_id} {track_id}"));
+                saw_msid_in_section = true;
+            }
+        }
+    }
+
+    let mut normalized = out.join("\r\n");
+    if !normalized.is_empty() {
+        normalized.push_str("\r\n");
+    }
+    normalized
+}
+
 fn preview_rtsp_url(camera: &CameraConfig) -> String {
     let mut url = camera.rtsp_url.clone();
     if url.contains("h264Preview_01_main") {
         url = url.replace("h264Preview_01_main", "h264Preview_01_sub");
     } else if url.contains("h265Preview_01_main") {
         url = url.replace("h265Preview_01_main", "h265Preview_01_sub");
+    } else if driver_is_xm(&camera.driver_id) {
+        url = url
+            .replace("_stream=0.sdp?real_stream", "_stream=1.sdp?real_stream")
+            .replace("_stream=0.sdp", "_stream=1.sdp");
     }
     url
+}
+
+fn build_live_preview_ffmpeg_args(preview_url: &str, codec: PreviewCodec, udp_port: u16) -> Vec<String> {
+    let mut args = vec![
+        "-nostdin".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-rtsp_transport".to_string(),
+        "tcp".to_string(),
+    ];
+    if codec == PreviewCodec::Vp8 {
+        // Some RTSP sources do not supply usable PTS for live VP8 preview.
+        // Generate timestamps up front so mixed-camera preview sessions do not stall.
+        args.push("-fflags".to_string());
+        args.push("+genpts".to_string());
+    }
+    args.push("-i".to_string());
+    args.push(preview_url.to_string());
+    args.push("-an".to_string());
+
+    match codec {
+        PreviewCodec::H264 => {
+            args.push("-c:v".to_string());
+            args.push("copy".to_string());
+        }
+        PreviewCodec::Vp8 => {
+            args.extend([
+                "-c:v".to_string(),
+                "libvpx".to_string(),
+                "-deadline".to_string(),
+                "realtime".to_string(),
+                "-cpu-used".to_string(),
+                "8".to_string(),
+                "-pix_fmt".to_string(),
+                "yuv420p".to_string(),
+                "-g".to_string(),
+                "30".to_string(),
+                "-keyint_min".to_string(),
+                "30".to_string(),
+                "-b:v".to_string(),
+                "1M".to_string(),
+                "-maxrate".to_string(),
+                "1M".to_string(),
+                "-bufsize".to_string(),
+                "2M".to_string(),
+            ]);
+        }
+    }
+
+    args.extend([
+        "-f".to_string(),
+        "rtp".to_string(),
+        "-payload_type".to_string(),
+        "96".to_string(),
+        format!("rtp://127.0.0.1:{udp_port}?pkt_size=1200"),
+    ]);
+    args
 }
 
 async fn run_camera_forwarder(
@@ -687,52 +860,13 @@ async fn run_camera_forwarder(
     };
 
     let mut ffmpeg = Command::new("ffmpeg");
-    ffmpeg
-        .arg("-nostdin")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-rtsp_transport")
-        .arg("tcp")
-        .arg("-i")
-        .arg(&preview_url)
-        .arg("-an");
-
-    match codec {
-        PreviewCodec::H264 => {
-            ffmpeg.arg("-c:v").arg("copy");
-        }
-        PreviewCodec::Vp8 => {
-            ffmpeg
-                .arg("-c:v")
-                .arg("libvpx")
-                .arg("-deadline")
-                .arg("realtime")
-                .arg("-cpu-used")
-                .arg("8")
-                .arg("-pix_fmt")
-                .arg("yuv420p")
-                .arg("-g")
-                .arg("30")
-                .arg("-keyint_min")
-                .arg("30")
-                .arg("-b:v")
-                .arg("1M")
-                .arg("-maxrate")
-                .arg("1M")
-                .arg("-bufsize")
-                .arg("2M");
-        }
-    }
+    ffmpeg.args(build_live_preview_ffmpeg_args(
+        &preview_url,
+        codec,
+        local_addr.port(),
+    ));
 
     let mut child = match ffmpeg
-        .arg("-f")
-        .arg("rtp")
-        .arg("-payload_type")
-        .arg("96")
-        .arg(format!(
-            "rtp://127.0.0.1:{}?pkt_size=1200",
-            local_addr.port()
-        ))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -787,6 +921,7 @@ async fn run_camera_forwarder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use webrtc::api::APIBuilder;
 
     fn sample_config() -> Config {
         let path = std::env::temp_dir().join(format!(
@@ -948,8 +1083,9 @@ mod tests {
                 "sdp": "m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\na=rtpmap:96 VP8/90000\r\na=rtpmap:97 H264/90000\r\n"
             }
         });
+        let cfg = sample_config();
         assert_eq!(
-            select_preview_codec(&offer).expect("codec"),
+            select_preview_codec_for_camera(&offer, &cfg.cameras[0]).expect("codec"),
             PreviewCodec::H264
         );
     }
@@ -962,10 +1098,82 @@ mod tests {
                 "sdp": "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP8/90000\r\n"
             }
         });
+        let cfg = sample_config();
         assert_eq!(
-            select_preview_codec(&offer).expect("codec"),
+            select_preview_codec_for_camera(&offer, &cfg.cameras[0]).expect("codec"),
             PreviewCodec::Vp8
         );
+    }
+
+    #[test]
+    fn select_preview_codec_prefers_vp8_for_xm_sources() {
+        let offer = json!({
+            "description": {
+                "type": "offer",
+                "sdp": "m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\na=rtpmap:96 VP8/90000\r\na=rtpmap:97 H264/90000\r\n"
+            }
+        });
+        let mut cfg = sample_config();
+        let mut camera = cfg.cameras.remove(0);
+        camera.driver_id = "xm_40e".to_string();
+        assert_eq!(
+            select_preview_codec_for_camera(&offer, &camera).expect("codec"),
+            PreviewCodec::Vp8
+        );
+    }
+
+    #[test]
+    fn select_preview_codec_rejects_xm_without_vp8_offer() {
+        let offer = json!({
+            "description": {
+                "type": "offer",
+                "sdp": "m=video 9 UDP/TLS/RTP/SAVPF 97\r\na=rtpmap:97 H264/90000\r\n"
+            }
+        });
+        let mut cfg = sample_config();
+        let mut camera = cfg.cameras.remove(0);
+        camera.driver_id = "xm_40e".to_string();
+        let err = select_preview_codec_for_camera(&offer, &camera).expect_err("xm should require vp8");
+        assert!(err.to_string().contains("required for XM live preview"));
+    }
+
+    #[test]
+    fn preview_rtsp_url_uses_xm_substream() {
+        let mut cfg = sample_config();
+        let mut camera = cfg.cameras.remove(0);
+        camera.driver_id = "xm_40e".to_string();
+        camera.rtsp_url =
+            "rtsp://admin:123456@192.168.0.201:554/user=admin_password=123456_channel=1_stream=0.sdp?real_stream"
+                .to_string();
+        assert_eq!(
+            preview_rtsp_url(&camera),
+            "rtsp://admin:123456@192.168.0.201:554/user=admin_password=123456_channel=1_stream=1.sdp?real_stream"
+        );
+    }
+
+    #[test]
+    fn live_preview_ffmpeg_args_add_genpts_for_vp8() {
+        let args = build_live_preview_ffmpeg_args(
+            "rtsp://camera.example/sub",
+            PreviewCodec::Vp8,
+            41000,
+        );
+        let ff_idx = args.iter().position(|arg| arg == "-fflags").expect("fflags");
+        assert_eq!(args.get(ff_idx + 1).map(String::as_str), Some("+genpts"));
+        let input_idx = args.iter().position(|arg| arg == "-i").expect("input");
+        assert!(ff_idx < input_idx);
+        assert!(args.iter().any(|arg| arg == "libvpx"));
+    }
+
+    #[test]
+    fn live_preview_ffmpeg_args_omit_genpts_for_h264_copy() {
+        let args = build_live_preview_ffmpeg_args(
+            "rtsp://camera.example/sub",
+            PreviewCodec::H264,
+            41000,
+        );
+        assert!(!args.iter().any(|arg| arg == "+genpts"));
+        assert!(args.iter().any(|arg| arg == "copy"));
     }
 
     #[test]
@@ -975,5 +1183,124 @@ mod tests {
         let payload = validate_launch_token(&cfg, &token).expect("token");
         assert_eq!(payload.gateway_pk, cfg.gateway.host_gateway_pk);
         assert_eq!(payload.service_pk, cfg.nostr_pubkey);
+    }
+
+    #[tokio::test]
+    async fn answer_uses_sendonly_for_recvonly_video_offer_lines() {
+        let mut media_engine = MediaEngine::default();
+        media_engine
+            .register_default_codecs()
+            .expect("register codecs");
+        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        let offerer = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .expect("offerer"),
+        );
+        let answerer = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .expect("answerer"),
+        );
+
+        for _ in 0..2 {
+            offerer
+                .add_transceiver_from_kind(
+                    RTPCodecType::Video,
+                    Some(RTCRtpTransceiverInit {
+                        direction: RTCRtpTransceiverDirection::Recvonly,
+                        send_encodings: vec![],
+                    }),
+                )
+                .await
+                .expect("recvonly video transceiver");
+        }
+
+        let offer = offerer.create_offer(None).await.expect("offer");
+        offerer
+            .set_local_description(offer)
+            .await
+            .expect("set local offer");
+        let local_offer = offerer.local_description().await.expect("local offer");
+        answerer
+            .set_remote_description(local_offer)
+            .await
+            .expect("set remote offer");
+
+        let mut offered_video_transceivers = available_offer_video_transceivers(&answerer).await;
+        for idx in 0..2 {
+            let track = Arc::new(TrackLocalStaticRTP::new(
+                PreviewCodec::Vp8.capability(),
+                format!("cam-{idx}"),
+                format!("session-cam-{idx}"),
+            ));
+            attach_preview_track(
+                &answerer,
+                &mut offered_video_transceivers,
+                track as Arc<dyn TrackLocal + Send + Sync>,
+            )
+            .await
+            .expect("attach track");
+        }
+
+        let answer = answerer.create_answer(None).await.expect("answer");
+        answerer
+            .set_local_description(answer)
+            .await
+            .expect("set local answer");
+        let sdp = answerer.local_description().await.expect("local answer").sdp;
+
+        let mut saw_video = 0usize;
+        let mut pending_video = false;
+        for line in sdp.lines() {
+            if line.starts_with("m=video ") {
+                pending_video = true;
+                saw_video += 1;
+                continue;
+            }
+            if line.starts_with("m=") {
+                pending_video = false;
+                continue;
+            }
+            if pending_video && line == "a=sendrecv" {
+                panic!("video answer line negotiated sendrecv instead of sendonly");
+            }
+        }
+        assert_eq!(saw_video, 2);
+        assert_eq!(sdp.matches("a=sendonly").count(), 2);
+        assert!(sdp.contains("msid:session-cam-0 cam-0"));
+        assert!(sdp.contains("msid:session-cam-1 cam-1"));
+    }
+
+    #[test]
+    fn firefox_compatible_answer_adds_media_stream_ids() {
+        let input = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 0.0.0.0\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "a=group:BUNDLE 0 1\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 120\r\n",
+            "c=IN IP4 0.0.0.0\r\n",
+            "a=setup:active\r\n",
+            "a=mid:0\r\n",
+            "a=sendonly\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 120\r\n",
+            "c=IN IP4 0.0.0.0\r\n",
+            "a=setup:active\r\n",
+            "a=mid:1\r\n",
+            "a=sendonly\r\n"
+        );
+        let output = with_firefox_compatible_answer_msid(
+            input,
+            &[
+                ("session-1".to_string(), "cam-1".to_string()),
+                ("session-1".to_string(), "cam-2".to_string()),
+            ],
+        );
+
+        assert!(output.contains("a=msid-semantic:WMS *\r\n"));
+        assert!(output.contains("a=mid:0\r\na=msid:session-1 cam-1\r\n"));
+        assert!(output.contains("a=mid:1\r\na=msid:session-1 cam-2\r\n"));
     }
 }

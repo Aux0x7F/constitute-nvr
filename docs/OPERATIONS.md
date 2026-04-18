@@ -25,9 +25,11 @@ Install flow notes:
 - unchanged binary hash skips reinstall/restart (unless install context flags are provided)
 - auto-update timer is enabled by default (`constitute-nvr-update.timer`)
 - updater rolls back binary when restart/health validation fails
+- installer now requires decoder-capable host `ffmpeg`; on Fedora-class hosts it provisions RPM Fusion codec support when HEVC decode is missing
 - install bootstrap now provisions the dedicated camera NIC, selects a non-colliding `/24`, and binds `dnsmasq` DHCP on that NIC
 - camera bootstrap must also leave the host serving NTP on the camera NIC
   - when chrony drop-ins are used, bootstrap now ensures the matching `confdir` line is present in `/etc/chrony.conf` so Fedora-class hosts actually load `/etc/chrony.d`
+- factory-static cameras on off-subnet defaults can be reached by provisioning explicit camera-NIC onboarding aliases (for example `192.168.0.2/24`)
 - source-build/dev installs are expected to update through `constitute-nvr-update.timer`; in-process source updates are intentionally skipped
 
 ## 2) Service Checks
@@ -68,6 +70,11 @@ Critical fields before ingest:
 - `autoprovision.reolink_*` (when auto-provision enabled)
 - `cameras[]`
 
+Camera-NIC onboarding aliases:
+- use `bootstrap-camera-network.sh --onboarding-alias <cidr>` to add explicit extra `/24` addresses on the dedicated camera NIC for factory-static cameras
+- when `--camera-cidr` is specified explicitly, bootstrap now honors that exact subnet instead of silently reselecting a neighboring `/24`
+- current discovery scans `/24` subnets already assigned to the camera NIC; it does not invent off-subnet reachability on its own
+
 ## 4) ONVIF Discovery Smoke
 
 ```bash
@@ -90,6 +97,14 @@ Notes:
   - `chronyd -p -f /etc/chrony.conf` should include the camera-subnet `allow` / `local` directives
   - `ss -ulpn | grep ':123 '` should show `chronyd` listening on UDP `123`
 - CGI setup path covers RTSP/ONVIF/P2P toggles when HTTP API is available; proprietary `9000` path remains fallback/R&D for HTTP-disabled devices.
+- For cheap generic/XM cameras that ship static on another `/24`, use onboarding aliases instead of this Reolink-only bootstrap path.
+- XM / NetSurveillance `40E` note:
+  - active driver is `xm_40e`, not the old generic `xm_rtsp` placeholder
+  - current recording uses video-only MP4 segmentation because the validated lab camera exposes `pcm_mulaw` audio that cannot be copied directly into MP4
+  - live preview for this camera requires HEVC decode on the host because the validated RTSP profiles are HEVC, not H.264
+  - site time for the lab XM camera is served from the host-side onboarding alias `192.168.0.2`
+  - the baked feed title is driven through `TitleOverlay.TitleUtf8`
+  - the hidden XM `UserOverlay` lane must stay cleared so stale lower-left text does not leak into the baked feed
 
 ## 6) Health Endpoint
 
@@ -142,7 +157,7 @@ sudo /usr/local/bin/constitute-nvr-self-update --service-name constitute-nvr --t
 ```
 
 ## Known POC Limits
-- depends on host `ffmpeg`
+- depends on installer-managed host `ffmpeg`; install now fails if HEVC decode support cannot be provisioned
 - release checksums are hash-verified but not signature-verified yet
 - TURN remains a documented stub; same-LAN and NAT-friendly direct ICE paths are the active target for this iteration
 
