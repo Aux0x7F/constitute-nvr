@@ -7,19 +7,26 @@ use crate::config::{
 use crate::onvif;
 use crate::reolink;
 use crate::reolink_cgi;
+use crate::xm;
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, LocalResult, NaiveDateTime, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
+use futures_util::stream::{self, StreamExt};
 use regex::Regex;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::net::Ipv4Addr;
+use std::process::Command;
 use tokio::net::TcpStream;
+use tokio::process::Command as TokioCommand;
 use tokio::time::{Duration, Instant, sleep, timeout};
 
 pub const DRIVER_ID_REOLINK: &str = "reolink";
+pub const DRIVER_ID_XM_40E: &str = "xm_40e";
+pub const DRIVER_ID_XM_RTSP: &str = "xm_rtsp";
 pub const DRIVER_ID_GENERIC_ONVIF_RTSP: &str = "generic_onvif_rtsp";
 const REOLINK_NATIVE_PTZ_SETTLE_TIMEOUT_MS: u64 = 5_000;
 const REOLINK_NATIVE_PTZ_POLL_INTERVAL_MS: u64 = 250;
@@ -268,6 +275,7 @@ pub struct ProbeCameraRequest {
 }
 
 struct ReolinkDriver;
+struct Xm40eDriver;
 struct GenericOnvifRtspDriver;
 
 impl CameraDriver for ReolinkDriver {
@@ -342,6 +350,35 @@ impl CameraDriver for GenericOnvifRtspDriver {
     }
 }
 
+impl CameraDriver for Xm40eDriver {
+    fn match_candidate(&self, candidate: &DiscoveredCameraCandidate) -> Option<DriverMatch> {
+        if !candidate_looks_like_xm(candidate) || !candidate.transports.rtsp {
+            return None;
+        }
+        Some(DriverMatch {
+            driver_id: DRIVER_ID_XM_40E.to_string(),
+            kind: "vendor_driver".to_string(),
+            confidence: if candidate.transports.onvif { 88 } else { 82 },
+            reason: "matched XM/NetSurveillance 40E-class footprint".to_string(),
+            mountable: true,
+        })
+    }
+
+    fn capabilities(&self, _camera: &CameraConfig) -> CameraCapabilitySet {
+        CameraCapabilitySet {
+            live_view: true,
+            ptz: false,
+            time_sync: true,
+            manual_time: false,
+            timezone: true,
+            overlay_text: false,
+            overlay_timestamp: false,
+            raw_probe: true,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct LeaseEntry {
     ip: String,
@@ -374,6 +411,60 @@ fn site_time_policy(cfg: &Config) -> SiteTimePolicy {
     }
 }
 
+pub fn driver_is_xm(driver_id: &str) -> bool {
+    matches!(
+        driver_id.trim(),
+        DRIVER_ID_XM_40E | DRIVER_ID_XM_RTSP
+    )
+}
+
+fn same_ipv4_subnet(left: Ipv4Addr, right: Ipv4Addr, prefix: u8) -> bool {
+    if prefix > 32 {
+        return false;
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    (u32::from(left) & mask) == (u32::from(right) & mask)
+}
+
+fn effective_ntp_server_for_camera(cfg: &Config, camera: &CameraConfig) -> Option<String> {
+    let host = camera.onvif_host.trim().parse::<Ipv4Addr>().ok()?;
+    let iface = cfg.camera_network.interface.trim();
+    if iface.is_empty() {
+        return None;
+    }
+    interface_ipv4_cidrs(iface).into_iter().find_map(|(addr, prefix)| {
+        same_ipv4_subnet(addr, host, prefix).then(|| addr.to_string())
+    })
+}
+
+fn effective_site_time_policy(cfg: &Config, camera: &CameraConfig) -> SiteTimePolicy {
+    let mut policy = site_time_policy(cfg);
+    if let Some(ntp_server) = effective_ntp_server_for_camera(cfg, camera) {
+        policy.ntp_server = ntp_server;
+    }
+    policy
+}
+
+fn site_timezone_code(site_timezone: &str, now_utc: DateTime<Utc>) -> Option<i32> {
+    let tz: Tz = site_timezone.trim().parse().ok()?;
+    let local = now_utc.with_timezone(&tz);
+    Some(local.offset().fix().local_minus_utc() / 60 + 720)
+}
+
+fn site_local_time_string_for_xm(site_timezone: &str, now_utc: DateTime<Utc>) -> Option<String> {
+    let tz: Tz = site_timezone.trim().parse().ok()?;
+    Some(
+        now_utc
+            .with_timezone(&tz)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string(),
+    )
+}
+
 fn observed_site_time_offset_secs(
     site_timezone: &str,
     observed_manual_time: &str,
@@ -388,6 +479,22 @@ fn observed_site_time_offset_secs(
         LocalResult::None => return None,
     };
     Some((local.with_timezone(&Utc) - now_utc).num_seconds().abs())
+}
+
+fn observed_timezone_matches(policy: &SiteTimePolicy, observed: &ObservedCameraState) -> bool {
+    if policy.timezone.trim().is_empty() {
+        return true;
+    }
+    if policy.timezone.trim() == observed.timezone.trim() {
+        return true;
+    }
+    observed
+        .raw
+        .get("time")
+        .and_then(|value| value.get("timezoneCode"))
+        .and_then(Value::as_i64)
+        .and_then(|code| site_timezone_code(&policy.timezone, Utc::now()).map(|expected| code == expected as i64))
+        .unwrap_or(false)
 }
 
 fn site_local_time_string(site_timezone: &str, now_utc: DateTime<Utc>) -> Option<String> {
@@ -511,6 +618,32 @@ pub async fn discover_candidates(cfg: &Config) -> Result<Vec<DiscoveredCameraCan
         candidate.transports.proprietary_9000 = true;
     }
 
+    for discovered in discover_interface_scan_candidates(cfg).await {
+        let candidate = map
+            .entry(discovered.ip.clone())
+            .or_insert_with(|| blank_candidate(&discovered.ip));
+        candidate.mac = first_nonempty(&candidate.mac, &discovered.mac);
+        candidate.lease_hostname =
+            first_nonempty(&candidate.lease_hostname, &discovered.lease_hostname);
+        for seen in &discovered.discovered_via {
+            push_unique_string(&mut candidate.discovered_via, seen);
+        }
+        candidate.signatures.vendor =
+            first_nonempty(&candidate.signatures.vendor, &discovered.signatures.vendor);
+        candidate.signatures.model =
+            first_nonempty(&candidate.signatures.model, &discovered.signatures.model);
+        candidate.signatures.public_title = first_nonempty(
+            &candidate.signatures.public_title,
+            &discovered.signatures.public_title,
+        );
+        candidate.transports.http = candidate.transports.http || discovered.transports.http;
+        candidate.transports.https = candidate.transports.https || discovered.transports.https;
+        candidate.transports.rtsp = candidate.transports.rtsp || discovered.transports.rtsp;
+        candidate.transports.onvif = candidate.transports.onvif || discovered.transports.onvif;
+        candidate.transports.proprietary_9000 =
+            candidate.transports.proprietary_9000 || discovered.transports.proprietary_9000;
+    }
+
     let client = http_client()?;
     for candidate in map.values_mut() {
         hydrate_candidate(candidate, &client).await?;
@@ -571,8 +704,12 @@ pub async fn mount_candidate(
         segment_secs: 10,
         desired: CameraDesiredConfig {
             display_name: display_name.clone(),
-            overlay_text: display_name.clone(),
-            overlay_timestamp: true,
+            overlay_text: if driver_is_xm(&driver_match.driver_id) {
+                String::new()
+            } else {
+                display_name.clone()
+            },
+            overlay_timestamp: !driver_is_xm(&driver_match.driver_id),
             desired_password: request.desired_password.trim().to_string(),
             generate_password: request.generate_password,
             ..Default::default()
@@ -639,6 +776,10 @@ pub async fn apply_mounted_camera(
 fn sync_display_name_and_linked_overlay(existing: &CameraConfig, next: &mut CameraConfig) {
     let requested_display_name = next.desired.display_name.trim();
     if requested_display_name.is_empty() {
+        return;
+    }
+    if driver_is_xm(&existing.driver_id) || driver_is_xm(&next.driver_id) {
+        next.name = requested_display_name.to_string();
         return;
     }
     let previous_display_name = camera_display_name(existing);
@@ -708,6 +849,18 @@ pub async fn probe_camera(cfg: &Config, request: ProbeCameraRequest) -> Result<V
             Ok(result) => result,
             Err(error) => json!({
                 "driverId": DRIVER_ID_REOLINK,
+                "status": "error",
+                "message": error.to_string(),
+            }),
+        }
+    } else if driver_is_xm(effective_driver)
+        && !request.username.trim().is_empty()
+        && !request.password.trim().is_empty()
+    {
+        match probe_xm_candidate(&candidate, &request).await {
+            Ok(result) => result,
+            Err(error) => json!({
+                "driverId": DRIVER_ID_XM_40E,
                 "status": "error",
                 "message": error.to_string(),
             }),
@@ -1532,11 +1685,11 @@ pub async fn read_mounted_camera(cfg: &Config, camera: &CameraConfig) -> Mounted
             let capabilities =
                 capabilities_for_observed(camera, base_capabilities.clone(), &observed);
             let display_name = first_nonempty(&observed.display_name, &camera_display_name(camera));
-            let vendor = first_nonempty(&camera.vendor, &observed.vendor);
-            let model = first_nonempty(&camera.model, &observed.model);
+            let vendor = first_nonempty(&observed.vendor, &camera.vendor);
+            let model = first_nonempty(&observed.model, &camera.model);
             MountedCamera {
                 source_id: camera.source_id.clone(),
-                driver_id: camera.driver_id.clone(),
+                driver_id: first_nonempty(&observed.driver_id, &camera.driver_id),
                 display_name,
                 vendor,
                 model,
@@ -1565,8 +1718,8 @@ pub async fn read_mounted_camera(cfg: &Config, camera: &CameraConfig) -> Mounted
             let capabilities =
                 capabilities_for_observed(camera, base_capabilities.clone(), &observed);
             let display_name = first_nonempty(&observed.display_name, &camera_display_name(camera));
-            let vendor = first_nonempty(&camera.vendor, &observed.vendor);
-            let model = first_nonempty(&camera.model, &observed.model);
+            let vendor = first_nonempty(&observed.vendor, &camera.vendor);
+            let model = first_nonempty(&observed.model, &camera.model);
             MountedCamera {
                 source_id: camera.source_id.clone(),
                 driver_id: camera.driver_id.clone(),
@@ -1600,6 +1753,9 @@ fn match_candidate(candidate: &DiscoveredCameraCandidate) -> DriverMatch {
     if let Some(matched) = ReolinkDriver.match_candidate(candidate) {
         return matched;
     }
+    if let Some(matched) = Xm40eDriver.match_candidate(candidate) {
+        return matched;
+    }
     if let Some(matched) = GenericOnvifRtspDriver.match_candidate(candidate) {
         return matched;
     }
@@ -1613,15 +1769,19 @@ fn match_candidate(candidate: &DiscoveredCameraCandidate) -> DriverMatch {
 }
 
 fn driver_capabilities(camera: &CameraConfig) -> CameraCapabilitySet {
-    match camera.driver_id.trim() {
-        DRIVER_ID_REOLINK => ReolinkDriver.capabilities(camera),
-        DRIVER_ID_GENERIC_ONVIF_RTSP => GenericOnvifRtspDriver.capabilities(camera),
-        _ => CameraCapabilitySet {
+    if camera.driver_id.trim() == DRIVER_ID_REOLINK {
+        ReolinkDriver.capabilities(camera)
+    } else if driver_is_xm(&camera.driver_id) {
+        Xm40eDriver.capabilities(camera)
+    } else if camera.driver_id.trim() == DRIVER_ID_GENERIC_ONVIF_RTSP {
+        GenericOnvifRtspDriver.capabilities(camera)
+    } else {
+        CameraCapabilitySet {
             live_view: true,
             ptz: camera.ptz_capable,
             raw_probe: true,
             ..Default::default()
-        },
+        }
     }
 }
 
@@ -1720,6 +1880,9 @@ async fn apply_driver_mount(cfg: &Config, camera: &CameraConfig) -> Result<Camer
     if camera.driver_id.trim() == DRIVER_ID_REOLINK {
         return apply_driver_desired(cfg, camera, camera).await;
     }
+    if driver_is_xm(&camera.driver_id) {
+        return apply_xm_40e_desired(cfg, camera, camera).await;
+    }
     Ok(camera.clone())
 }
 
@@ -1728,15 +1891,19 @@ async fn apply_driver_desired(
     existing: &CameraConfig,
     next: &CameraConfig,
 ) -> Result<CameraConfig> {
-    match next.driver_id.trim() {
-        DRIVER_ID_REOLINK => apply_reolink_desired(cfg, existing, next).await,
-        DRIVER_ID_GENERIC_ONVIF_RTSP => apply_generic_onvif_desired(cfg, next).await,
-        _ => Ok(next.clone()),
+    if next.driver_id.trim() == DRIVER_ID_REOLINK {
+        apply_reolink_desired(cfg, existing, next).await
+    } else if driver_is_xm(&next.driver_id) {
+        apply_xm_40e_desired(cfg, existing, next).await
+    } else if next.driver_id.trim() == DRIVER_ID_GENERIC_ONVIF_RTSP {
+        apply_generic_onvif_desired(cfg, next).await
+    } else {
+        Ok(next.clone())
     }
 }
 
 async fn apply_generic_onvif_desired(cfg: &Config, next: &CameraConfig) -> Result<CameraConfig> {
-    let policy = site_time_policy(cfg);
+    let policy = effective_site_time_policy(cfg, next);
     if !policy.ntp_enabled {
         return Ok(next.clone());
     }
@@ -1749,6 +1916,50 @@ async fn apply_generic_onvif_desired(cfg: &Config, next: &CameraConfig) -> Resul
     )
     .await;
     Ok(next.clone())
+}
+
+async fn apply_xm_40e_desired(
+    cfg: &Config,
+    _existing: &CameraConfig,
+    next: &CameraConfig,
+) -> Result<CameraConfig> {
+    let _ = ffprobe_rtsp_stream(&next.rtsp_url)
+        .await
+        .with_context(|| format!("XM RTSP apply validation failed for {}", next.onvif_host))?;
+    let request = xm_connect_request(next)?;
+    let policy = effective_site_time_policy(cfg, next);
+    let desired_display_title = nonempty_option(&camera_display_name(next));
+    let site_time = if policy.ntp_enabled
+        && !policy.ntp_server.trim().is_empty()
+        && !policy.timezone.trim().is_empty()
+    {
+        Some(xm::XmSiteTimePolicy {
+            ntp_server: policy.ntp_server.clone(),
+            timezone_code: site_timezone_code(&policy.timezone, Utc::now())
+                .ok_or_else(|| anyhow!("invalid site timezone {:?}", policy.timezone))?,
+            current_local_time: site_local_time_string_for_xm(&policy.timezone, Utc::now())
+                .ok_or_else(|| anyhow!("invalid site timezone {:?}", policy.timezone))?,
+        })
+    } else {
+        None
+    };
+    let applied = xm::apply_state(
+        &request,
+        desired_display_title.as_deref(),
+        None,
+        site_time.as_ref(),
+    )
+    .await?;
+    let model = applied.system.model_family.trim();
+    let mut updated = next.clone();
+    updated.driver_id = DRIVER_ID_XM_40E.to_string();
+    updated.vendor = "XM/NetSurveillance".to_string();
+    if !model.is_empty() {
+        updated.model = model.to_string();
+    }
+    updated.desired.overlay_text.clear();
+    updated.desired.overlay_timestamp = false;
+    Ok(updated)
 }
 
 async fn apply_reolink_desired(
@@ -2237,9 +2448,12 @@ async fn restore_reolink_onvif_protocols(
 }
 
 async fn read_observed_state(camera: &CameraConfig) -> Result<ObservedCameraState> {
-    match camera.driver_id.trim() {
-        DRIVER_ID_REOLINK => read_reolink_observed_state(camera).await,
-        _ => read_generic_observed_state(camera).await,
+    if camera.driver_id.trim() == DRIVER_ID_REOLINK {
+        read_reolink_observed_state(camera).await
+    } else if driver_is_xm(&camera.driver_id) {
+        read_xm_observed_state(camera).await
+    } else {
+        read_generic_observed_state(camera).await
     }
 }
 
@@ -2601,6 +2815,117 @@ async fn probe_reolink_candidate(
     ))
 }
 
+fn xm_connect_request(camera: &CameraConfig) -> Result<xm::XmConnectRequest> {
+    let host = camera.onvif_host.trim();
+    let username = camera.username.trim();
+    let password = camera.password.trim();
+    if host.is_empty() {
+        return Err(anyhow!("XM host is not configured"));
+    }
+    if username.is_empty() || password.is_empty() {
+        return Err(anyhow!(
+            "XM management credentials are required for {}",
+            camera.source_id
+        ));
+    }
+    Ok(xm::XmConnectRequest {
+        host: host.to_string(),
+        username: username.to_string(),
+        password: password.to_string(),
+    })
+}
+
+async fn probe_xm_candidate(
+    candidate: &DiscoveredCameraCandidate,
+    request: &ProbeCameraRequest,
+) -> Result<Value> {
+    let xm_request = xm::XmConnectRequest {
+        host: candidate.ip.trim().to_string(),
+        username: request.username.trim().to_string(),
+        password: request.password.trim().to_string(),
+    };
+    let xm_state = xm::read_state(&xm_request)
+        .await
+        .context("XM management probe failed")?;
+    let main_url = derive_rtsp_url(
+        candidate,
+        DRIVER_ID_XM_40E,
+        request.username.trim(),
+        request.password.trim(),
+        "",
+    );
+    let preview_url = xm_preview_rtsp_url(&main_url);
+    let main = ffprobe_rtsp_stream(&main_url)
+        .await
+        .context("XM RTSP main stream probe failed")?;
+    let preview = ffprobe_rtsp_stream(&preview_url)
+        .await
+        .unwrap_or(Value::Null);
+    let ports = probe_common_ports(&candidate.ip).await;
+    Ok(json!({
+        "driverId": DRIVER_ID_XM_40E,
+        "status": "ok",
+        "message": "XM 40E management and RTSP paths authenticated and returned live state.",
+        "observed": {
+            "vendor": xm_state.system.vendor,
+            "model": xm_state.system.model_family,
+            "ip": candidate.ip,
+            "displayName": xm_state.video.title_text,
+            "timeMode": xm_state.time.time_mode,
+            "ntpServer": xm_state.time.ntp_server,
+            "manualTime": xm_state.time.current_time_iso,
+            "timezone": xm_state.time.timezone_offset_label,
+        },
+        "services": {
+            "managementPlane": DRIVER_ID_XM_40E,
+            "http": ports.http,
+            "https": ports.https,
+            "rtsp": ports.rtsp,
+            "onvif": ports.onvif,
+            "proprietary9000": ports.proprietary_9000,
+        },
+        "raw": {
+            "managementPlane": DRIVER_ID_XM_40E,
+            "system": xm_state.system,
+            "time": xm_state.time,
+            "video": xm_state.video,
+            "mainStream": main,
+            "previewStream": preview,
+        }
+    }))
+}
+
+async fn ffprobe_rtsp_stream(url: &str) -> Result<Value> {
+    let output = timeout(
+        Duration::from_secs(12),
+        TokioCommand::new("ffprobe")
+            .arg("-v")
+            .arg("error")
+            .arg("-rtsp_transport")
+            .arg("tcp")
+            .arg("-timeout")
+            .arg("5000000")
+            .arg("-i")
+            .arg(url)
+            .arg("-show_entries")
+            .arg("stream=codec_name,codec_type,width,height")
+            .arg("-of")
+            .arg("json")
+            .output(),
+    )
+    .await
+    .context("ffprobe timed out")??;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!(if stderr.is_empty() {
+            "ffprobe failed to read stream".to_string()
+        } else {
+            stderr
+        }));
+    }
+    serde_json::from_slice(&output.stdout).context("ffprobe returned invalid json")
+}
+
 async fn read_generic_observed_state(camera: &CameraConfig) -> Result<ObservedCameraState> {
     let ports = probe_common_ports(&camera.onvif_host).await;
     if ports.onvif {
@@ -2681,6 +3006,49 @@ async fn read_generic_observed_state(camera: &CameraConfig) -> Result<ObservedCa
     })
 }
 
+async fn read_xm_observed_state(camera: &CameraConfig) -> Result<ObservedCameraState> {
+    let ports = probe_common_ports(&camera.onvif_host).await;
+    let xm_state = xm::read_state(&xm_connect_request(camera)?).await?;
+    Ok(ObservedCameraState {
+        display_name: first_nonempty(&xm_state.video.title_text, &camera_display_name(camera)),
+        driver_id: DRIVER_ID_XM_40E.to_string(),
+        vendor: first_nonempty(&xm_state.system.vendor, "XM/NetSurveillance"),
+        model: first_nonempty(&xm_state.system.model_family, "XM Camera"),
+        ip: camera.onvif_host.clone(),
+        mac_address: camera.mac_address.clone(),
+        time_mode: xm_state.time.time_mode.clone(),
+        ntp_server: xm_state.time.ntp_server.clone(),
+        manual_time: xm_state.time.current_time_iso.clone(),
+        timezone: xm_state.time.timezone_offset_label.clone(),
+        overlay_text: xm_state.video.user_title_text.clone(),
+        overlay_timestamp: None,
+        ptz_capable: false,
+        current_pose: CameraPose::default(),
+        pose_status: "unsupported".to_string(),
+        pose_source: String::new(),
+        services: json!({
+            "managementPlane": DRIVER_ID_XM_40E,
+            "timeManagementPlane": "xm_time_config",
+            "nameManagementPlane": "xm_osd_title",
+            "http": ports.http,
+            "https": ports.https,
+            "rtsp": ports.rtsp,
+            "onvif": ports.onvif,
+            "proprietary9000": ports.proprietary_9000,
+            "serialNumber": xm_state.system.serial_number,
+            "firmwareVersion": xm_state.system.firmware_version,
+        }),
+        raw: json!({
+            "managementPlane": DRIVER_ID_XM_40E,
+            "timeManagementPlane": "xm_time_config",
+            "nameManagementPlane": "xm_osd_title",
+            "system": xm_state.system,
+            "time": xm_state.time,
+            "video": xm_state.video,
+        }),
+    })
+}
+
 async fn fallback_observed_state(camera: &CameraConfig) -> ObservedCameraState {
     let ports = probe_common_ports(&camera.onvif_host).await;
     ObservedCameraState {
@@ -2721,7 +3089,7 @@ fn verification_for_observed(
     capabilities: &CameraCapabilitySet,
     failed_fields: Vec<String>,
 ) -> CameraReconcileResult {
-    let site_time = site_time_policy(cfg);
+    let site_time = effective_site_time_policy(cfg, camera);
     let mut drift_fields = Vec::new();
     if !camera.desired.display_name.trim().is_empty()
         && camera.desired.display_name.trim() != observed.display_name.trim()
@@ -2747,7 +3115,7 @@ fn verification_for_observed(
     if capabilities.timezone
         && site_time.ntp_enabled
         && !site_time.timezone.trim().is_empty()
-        && site_time.timezone.trim() != observed.timezone.trim()
+        && !observed_timezone_matches(&site_time, observed)
     {
         drift_fields.push("timezone".to_string());
     }
@@ -2803,7 +3171,7 @@ fn applied_fields(
     camera: &CameraConfig,
     capabilities: &CameraCapabilitySet,
 ) -> Vec<String> {
-    let site_time = site_time_policy(cfg);
+    let site_time = effective_site_time_policy(cfg, camera);
     let mut fields = vec!["display_name".to_string()];
     if capabilities.time_sync && site_time.ntp_enabled {
         fields.extend(
@@ -2834,7 +3202,7 @@ fn unsupported_fields(
     camera: &CameraConfig,
     capabilities: &CameraCapabilitySet,
 ) -> Vec<String> {
-    let site_time = site_time_policy(cfg);
+    let site_time = effective_site_time_policy(cfg, camera);
     let mut fields = Vec::new();
     if !capabilities.time_sync && site_time.ntp_enabled {
         fields.push("ntp_server".to_string());
@@ -2872,11 +3240,27 @@ async fn hydrate_candidate(
     candidate.transports.onvif = candidate.transports.onvif || probe.onvif;
     candidate.transports.proprietary_9000 =
         candidate.transports.proprietary_9000 || probe.proprietary_9000;
-    if candidate.signatures.public_title.trim().is_empty() {
-        candidate.signatures.public_title =
-            fetch_public_title(client, &candidate.ip, probe.http, probe.https)
-                .await
-                .unwrap_or_default();
+    let fingerprint = if candidate.signatures.public_title.trim().is_empty()
+        || candidate.signatures.vendor.trim().is_empty()
+        || candidate.signatures.model.trim().is_empty()
+    {
+        fetch_http_fingerprint(client, &candidate.ip, probe.http, probe.https)
+            .await
+            .unwrap_or_default()
+    } else {
+        HttpFingerprint::default()
+    };
+    if candidate.signatures.public_title.trim().is_empty() && !fingerprint.title.trim().is_empty() {
+        candidate.signatures.public_title = fingerprint.title.clone();
+    }
+    if is_xm_http_fingerprint(&fingerprint) {
+        candidate.signatures.vendor =
+            first_nonempty(&candidate.signatures.vendor, "XM/NetSurveillance");
+        candidate.signatures.model =
+            first_nonempty(&candidate.signatures.model, "XM 40E-class camera");
+        if candidate.signatures.public_title.trim().is_empty() {
+            candidate.signatures.public_title = "XM/NetSurveillance 40E-class camera".to_string();
+        }
     }
     if candidate.signatures.vendor.trim().is_empty() {
         candidate.signatures.vendor = vendor_from_candidate(candidate);
@@ -2962,6 +3346,8 @@ fn build_source_id(candidate: &DiscoveredCameraCandidate, driver_id: &str) -> St
             format!("reolink-{}", candidate.signatures.reolink_uid.trim())
         } else if driver_id == DRIVER_ID_REOLINK {
             format!("reolink-{}", candidate.ip.trim())
+        } else if driver_is_xm(driver_id) {
+            format!("xm-{}", candidate.ip.trim())
         } else {
             format!(
                 "camera-{}-{}",
@@ -2992,6 +3378,8 @@ fn derive_vendor(candidate: &DiscoveredCameraCandidate, driver_id: &str) -> Stri
         candidate.signatures.vendor.trim().to_string()
     } else if driver_id == DRIVER_ID_REOLINK {
         "Reolink".to_string()
+    } else if driver_is_xm(driver_id) {
+        "XM/NetSurveillance".to_string()
     } else {
         "ONVIF/RTSP".to_string()
     }
@@ -3035,7 +3423,26 @@ fn derive_rtsp_url(
             candidate.ip.trim()
         );
     }
+    if driver_is_xm(driver_id) {
+        let user = if username.trim().is_empty() {
+            "admin"
+        } else {
+            username.trim()
+        };
+        let pass = password.trim();
+        return format!(
+            "rtsp://{auth}{}:554/user={}_password={}_channel=1_stream=0.sdp?real_stream",
+            candidate.ip.trim(),
+            user,
+            pass
+        );
+    }
     format!("rtsp://{auth}{}:554/", candidate.ip.trim())
+}
+
+fn xm_preview_rtsp_url(url: &str) -> String {
+    url.replace("_stream=0.sdp?real_stream", "_stream=1.sdp?real_stream")
+        .replace("_stream=0.sdp", "_stream=1.sdp")
 }
 
 fn normalize_camera_defaults(cfg: &Config, camera: &mut CameraConfig) {
@@ -3151,11 +3558,27 @@ fn vendor_from_candidate(candidate: &DiscoveredCameraCandidate) -> String {
     let title = candidate.signatures.public_title.to_ascii_lowercase();
     if title.contains("reolink") || !candidate.signatures.reolink_uid.trim().is_empty() {
         "Reolink".to_string()
+    } else if candidate_looks_like_xm(candidate) {
+        "XM/NetSurveillance".to_string()
     } else if candidate.transports.onvif || candidate.transports.rtsp {
         "ONVIF/RTSP".to_string()
     } else {
         String::new()
     }
+}
+
+fn candidate_looks_like_xm(candidate: &DiscoveredCameraCandidate) -> bool {
+    let vendor = candidate.signatures.vendor.to_ascii_lowercase();
+    let model = candidate.signatures.model.to_ascii_lowercase();
+    let title = candidate.signatures.public_title.to_ascii_lowercase();
+    vendor.contains("xm")
+        || vendor.contains("netsurveillance")
+        || model.contains("40e")
+        || model.contains("xm rtsp")
+        || model.contains("netsurveillance")
+        || title.contains("40e")
+        || title.contains("xm")
+        || title.contains("netsurveillance")
 }
 
 fn model_from_candidate(candidate: &DiscoveredCameraCandidate) -> String {
@@ -3184,6 +3607,82 @@ fn parse_lease_file(path: &str) -> Vec<LeaseEntry> {
             })
         })
         .collect()
+}
+
+async fn discover_interface_scan_candidates(cfg: &Config) -> Vec<DiscoveredCameraCandidate> {
+    let ips = camera_interface_scan_ips(cfg);
+    if ips.is_empty() {
+        return Vec::new();
+    }
+    stream::iter(ips)
+        .map(|ip| async move { active_scan_candidate(&ip).await })
+        .buffer_unordered(96)
+        .filter_map(|candidate| async move { candidate })
+        .collect::<Vec<_>>()
+        .await
+}
+
+fn camera_interface_scan_ips(cfg: &Config) -> Vec<String> {
+    let iface = cfg.camera_network.interface.trim();
+    if iface.is_empty() {
+        return Vec::new();
+    }
+    let primary_host = cfg.camera_network.host_ip.trim();
+    let mut out = HashSet::new();
+    for (addr, prefix) in interface_ipv4_cidrs(iface) {
+        if !primary_host.is_empty() && addr.to_string() == primary_host {
+            continue;
+        }
+        if prefix != 24 {
+            continue;
+        }
+        let network = u32::from(addr) & 0xFFFF_FF00;
+        for host in 1..=254u32 {
+            let ip = Ipv4Addr::from(network + host);
+            if ip == addr {
+                continue;
+            }
+            out.insert(ip.to_string());
+        }
+    }
+    let mut sorted = out.into_iter().collect::<Vec<_>>();
+    sorted.sort();
+    sorted
+}
+
+fn interface_ipv4_cidrs(iface: &str) -> Vec<(Ipv4Addr, u8)> {
+    let output = match Command::new("ip")
+        .args(["-4", "-o", "addr", "show", "dev", iface.trim()])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let parts = line.split_whitespace().collect::<Vec<_>>();
+            let idx = parts.iter().position(|part| *part == "inet")?;
+            let cidr = parts.get(idx + 1)?.trim();
+            let (ip, prefix) = cidr.split_once('/')?;
+            Some((ip.parse::<Ipv4Addr>().ok()?, prefix.parse::<u8>().ok()?))
+        })
+        .collect()
+}
+
+async fn active_scan_candidate(ip: &str) -> Option<DiscoveredCameraCandidate> {
+    let ports = probe_common_ports(ip).await;
+    if !(ports.rtsp || ports.onvif) {
+        return None;
+    }
+    let mut candidate = blank_candidate(ip);
+    candidate.transports.http = ports.http;
+    candidate.transports.https = ports.https;
+    candidate.transports.rtsp = ports.rtsp;
+    candidate.transports.onvif = ports.onvif;
+    candidate.transports.proprietary_9000 = ports.proprietary_9000;
+    push_unique_string(&mut candidate.discovered_via, "interface_scan");
+    Some(candidate)
 }
 
 fn host_and_port_from_xaddr(value: &str) -> Option<(String, u16)> {
@@ -3232,7 +3731,19 @@ fn http_client() -> Result<Client> {
         .context("failed building camera discovery http client")
 }
 
-async fn fetch_public_title(client: &Client, ip: &str, http: bool, https: bool) -> Result<String> {
+#[derive(Clone, Debug, Default)]
+struct HttpFingerprint {
+    title: String,
+    server: String,
+    body: String,
+}
+
+async fn fetch_http_fingerprint(
+    client: &Client,
+    ip: &str,
+    http: bool,
+    https: bool,
+) -> Result<HttpFingerprint> {
     let title_re = Regex::new("(?is)<title>(.*?)</title>").context("invalid title regex")?;
     for url in [
         http.then(|| format!("http://{ip}/")),
@@ -3245,18 +3756,44 @@ async fn fetch_public_title(client: &Client, ip: &str, http: bool, https: bool) 
             Ok(response) if response.status().is_success() => response,
             _ => continue,
         };
+        let server = response
+            .headers()
+            .get("server")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         let body = response.text().await.unwrap_or_default();
-        if let Some(captures) = title_re.captures(&body) {
-            let title = captures
-                .get(1)
-                .map(|m| m.as_str().trim())
-                .unwrap_or_default();
-            if !title.is_empty() {
-                return Ok(title.to_string());
-            }
-        }
+        let title = title_re
+            .captures(&body)
+            .and_then(|captures| captures.get(1))
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
+        return Ok(HttpFingerprint {
+            title,
+            server,
+            body,
+        });
     }
-    Ok(String::new())
+    Ok(HttpFingerprint::default())
+}
+
+fn is_xm_http_fingerprint(fingerprint: &HttpFingerprint) -> bool {
+    if fingerprint.body.trim().is_empty() && fingerprint.server.trim().is_empty() {
+        return false;
+    }
+    let server = fingerprint.server.to_ascii_lowercase();
+    let body = fingerprint.body.to_ascii_lowercase();
+    let markers = [
+        "api_pluginplay/api_plugin.js",
+        "api_pluginplay/commonnew.js",
+        "jscore/browserwindow.js",
+        "ipcconfigctrl",
+        "raw_player.js",
+        "pubversion=",
+    ];
+    let hits = markers.iter().filter(|marker| body.contains(**marker)).count();
+    hits >= 2 || (server.contains("gsoap/2.8") && body.contains("api_pluginplay/api_plugin.js"))
 }
 
 fn first_nonempty(preferred: &str, fallback: &str) -> String {
@@ -3323,6 +3860,41 @@ mod tests {
         let matched = match_candidate(&candidate);
         assert_eq!(matched.driver_id, DRIVER_ID_GENERIC_ONVIF_RTSP);
         assert!(matched.mountable);
+    }
+
+    #[test]
+    fn xm_driver_matches_xm_fingerprint_before_generic() {
+        let candidate = DiscoveredCameraCandidate {
+            ip: "192.168.0.201".to_string(),
+            signatures: CameraSignatureSet {
+                vendor: "XM/NetSurveillance".to_string(),
+                model: "XM RTSP camera".to_string(),
+                ..Default::default()
+            },
+            transports: CameraTransportFacts {
+                http: true,
+                rtsp: true,
+                onvif: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let matched = match_candidate(&candidate);
+        assert_eq!(matched.driver_id, DRIVER_ID_XM_40E);
+        assert_eq!(matched.kind, "vendor_driver");
+        assert!(matched.mountable);
+    }
+
+    #[test]
+    fn derive_rtsp_url_uses_xm_path_shape() {
+        let candidate = DiscoveredCameraCandidate {
+            ip: "192.168.0.201".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_rtsp_url(&candidate, DRIVER_ID_XM_40E, "admin", "123456", ""),
+            "rtsp://admin:123456@192.168.0.201:554/user=admin_password=123456_channel=1_stream=0.sdp?real_stream"
+        );
     }
 
     #[test]
@@ -3712,6 +4284,44 @@ mod tests {
 
         assert_eq!(next.name, "Driveway");
         assert_eq!(next.desired.overlay_text, "Package Zone");
+    }
+
+    #[test]
+    fn xm_display_name_change_does_not_link_hidden_overlay_fields() {
+        let existing = CameraConfig {
+            source_id: "cam".to_string(),
+            name: "Front Door".to_string(),
+            onvif_host: "10.0.0.1".to_string(),
+            onvif_port: 8000,
+            rtsp_url: String::new(),
+            username: String::new(),
+            password: String::new(),
+            driver_id: DRIVER_ID_XM_40E.to_string(),
+            vendor: String::new(),
+            model: String::new(),
+            mac_address: String::new(),
+            rtsp_port: 554,
+            ptz_capable: false,
+            enabled: true,
+            segment_secs: 10,
+            desired: CameraDesiredConfig {
+                display_name: "Front Door".to_string(),
+                overlay_text: String::new(),
+                overlay_timestamp: false,
+                ..Default::default()
+            },
+            credentials: Default::default(),
+        };
+        let mut next = existing.clone();
+        next.desired.display_name = "Driveway".to_string();
+        next.desired.overlay_text = "Front Door".to_string();
+        next.desired.overlay_timestamp = true;
+
+        sync_display_name_and_linked_overlay(&existing, &mut next);
+
+        assert_eq!(next.name, "Driveway");
+        assert_eq!(next.desired.overlay_text, "Front Door");
+        assert!(next.desired.overlay_timestamp);
     }
 
     #[test]

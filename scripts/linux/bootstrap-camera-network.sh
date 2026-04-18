@@ -9,6 +9,7 @@ CAMERA_CIDR=""
 HOST_IP=""
 DHCP_RANGE_START=""
 DHCP_RANGE_END=""
+declare -a ONBOARDING_ALIASES=()
 DNSMASQ_CONF="/etc/dnsmasq.d/constitute-nvr-camera.conf"
 CHRONY_DROPIN=""
 
@@ -31,6 +32,7 @@ Options:
   --host-ip <ip>             Host IP on camera subnet (default: .1)
   --dhcp-range-start <ip>    DHCP pool start (default: .50)
   --dhcp-range-end <ip>      DHCP pool end (default: .199)
+  --onboarding-alias <cidr>  Additional IPv4 alias on the camera NIC for factory-static cameras
   --print-env                Emit CAMERA_* shell assignments on success
   -h, --help                 Show help
 EOF
@@ -84,6 +86,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dhcp-range-end)
       DHCP_RANGE_END="${2:?missing value for --dhcp-range-end}"
+      shift 2
+      ;;
+    --onboarding-alias)
+      ONBOARDING_ALIASES+=("${2:?missing value for --onboarding-alias}")
       shift 2
       ;;
     --print-env)
@@ -167,7 +173,7 @@ select_camera_iface() {
 
 derive_network_values() {
   local json
-  json="$(python3 - <<'PY'
+  json="$(CAMERA_CIDR="$CAMERA_CIDR" python3 - <<'PY'
 import ipaddress
 import json
 import os
@@ -208,7 +214,16 @@ candidates = [
 ]
 
 if requested:
-    candidates = [requested] + [c for c in candidates if c != requested]
+    chosen = ipaddress.ip_network(requested, strict=False)
+    data = {
+        "camera_cidr": str(chosen),
+        "host_ip": str(chosen.network_address + 1),
+        "dhcp_range_start": str(chosen.network_address + 50),
+        "dhcp_range_end": str(chosen.network_address + 199),
+        "prefix": chosen.prefixlen,
+    }
+    print(json.dumps(data))
+    sys.exit(0)
 
 chosen = None
 for candidate in candidates:
@@ -372,6 +387,9 @@ apply_networkmanager_config() {
     ipv4.never-default yes \
     ipv6.method disabled \
     >/dev/null
+  for alias in "${ONBOARDING_ALIASES[@]}"; do
+    run_sudo nmcli connection modify "$connection_name" +ipv4.addresses "$alias" >/dev/null
+  done
   run_sudo ip -4 addr flush dev "$CAMERA_IFACE" >/dev/null 2>&1 || true
   run_sudo nmcli connection up "$connection_name" ifname "$CAMERA_IFACE" >/dev/null
 }
@@ -411,6 +429,7 @@ CAMERA_CIDR=${CAMERA_CIDR}
 CAMERA_HOST_IP=${HOST_IP}
 CAMERA_DHCP_RANGE_START=${DHCP_RANGE_START}
 CAMERA_DHCP_RANGE_END=${DHCP_RANGE_END}
+CAMERA_ONBOARDING_ALIASES=${ONBOARDING_ALIASES[*]}
 EOF
 }
 

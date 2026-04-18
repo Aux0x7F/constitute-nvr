@@ -734,13 +734,23 @@ fn apply_camera_defaults(camera: &mut CameraConfig, _network: &CameraNetworkConf
     if camera.driver_id.trim().is_empty() {
         camera.driver_id = if camera.source_id.trim().starts_with("reolink-") {
             "reolink".to_string()
+        } else if camera.source_id.trim().starts_with("xm-") {
+            "xm_40e".to_string()
         } else {
             "generic_onvif_rtsp".to_string()
         };
         changed = true;
     }
+    if camera.driver_id.trim() == "xm_rtsp" {
+        camera.driver_id = "xm_40e".to_string();
+        changed = true;
+    }
     if camera.vendor.trim().is_empty() && camera.driver_id == "reolink" {
         camera.vendor = "Reolink".to_string();
+        changed = true;
+    }
+    if camera.vendor.trim().is_empty() && camera.driver_id == "xm_40e" {
+        camera.vendor = "XM/NetSurveillance".to_string();
         changed = true;
     }
     if camera.model.trim().is_empty() {
@@ -766,7 +776,10 @@ fn apply_camera_defaults(camera: &mut CameraConfig, _network: &CameraNetworkConf
         camera.desired.display_name = camera.name.trim().to_string();
         changed = true;
     }
-    if camera.desired.overlay_text.trim().is_empty() && !camera.name.trim().is_empty() {
+    if camera.driver_id != "xm_40e"
+        && camera.desired.overlay_text.trim().is_empty()
+        && !camera.name.trim().is_empty()
+    {
         camera.desired.overlay_text = camera.name.trim().to_string();
         changed = true;
     }
@@ -1500,5 +1513,36 @@ mod tests {
         assert!(camera.ptz_capable);
         assert_eq!(camera.desired.overlay_text, "Reolink E1 Outdoor SE");
         assert_eq!(camera.desired.display_name, "Reolink E1 Outdoor SE");
+    }
+
+    #[test]
+    fn apply_defaults_migrates_legacy_xm_driver_to_xm_40e() {
+        let mut cfg = Config::default_generated();
+        cfg.cameras.push(CameraConfig {
+            source_id: "xm-192-168-0-201".to_string(),
+            name: "XM Camera".to_string(),
+            onvif_host: "192.168.0.201".to_string(),
+            onvif_port: 8000,
+            rtsp_url: "rtsp://admin:123456@192.168.0.201:554/user=admin_password=123456_channel=1_stream=0.sdp?real_stream".to_string(),
+            username: "admin".to_string(),
+            password: "123456".to_string(),
+            driver_id: "xm_rtsp".to_string(),
+            vendor: String::new(),
+            model: String::new(),
+            mac_address: String::new(),
+            rtsp_port: 0,
+            ptz_capable: false,
+            enabled: true,
+            segment_secs: 10,
+            desired: CameraDesiredConfig::default(),
+            credentials: CameraCredentialState::default(),
+        });
+
+        cfg.apply_defaults();
+        let camera = &cfg.cameras[0];
+        assert_eq!(camera.driver_id, "xm_40e");
+        assert_eq!(camera.vendor, "XM/NetSurveillance");
+        assert_eq!(camera.desired.display_name, "XM Camera");
+        assert_eq!(camera.desired.overlay_text, "");
     }
 }

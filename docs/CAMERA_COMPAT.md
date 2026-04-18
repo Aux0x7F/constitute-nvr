@@ -8,6 +8,48 @@
 - RTSP ingest: pending
 - Recommended status: test candidate
 
+### XM / NetSurveillance 40E
+- Lab discovery address: `192.168.0.201` (factory-static, off the managed `192.168.250.0/24` subnet)
+- Discovery requirement: host camera NIC must carry an explicit onboarding alias on the matching `/24` (for example `192.168.0.2/24`)
+- HTTP/web UI fingerprint:
+  - `Server: gSOAP/2.8`
+  - legacy plugin UI assets such as `api_pluginPlay/api_plugin.js`, `raw_player.js`, and `IPCConfigCtrl`
+- Live model fingerprint:
+  - `fsVersion="40E_19_DL_c1_V3-A-RTMP-H5 V3.4.0.3 build 2025-01-09 17:38:27"`
+  - serial `EF00000006092ABD`
+- RTSP ingest path: verified live on `2026-04-17`
+  - `rtsp://admin:123456@192.168.0.201:554/user=admin_password=123456_channel=1_stream=0.sdp?real_stream`
+- Stream facts proved on the lab camera:
+  - main stream: HEVC `2560x1440`
+  - substream: HEVC `640x360`
+  - tested RTSP profile variants on `2026-04-17` remained HEVC-only; no H.264 profile was found in the validated live paths
+- Current driver status:
+  - supported as `xm_40e`
+  - discovery, probe, ingest, live preview, baked-title apply, and site-time apply are in scope
+  - live service proof on `2026-04-18`:
+    - mounted as `xm-192-168-0-201` on the lab host
+    - `/health` reported the XM source `running`
+    - recorded segments were created under `/data/constitute-nvr/segments/xm-192-168-0-201`
+    - baked feed title was driven `Front Door -> Test -> Front Door`
+    - baked feed clock was verified live with:
+      - NTP mode
+      - NTP server `192.168.0.2`
+      - 24-hour time
+      - weekday hidden
+  - recorder note:
+    - this model exposes `pcm_mulaw` audio alongside HEVC video
+    - iteration-1 ingest records video-only MP4 segments because copying `pcm_mulaw` audio into MP4 is not container-safe
+  - preview note:
+    - live preview depends on host HEVC decode because the validated RTSP profiles are HEVC
+    - installer/runtime now treat decoder-capable `ffmpeg` as part of the supported contract
+  - XM-specific management notes:
+    - baked feed title is controlled by `TitleOverlay.TitleUtf8`
+    - site time is controlled by `/setTimeConfig` with manual seed -> NTP transition
+    - the effective NTP alias for this camera is `192.168.0.2`
+    - a second XM `UserOverlay` lane can leak stale text into the lower-left corner; the active driver now clears that lane on apply so the feed only shows the main title and clock
+- PTZ is not supported on this model
+- Recommended status: supported for discovery, ingest, live preview, baked title, and site time when an onboarding alias exists on the camera NIC
+
 ### Reolink E1 Outdoor SE PoE Pan Cam
 - First boot requires DHCP lease before the camera exposes an address
 - Proprietary LAN discovery observed on UDP `2000/3000`

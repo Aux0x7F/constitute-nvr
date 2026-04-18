@@ -118,6 +118,55 @@ require_cmd() {
   fi
 }
 
+ffmpeg_has_hevc_decoder() {
+  command -v ffmpeg >/dev/null 2>&1 || return 1
+  ffmpeg -decoders 2>/dev/null | awk '$2 == "hevc" { found = 1 } END { exit(found ? 0 : 1) }'
+}
+
+ensure_ffmpeg_preview_stack() {
+  if ffmpeg_has_hevc_decoder; then
+    return 0
+  fi
+
+  if command -v dnf >/dev/null 2>&1; then
+    local fedora_release=""
+    fedora_release="$(rpm -E %fedora 2>/dev/null || true)"
+    if [[ -z "$fedora_release" ]]; then
+      echo "unable to determine Fedora release for ffmpeg codec bootstrap" >&2
+      exit 1
+    fi
+
+    if ! rpm -q rpmfusion-free-release >/dev/null 2>&1 || ! rpm -q rpmfusion-nonfree-release >/dev/null 2>&1; then
+      log "installing RPM Fusion release repos for decoder-capable ffmpeg"
+      run_sudo dnf install -y \
+        "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${fedora_release}.noarch.rpm" \
+        "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-${fedora_release}.noarch.rpm"
+    fi
+
+    if ! ffmpeg_has_hevc_decoder; then
+      log "installing HEVC-capable ffmpeg codec support"
+      run_sudo dnf install -y libavcodec-freeworld --allowerasing >/dev/null 2>&1 || true
+    fi
+
+    if ! ffmpeg_has_hevc_decoder; then
+      log "switching Fedora host from ffmpeg-free to full ffmpeg"
+      run_sudo dnf swap -y ffmpeg-free ffmpeg --allowerasing >/dev/null
+    fi
+  elif command -v apt-get >/dev/null 2>&1; then
+    log "installing ffmpeg via apt-get"
+    run_sudo apt-get update >/dev/null
+    run_sudo apt-get install -y ffmpeg >/dev/null
+  else
+    echo "unable to provision ffmpeg with HEVC decode support automatically" >&2
+    exit 1
+  fi
+
+  if ! ffmpeg_has_hevc_decoder; then
+    echo "ffmpeg is installed but still lacks HEVC decoder support; live preview for HEVC cameras cannot work" >&2
+    exit 1
+  fi
+}
+
 confirm() {
   local prompt="$1"
   local default_yes="$2"
@@ -443,6 +492,8 @@ fi
 require_cmd systemctl
 require_cmd curl
 require_cmd python3
+
+ensure_ffmpeg_preview_stack
 
 SRC_DIR=""
 TMP_DIR=""

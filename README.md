@@ -25,6 +25,7 @@ Installer behavior:
 - skips reinstall/restart when installed binary hash is unchanged
 - installs systemd service and self-update timer by default
 - updater keeps config/state out of release paths and rolls back binary on failed restart/health check
+- provisions decoder-capable host `ffmpeg` for live preview, including HEVC camera support on Fedora-class hosts
 - provisions an isolated camera NIC with a collision-checked `/24` and `dnsmasq` DHCP
 - optionally applies camera-interface hardening (DHCP + RTSP/ONVIF + optional NTP lane)
 
