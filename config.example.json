@@ -55,7 +55,10 @@
     "host_ip": "192.168.250.1",
     "dhcp_enabled": true,
     "dhcp_range_start": "192.168.250.50",
-    "dhcp_range_end": "192.168.250.199"
+    "dhcp_range_end": "192.168.250.199",
+    "ntp_enabled": true,
+    "ntp_server": "192.168.250.1",
+    "timezone": "America/Phoenix"
   },
   "live_preview": {
     "udp_port_min": 41000,

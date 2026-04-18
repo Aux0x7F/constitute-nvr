@@ -304,6 +304,32 @@ detect_chrony_dropin() {
   CHRONY_DROPIN="/etc/chrony.d/constitute-nvr-camera.conf"
 }
 
+ensure_chrony_dropin_loaded() {
+  local dropin_dir include_line
+  dropin_dir="$(dirname "$CHRONY_DROPIN")"
+  case "$dropin_dir" in
+    /etc/chrony/conf.d)
+      include_line="confdir /etc/chrony/conf.d"
+      ;;
+    /etc/chrony.d)
+      include_line="confdir /etc/chrony.d"
+      ;;
+    *)
+      return
+      ;;
+  esac
+
+  if [[ ! -f /etc/chrony.conf ]]; then
+    return
+  fi
+  if grep -Fxq "$include_line" /etc/chrony.conf; then
+    return
+  fi
+
+  log "ensuring chrony loads ${dropin_dir}"
+  printf '\n%s\n' "$include_line" | run_sudo tee -a /etc/chrony.conf >/dev/null
+}
+
 restart_chrony() {
   local unit=""
   if systemctl list-unit-files chronyd.service --no-legend >/dev/null 2>&1; then
@@ -368,6 +394,7 @@ EOF
 
 write_chrony_config() {
   detect_chrony_dropin
+  ensure_chrony_dropin_loaded
   run_sudo mkdir -p "$(dirname "$CHRONY_DROPIN")"
   cat <<EOF | run_sudo tee "$CHRONY_DROPIN" >/dev/null
 # Managed by constitute-nvr camera bootstrap.

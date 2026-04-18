@@ -10,8 +10,6 @@ use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 use tokio::time::sleep;
 
-use crate::config::{CameraDesiredConfig, CameraTimeMode};
-
 const DEVICE_WSDL: &str = "http://www.onvif.org/ver10/device/wsdl";
 const MEDIA_WSDL: &str = "http://www.onvif.org/ver10/media/wsdl";
 const PTZ_WSDL: &str = "http://www.onvif.org/ver20/ptz/wsdl";
@@ -54,6 +52,13 @@ pub struct OnvifPtzPose {
     pub pan: Option<f32>,
     pub tilt: Option<f32>,
     pub zoom: Option<f32>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct OnvifSiteTimePolicy {
+    pub ntp_enabled: bool,
+    pub ntp_server: String,
+    pub timezone: String,
 }
 
 pub async fn read_state(ip: &str, port: u16, username: &str, password: &str) -> Result<OnvifState> {
@@ -173,6 +178,9 @@ pub async fn read_state(ip: &str, port: u16, username: &str, password: &str) -> 
         .map(|doc| (parse_ptz_pose(&doc), parse_ptz_move_status(&doc)))
         .unwrap_or((None, String::new()));
 
+    let raw_timezone = descendant_text(&time_doc, "TZ");
+    let normalized_timezone = normalize_onvif_timezone(&raw_timezone);
+
     Ok(OnvifState {
         manufacturer: descendant_text(&info_doc, "Manufacturer"),
         model: descendant_text(&info_doc, "Model"),
@@ -184,7 +192,7 @@ pub async fn read_state(ip: &str, port: u16, username: &str, password: &str) -> 
         ptz_service_url,
         profile_token: profile_token.clone(),
         time_mode: descendant_text(&time_doc, "DateTimeType").to_ascii_lowercase(),
-        timezone: descendant_text(&time_doc, "TZ"),
+        timezone: normalized_timezone.clone(),
         ntp_server: ntp_doc.as_ref().map(first_ntp_server).unwrap_or_default(),
         manual_time: local_datetime_value(&time_doc),
         ptz_capable,
@@ -208,7 +216,8 @@ pub async fn read_state(ip: &str, port: u16, username: &str, password: &str) -> 
             },
             "time": {
                 "mode": descendant_text(&time_doc, "DateTimeType"),
-                "timezone": descendant_text(&time_doc, "TZ"),
+                "timezone": normalized_timezone,
+                "timezoneRaw": raw_timezone,
                 "localDateTime": local_datetime_value(&time_doc),
                 "ntpServer": ntp_doc.as_ref().map(first_ntp_server).unwrap_or_default(),
             },
@@ -274,73 +283,47 @@ pub async fn set_network_protocol(
     .map(|_| ())
 }
 
-pub async fn apply_time_settings(
+pub async fn apply_site_time_settings(
     ip: &str,
     port: u16,
     username: &str,
     password: &str,
-    desired: &CameraDesiredConfig,
+    policy: &OnvifSiteTimePolicy,
 ) -> Result<()> {
+    if !policy.ntp_enabled {
+        return Ok(());
+    }
     let state = read_state(ip, port, username, password).await?;
     let client = http_client()?;
-    let timezone = if desired.timezone.trim().is_empty() {
+    let timezone = if policy.timezone.trim().is_empty() {
         state.timezone.trim().to_string()
     } else {
-        desired.timezone.trim().to_string()
+        policy.timezone.trim().to_string()
     };
-
-    if matches!(desired.time_mode, CameraTimeMode::Ntp) {
-        let ntp_server = desired.ntp_server.trim();
-        if !ntp_server.is_empty() {
-            soap_call(
-                &client,
-                &state.device_service_url,
-                username,
-                password,
-                &format!("{DEVICE_WSDL}/SetNTP"),
-                &format!(
-                    "<tds:SetNTP><tds:FromDHCP>false</tds:FromDHCP>{}</tds:SetNTP>",
-                    ntp_manual_entry(ntp_server)
-                ),
-            )
-            .await
-            .context("ONVIF SetNTP failed")?;
-        }
-
-        let timezone_xml = if timezone.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "<tds:TimeZone><tt:TZ>{}</tt:TZ></tds:TimeZone>",
-                escape_xml(&timezone)
-            )
-        };
+    let ntp_server = policy.ntp_server.trim();
+    if !ntp_server.is_empty() {
         soap_call(
             &client,
             &state.device_service_url,
             username,
             password,
-            &format!("{DEVICE_WSDL}/SetSystemDateAndTime"),
+            &format!("{DEVICE_WSDL}/SetNTP"),
             &format!(
-                "<tds:SetSystemDateAndTime><tds:DateTimeType>NTP</tds:DateTimeType><tds:DaylightSavings>false</tds:DaylightSavings>{timezone_xml}</tds:SetSystemDateAndTime>"
+                "<tds:SetNTP><tds:FromDHCP>false</tds:FromDHCP>{}</tds:SetNTP>",
+                ntp_manual_entry(ntp_server)
             ),
         )
         .await
-        .context("ONVIF SetSystemDateAndTime (NTP) failed")?;
-        return Ok(());
+        .context("ONVIF SetNTP failed")?;
     }
 
-    let manual_time = desired.manual_time.trim();
-    if manual_time.is_empty() {
-        return Err(anyhow!("manual_time is required when time_mode is manual"));
-    }
-    let manual_xml = build_manual_datetime_xml(manual_time)?;
+    let onvif_timezone = onvif_timezone_value(&timezone);
     let timezone_xml = if timezone.is_empty() {
         String::new()
     } else {
         format!(
             "<tds:TimeZone><tt:TZ>{}</tt:TZ></tds:TimeZone>",
-            escape_xml(&timezone)
+            escape_xml(&onvif_timezone)
         )
     };
     soap_call(
@@ -350,11 +333,11 @@ pub async fn apply_time_settings(
         password,
         &format!("{DEVICE_WSDL}/SetSystemDateAndTime"),
         &format!(
-            "<tds:SetSystemDateAndTime><tds:DateTimeType>Manual</tds:DateTimeType><tds:DaylightSavings>false</tds:DaylightSavings>{timezone_xml}<tds:UTCDateTime>{manual_xml}</tds:UTCDateTime></tds:SetSystemDateAndTime>"
+            "<tds:SetSystemDateAndTime><tds:DateTimeType>NTP</tds:DateTimeType><tds:DaylightSavings>false</tds:DaylightSavings>{timezone_xml}</tds:SetSystemDateAndTime>"
         ),
     )
     .await
-    .context("ONVIF SetSystemDateAndTime (manual) failed")?;
+    .context("ONVIF SetSystemDateAndTime (NTP) failed")?;
     Ok(())
 }
 
@@ -806,6 +789,35 @@ fn first_ntp_server(doc: &Document<'_>) -> String {
         .unwrap_or_default()
 }
 
+fn normalize_onvif_timezone(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match trimmed {
+        "UTC" | "GMT+00:00:00" | "UTC+00:00:00" => "UTC".to_string(),
+        "MST7"
+        | "MST7:00:00"
+        | "UTC+7:00:00"
+        | "UTC+07:00:00"
+        | "GMT+7:00:00"
+        | "GMT+07:00:00" => "America/Phoenix".to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
+fn onvif_timezone_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match trimmed {
+        "UTC" => "UTC".to_string(),
+        "America/Phoenix" => "UTC+07:00:00".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn ntp_manual_entry(server: &str) -> String {
     let trimmed = server.trim();
     if trimmed.parse::<IpAddr>().is_ok() {
@@ -901,5 +913,13 @@ mod tests {
     fn ntp_manual_entry_uses_ipv4_or_dns() {
         assert!(ntp_manual_entry("192.168.250.1").contains("IPv4Address"));
         assert!(ntp_manual_entry("pool.ntp.org").contains("DNSname"));
+    }
+
+    #[test]
+    fn maps_phoenix_onvif_timezone_bidirectionally() {
+        assert_eq!(onvif_timezone_value("America/Phoenix"), "UTC+07:00:00");
+        assert_eq!(normalize_onvif_timezone("UTC+07:00:00"), "America/Phoenix");
+        assert_eq!(normalize_onvif_timezone("GMT+07:00:00"), "America/Phoenix");
+        assert_eq!(normalize_onvif_timezone("MST7"), "America/Phoenix");
     }
 }

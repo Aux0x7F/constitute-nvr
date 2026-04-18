@@ -815,8 +815,6 @@ mod tests {
             segment_secs: 10,
             desired: crate::config::CameraDesiredConfig {
                 display_name: "Front".to_string(),
-                ntp_server: "10.0.0.1".to_string(),
-                timezone: "UTC".to_string(),
                 overlay_text: "Front".to_string(),
                 overlay_timestamp: true,
                 ..Default::default()

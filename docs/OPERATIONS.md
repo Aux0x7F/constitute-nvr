@@ -26,6 +26,8 @@ Install flow notes:
 - auto-update timer is enabled by default (`constitute-nvr-update.timer`)
 - updater rolls back binary when restart/health validation fails
 - install bootstrap now provisions the dedicated camera NIC, selects a non-colliding `/24`, and binds `dnsmasq` DHCP on that NIC
+- camera bootstrap must also leave the host serving NTP on the camera NIC
+  - when chrony drop-ins are used, bootstrap now ensures the matching `confdir` line is present in `/etc/chrony.conf` so Fedora-class hosts actually load `/etc/chrony.d`
 - source-build/dev installs are expected to update through `constitute-nvr-update.timer`; in-process source updates are intentionally skipped
 
 ## 2) Service Checks
@@ -35,6 +37,8 @@ systemctl status constitute-nvr
 journalctl -u constitute-nvr -n 100 --no-pager
 systemctl status constitute-nvr-update.timer
 systemctl list-timers | grep constitute-nvr-update
+chronyd -p -f /etc/chrony.conf
+ss -ulpn | grep ':123 '
 ```
 
 ## Persistence Contract
@@ -58,6 +62,9 @@ Critical fields before ingest:
 - `camera_network.subnet_cidr`
 - `camera_network.host_ip`
 - `camera_network.dhcp_enabled`
+- `camera_network.ntp_enabled`
+- `camera_network.ntp_server`
+- `camera_network.timezone`
 - `autoprovision.reolink_*` (when auto-provision enabled)
 - `cameras[]`
 
@@ -79,6 +86,9 @@ constitute-nvr --probe-reolink-ip 192.168.1.20
 Notes:
 - Binding UDP/67 generally requires root or `CAP_NET_BIND_SERVICE`.
 - Current automation covers lease + vendor discovery + standards readiness checks.
+- After bootstrap, verify host NTP serving for the camera subnet:
+  - `chronyd -p -f /etc/chrony.conf` should include the camera-subnet `allow` / `local` directives
+  - `ss -ulpn | grep ':123 '` should show `chronyd` listening on UDP `123`
 - CGI setup path covers RTSP/ONVIF/P2P toggles when HTTP API is available; proprietary `9000` path remains fallback/R&D for HTTP-disabled devices.
 
 ## 6) Health Endpoint
@@ -89,7 +99,7 @@ curl -s http://127.0.0.1:8456/health | jq .
 
 Notes:
 - `/health` is intentionally redacted; camera credentials and raw credential-bearing RTSP URLs are never returned.
-- `cameraNetwork` should reflect the provisioned camera NIC and DHCP range.
+- `cameraNetwork` should reflect the provisioned camera NIC, DHCP range, and active site-time policy (`ntp_enabled`, `ntp_server`, `timezone`).
 
 ## 7) Camera Hardening Script
 Audit-only:

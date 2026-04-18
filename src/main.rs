@@ -486,8 +486,6 @@ async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<
                 segment_secs: 10,
                 desired: config::CameraDesiredConfig {
                     display_name: source_name.clone(),
-                    ntp_server: cfg.camera_network.ntp_server.clone(),
-                    timezone: "UTC".to_string(),
                     overlay_text: source_name.clone(),
                     overlay_timestamp: true,
                     ..Default::default()

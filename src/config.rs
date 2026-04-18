@@ -116,19 +116,22 @@ pub enum CameraTimeMode {
     Manual,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CameraHardeningConfig {
-    #[serde(default = "default_camera_hardening_enable_onvif")]
+    #[serde(default = "default_camera_hardening_enable_onvif", alias = "enableOnvif")]
     pub enable_onvif: bool,
-    #[serde(default = "default_camera_hardening_enable_rtsp")]
+    #[serde(default = "default_camera_hardening_enable_rtsp", alias = "enableRtsp")]
     pub enable_rtsp: bool,
-    #[serde(default = "default_camera_hardening_disable_p2p")]
+    #[serde(default = "default_camera_hardening_disable_p2p", alias = "disableP2p")]
     pub disable_p2p: bool,
-    #[serde(default = "default_camera_hardening_disable_http")]
+    #[serde(default = "default_camera_hardening_disable_http", alias = "disableHttp")]
     pub disable_http: bool,
-    #[serde(default = "default_camera_hardening_disable_https")]
+    #[serde(default = "default_camera_hardening_disable_https", alias = "disableHttps")]
     pub disable_https: bool,
-    #[serde(default = "default_camera_hardening_preserve_proprietary_9000")]
+    #[serde(
+        default = "default_camera_hardening_preserve_proprietary_9000",
+        alias = "preserveProprietary9000"
+    )]
     pub preserve_proprietary_9000: bool,
 }
 
@@ -147,23 +150,23 @@ impl Default for CameraHardeningConfig {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CameraDesiredConfig {
-    #[serde(default)]
+    #[serde(default, alias = "displayName")]
     pub display_name: String,
-    #[serde(default)]
+    #[serde(default, alias = "timeMode")]
     pub time_mode: CameraTimeMode,
-    #[serde(default)]
+    #[serde(default, alias = "ntpServer")]
     pub ntp_server: String,
-    #[serde(default)]
+    #[serde(default, alias = "manualTime")]
     pub manual_time: String,
     #[serde(default)]
     pub timezone: String,
-    #[serde(default)]
+    #[serde(default, alias = "overlayText")]
     pub overlay_text: String,
-    #[serde(default = "default_camera_overlay_timestamp")]
+    #[serde(default = "default_camera_overlay_timestamp", alias = "overlayTimestamp")]
     pub overlay_timestamp: bool,
-    #[serde(default)]
+    #[serde(default, alias = "desiredPassword")]
     pub desired_password: String,
-    #[serde(default)]
+    #[serde(default, alias = "generatePassword")]
     pub generate_password: bool,
     #[serde(default)]
     pub hardening: CameraHardeningConfig,
@@ -251,6 +254,8 @@ pub struct CameraNetworkConfig {
     pub ntp_enabled: bool,
     #[serde(default)]
     pub ntp_server: String,
+    #[serde(default = "default_camera_network_timezone", alias = "timeZone")]
+    pub timezone: String,
     #[serde(default)]
     pub dns_server: String,
     #[serde(default = "default_camera_network_lease_file")]
@@ -643,6 +648,18 @@ fn apply_camera_network_defaults(cfg: &mut CameraNetworkConfig) -> bool {
         cfg.lease_file = default_camera_network_lease_file();
         changed = true;
     }
+    match normalize_site_timezone_candidate(&cfg.timezone) {
+        Some(normalized) if normalized != cfg.timezone => {
+            cfg.timezone = normalized;
+            changed = true;
+        }
+        None if cfg.timezone.trim().is_empty() => {
+            cfg.timezone = default_camera_network_timezone();
+            changed = true;
+        }
+        None => {}
+        _ => {}
+    }
     if cfg.subnet_cidr.trim().is_empty() {
         return changed;
     }
@@ -687,6 +704,10 @@ fn default_camera_network_ntp_enabled() -> bool {
     true
 }
 
+fn default_camera_network_timezone() -> String {
+    detect_system_timezone().unwrap_or_else(|| "UTC".to_string())
+}
+
 fn default_camera_network_lease_file() -> String {
     "/var/lib/misc/dnsmasq.leases".to_string()
 }
@@ -708,7 +729,7 @@ fn apply_live_preview_defaults(cfg: &mut LivePreviewConfig) -> bool {
     changed
 }
 
-fn apply_camera_defaults(camera: &mut CameraConfig, network: &CameraNetworkConfig) -> bool {
+fn apply_camera_defaults(camera: &mut CameraConfig, _network: &CameraNetworkConfig) -> bool {
     let mut changed = false;
     if camera.driver_id.trim().is_empty() {
         camera.driver_id = if camera.source_id.trim().starts_with("reolink-") {
@@ -745,14 +766,6 @@ fn apply_camera_defaults(camera: &mut CameraConfig, network: &CameraNetworkConfi
         camera.desired.display_name = camera.name.trim().to_string();
         changed = true;
     }
-    if camera.desired.ntp_server.trim().is_empty() && !network.ntp_server.trim().is_empty() {
-        camera.desired.ntp_server = network.ntp_server.trim().to_string();
-        changed = true;
-    }
-    if camera.desired.timezone.trim().is_empty() {
-        camera.desired.timezone = "UTC".to_string();
-        changed = true;
-    }
     if camera.desired.overlay_text.trim().is_empty() && !camera.name.trim().is_empty() {
         camera.desired.overlay_text = camera.name.trim().to_string();
         changed = true;
@@ -766,6 +779,55 @@ fn apply_camera_defaults(camera: &mut CameraConfig, network: &CameraNetworkConfi
     }
     changed |= sync_camera_credential_state(camera);
     changed
+}
+
+fn detect_system_timezone() -> Option<String> {
+    detect_system_timezone_from_sources(
+        std::env::var("TZ").ok(),
+        fs::read_to_string("/etc/timezone").ok(),
+        fs::read_link("/etc/localtime")
+            .ok()
+            .map(|path| path.to_string_lossy().to_string()),
+    )
+}
+
+fn detect_system_timezone_from_sources(
+    env_tz: Option<String>,
+    etc_timezone: Option<String>,
+    localtime_link: Option<String>,
+) -> Option<String> {
+    for candidate in [env_tz, etc_timezone, localtime_link] {
+        if let Some(value) = candidate
+            && let Some(normalized) = normalize_site_timezone_candidate(&value)
+        {
+            return Some(normalized);
+        }
+    }
+    None
+}
+
+fn normalize_site_timezone_candidate(value: &str) -> Option<String> {
+    let trimmed = value
+        .trim()
+        .trim_matches(char::from(0))
+        .trim_start_matches(':')
+        .replace('\\', "/");
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed.split("zoneinfo/").nth(1) {
+        return normalize_site_timezone_candidate(rest);
+    }
+    if trimmed.eq_ignore_ascii_case("UTC") || trimmed.eq_ignore_ascii_case("Etc/UTC") {
+        return Some("UTC".to_string());
+    }
+    let valid = trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '-' | '+'));
+    if valid && trimmed.contains('/') {
+        return Some(trimmed);
+    }
+    None
 }
 
 fn infer_camera_model(camera: &CameraConfig) -> String {
@@ -1154,6 +1216,39 @@ mod tests {
     }
 
     #[test]
+    fn camera_desired_config_accepts_camel_case_api_fields() {
+        let desired: CameraDesiredConfig = serde_json::from_value(serde_json::json!({
+            "displayName": "Carport",
+            "timeMode": "ntp",
+            "ntpServer": "192.168.250.1",
+            "manualTime": "",
+            "timezone": "UTC",
+            "overlayText": "Carport",
+            "overlayTimestamp": true,
+            "desiredPassword": "secret",
+            "generatePassword": false,
+            "hardening": {
+                "enableOnvif": true,
+                "enableRtsp": true,
+                "disableP2p": true,
+                "disableHttp": false,
+                "disableHttps": false,
+                "preserveProprietary9000": true
+            }
+        }))
+        .expect("camera desired config");
+
+        assert_eq!(desired.display_name, "Carport");
+        assert_eq!(desired.ntp_server, "192.168.250.1");
+        assert_eq!(desired.overlay_text, "Carport");
+        assert!(desired.overlay_timestamp);
+        assert_eq!(desired.desired_password, "secret");
+        assert!(desired.hardening.enable_onvif);
+        assert!(desired.hardening.disable_p2p);
+        assert!(desired.hardening.preserve_proprietary_9000);
+    }
+
+    #[test]
     fn apply_defaults_derives_camera_network_ranges() {
         let mut cfg = Config::default_generated();
         cfg.camera_network.subnet_cidr = "192.168.250.0/24".to_string();
@@ -1164,6 +1259,42 @@ mod tests {
         assert_eq!(cfg.camera_network.host_ip, "192.168.250.1");
         assert_eq!(cfg.camera_network.dhcp_range_start, "192.168.250.50");
         assert_eq!(cfg.camera_network.dhcp_range_end, "192.168.250.199");
+    }
+
+    #[test]
+    fn apply_defaults_derives_camera_network_timezone_from_host_sources() {
+        assert_eq!(
+            detect_system_timezone_from_sources(
+                Some("America/Phoenix".to_string()),
+                None,
+                None,
+            ),
+            Some("America/Phoenix".to_string())
+        );
+        assert_eq!(
+            detect_system_timezone_from_sources(
+                None,
+                Some("America/Phoenix\n".to_string()),
+                None,
+            ),
+            Some("America/Phoenix".to_string())
+        );
+        assert_eq!(
+            detect_system_timezone_from_sources(
+                None,
+                None,
+                Some("/usr/share/zoneinfo/America/Phoenix".to_string()),
+            ),
+            Some("America/Phoenix".to_string())
+        );
+    }
+
+    #[test]
+    fn apply_defaults_falls_back_to_utc_when_timezone_cannot_be_detected() {
+        assert_eq!(
+            detect_system_timezone_from_sources(None, None, None),
+            None
+        );
     }
 
     #[test]
@@ -1367,7 +1498,6 @@ mod tests {
         assert_eq!(camera.vendor, "Reolink");
         assert_eq!(camera.model, "E1 Outdoor SE");
         assert!(camera.ptz_capable);
-        assert_eq!(camera.desired.ntp_server, "192.168.250.1");
         assert_eq!(camera.desired.overlay_text, "Reolink E1 Outdoor SE");
         assert_eq!(camera.desired.display_name, "Reolink E1 Outdoor SE");
     }

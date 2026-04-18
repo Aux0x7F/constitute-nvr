@@ -1,6 +1,6 @@
 use crate::camera;
 use crate::config::{
-    CameraConfig, CameraDesiredConfig, CameraTimeMode, Config, adopt_camera_active_password,
+    CameraConfig, CameraDesiredConfig, Config, adopt_camera_active_password,
     camera_credential_candidates, finalize_camera_password_rotation, mark_camera_rotation_failed,
     mark_camera_rotation_pending,
 };
@@ -8,6 +8,8 @@ use crate::onvif;
 use crate::reolink;
 use crate::reolink_cgi;
 use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone, Utc};
+use chrono_tz::Tz;
 use regex::Regex;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
@@ -25,6 +27,7 @@ const REOLINK_CGI_FALLBACK_MIN_PULSE_MS: u64 = 180;
 const REOLINK_CGI_FALLBACK_MAX_PULSE_MS: u64 = 1_200;
 const REOLINK_CGI_FALLBACK_SPEED: i32 = 32;
 const REOLINK_OBSERVED_STEP_MAX_ATTEMPTS: usize = 8;
+const CAMERA_TIME_MAX_DRIFT_SECS: i64 = 90;
 
 pub trait CameraDriver {
     fn match_candidate(&self, candidate: &DiscoveredCameraCandidate) -> Option<DriverMatch>;
@@ -58,8 +61,16 @@ pub struct CameraNetworkSummary {
     pub dhcp_range_end: String,
     pub ntp_enabled: bool,
     pub ntp_server: String,
+    pub timezone: String,
     pub dns_server: String,
     pub lease_file: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SiteTimePolicy {
+    ntp_enabled: bool,
+    ntp_server: String,
+    timezone: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -292,7 +303,7 @@ impl CameraDriver for ReolinkDriver {
             live_view: true,
             ptz: camera.ptz_capable,
             time_sync: true,
-            manual_time: true,
+            manual_time: false,
             timezone: true,
             overlay_text: true,
             overlay_timestamp: true,
@@ -349,15 +360,104 @@ pub fn camera_network_summary(cfg: &Config) -> CameraNetworkSummary {
         dhcp_range_end: cfg.camera_network.dhcp_range_end.clone(),
         ntp_enabled: cfg.camera_network.ntp_enabled,
         ntp_server: cfg.camera_network.ntp_server.clone(),
+        timezone: cfg.camera_network.timezone.clone(),
         dns_server: cfg.camera_network.dns_server.clone(),
         lease_file: cfg.camera_network.lease_file.clone(),
     }
 }
 
+fn site_time_policy(cfg: &Config) -> SiteTimePolicy {
+    SiteTimePolicy {
+        ntp_enabled: cfg.camera_network.ntp_enabled,
+        ntp_server: cfg.camera_network.ntp_server.trim().to_string(),
+        timezone: first_nonempty(&cfg.camera_network.timezone, "UTC"),
+    }
+}
+
+fn observed_site_time_offset_secs(
+    site_timezone: &str,
+    observed_manual_time: &str,
+    now_utc: DateTime<Utc>,
+) -> Option<i64> {
+    let tz: Tz = site_timezone.trim().parse().ok()?;
+    let naive = NaiveDateTime::parse_from_str(observed_manual_time.trim(), "%Y-%m-%dT%H:%M:%S")
+        .ok()?;
+    let local = match tz.from_local_datetime(&naive) {
+        LocalResult::Single(value) => value,
+        LocalResult::Ambiguous(first, _) => first,
+        LocalResult::None => return None,
+    };
+    Some((local.with_timezone(&Utc) - now_utc).num_seconds().abs())
+}
+
+fn site_local_time_string(site_timezone: &str, now_utc: DateTime<Utc>) -> Option<String> {
+    let tz: Tz = site_timezone.trim().parse().ok()?;
+    Some(
+        now_utc
+            .with_timezone(&tz)
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string(),
+    )
+}
+
+fn to_onvif_site_time_policy(policy: &SiteTimePolicy) -> onvif::OnvifSiteTimePolicy {
+    onvif::OnvifSiteTimePolicy {
+        ntp_enabled: policy.ntp_enabled,
+        ntp_server: policy.ntp_server.clone(),
+        timezone: policy.timezone.clone(),
+    }
+}
+
+fn reolink_observed_time_mode(
+    onvif_state: Option<&onvif::OnvifState>,
+    presentation: &reolink_cgi::ReolinkPresentationState,
+) -> String {
+    onvif_state
+        .map(|state| state.time_mode.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| presentation.time_mode.clone())
+}
+
+fn reolink_observed_ntp_server(
+    onvif_state: Option<&onvif::OnvifState>,
+    presentation: &reolink_cgi::ReolinkPresentationState,
+) -> String {
+    onvif_state
+        .map(|state| state.ntp_server.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| presentation.ntp_server.clone())
+}
+
+fn reolink_observed_manual_time(
+    onvif_state: Option<&onvif::OnvifState>,
+    presentation: &reolink_cgi::ReolinkPresentationState,
+) -> String {
+    if !presentation.manual_time.trim().is_empty() {
+        return presentation.manual_time.clone();
+    }
+    onvif_state
+        .map(|state| state.manual_time.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_default()
+}
+
+fn reolink_observed_timezone(
+    onvif_state: Option<&onvif::OnvifState>,
+    presentation: &reolink_cgi::ReolinkPresentationState,
+) -> String {
+    if !presentation.timezone.trim().is_empty() {
+        return presentation.timezone.clone();
+    }
+    onvif_state
+        .map(|state| state.timezone.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_default()
+}
+
 pub async fn list_inventory(cfg: &Config) -> Result<CameraInventory> {
     let mut mounted = Vec::with_capacity(cfg.cameras.len());
     for camera in &cfg.cameras {
-        mounted.push(read_mounted_camera(camera).await);
+        mounted.push(read_mounted_camera(cfg, camera).await);
     }
     Ok(CameraInventory {
         mounted,
@@ -471,8 +571,6 @@ pub async fn mount_candidate(
         segment_secs: 10,
         desired: CameraDesiredConfig {
             display_name: display_name.clone(),
-            ntp_server: cfg.camera_network.ntp_server.clone(),
-            timezone: "UTC".to_string(),
             overlay_text: display_name.clone(),
             overlay_timestamp: true,
             desired_password: request.desired_password.trim().to_string(),
@@ -485,7 +583,7 @@ pub async fn mount_candidate(
     camera = apply_driver_mount(cfg, &camera).await?;
     Ok(CameraMountResult {
         configured: camera.clone(),
-        mounted: read_mounted_camera(&camera).await,
+        mounted: read_mounted_camera(cfg, &camera).await,
     })
 }
 
@@ -501,15 +599,59 @@ pub async fn apply_mounted_camera(
         .ok_or_else(|| anyhow!("camera source is not configured"))?;
     let mut next = existing.clone();
     next.desired = request.desired.clone();
-    if !request.desired.display_name.trim().is_empty() {
-        next.name = request.desired.display_name.trim().to_string();
-    }
+    sync_display_name_and_linked_overlay(&existing, &mut next);
     normalize_camera_defaults(cfg, &mut next);
+    let requested_fields = requested_apply_fields(&existing, &next);
     next = apply_driver_desired(cfg, &existing, &next).await?;
+    let mounted = read_mounted_camera(cfg, &next).await;
+    let verification_failures =
+        requested_verification_failures(&mounted.verification, &requested_fields);
+    if !verification_failures.is_empty() {
+        let requested_name = next.desired.display_name.trim();
+        let observed_name = mounted.observed.display_name.trim();
+        let detail = if verification_failures.iter().any(|field| field == "display_name")
+            && !requested_name.is_empty()
+        {
+            format!(
+                "requested camera name {:?}, observed {:?}",
+                requested_name,
+                if observed_name.is_empty() {
+                    "<empty>"
+                } else {
+                    observed_name
+                }
+            )
+        } else {
+            mounted.verification.message.clone()
+        };
+        return Err(anyhow!(
+            "camera apply did not verify requested field(s): {} ({})",
+            verification_failures.join(", "),
+            detail
+        ));
+    }
     Ok(CameraApplyResult {
         configured: next.clone(),
-        mounted: read_mounted_camera(&next).await,
+        mounted,
     })
+}
+
+fn sync_display_name_and_linked_overlay(existing: &CameraConfig, next: &mut CameraConfig) {
+    let requested_display_name = next.desired.display_name.trim();
+    if requested_display_name.is_empty() {
+        return;
+    }
+    let previous_display_name = camera_display_name(existing);
+    let requested_overlay_text = next.desired.overlay_text.trim();
+    next.name = requested_display_name.to_string();
+    // Treat overlay text as linked to the display name unless the operator
+    // has explicitly diverged it to a different value.
+    if requested_overlay_text.is_empty()
+        || (!previous_display_name.trim().is_empty()
+            && requested_overlay_text == previous_display_name.trim())
+    {
+        next.desired.overlay_text = requested_display_name.to_string();
+    }
 }
 
 pub async fn read_camera(cfg: &Config, source_id: &str) -> Result<MountedCamera> {
@@ -519,7 +661,7 @@ pub async fn read_camera(cfg: &Config, source_id: &str) -> Result<MountedCamera>
         .find(|camera| camera.source_id.trim() == source_id.trim())
         .cloned()
         .ok_or_else(|| anyhow!("camera source is not configured"))?;
-    Ok(read_mounted_camera(&camera).await)
+    Ok(read_mounted_camera(cfg, &camera).await)
 }
 
 pub async fn control_mounted_camera(
@@ -1383,13 +1525,13 @@ async fn control_reolink_cgi_fallback(
     })
 }
 
-pub async fn read_mounted_camera(camera: &CameraConfig) -> MountedCamera {
+pub async fn read_mounted_camera(cfg: &Config, camera: &CameraConfig) -> MountedCamera {
     let base_capabilities = driver_capabilities(camera);
     match read_observed_state(camera).await {
         Ok(observed) => {
             let capabilities =
                 capabilities_for_observed(camera, base_capabilities.clone(), &observed);
-            let display_name = first_nonempty(&camera_display_name(camera), &observed.display_name);
+            let display_name = first_nonempty(&observed.display_name, &camera_display_name(camera));
             let vendor = first_nonempty(&camera.vendor, &observed.vendor);
             let model = first_nonempty(&camera.model, &observed.model);
             MountedCamera {
@@ -1409,6 +1551,7 @@ pub async fn read_mounted_camera(camera: &CameraConfig) -> MountedCamera {
                 desired_pose: observed.current_pose.clone(),
                 pose_status: observed.pose_status.clone(),
                 verification: verification_for_observed(
+                    cfg,
                     camera,
                     &observed,
                     &capabilities,
@@ -1421,7 +1564,7 @@ pub async fn read_mounted_camera(camera: &CameraConfig) -> MountedCamera {
             let observed = fallback_observed_state(camera).await;
             let capabilities =
                 capabilities_for_observed(camera, base_capabilities.clone(), &observed);
-            let display_name = first_nonempty(&camera_display_name(camera), &observed.display_name);
+            let display_name = first_nonempty(&observed.display_name, &camera_display_name(camera));
             let vendor = first_nonempty(&camera.vendor, &observed.vendor);
             let model = first_nonempty(&camera.model, &observed.model);
             MountedCamera {
@@ -1445,7 +1588,7 @@ pub async fn read_mounted_camera(camera: &CameraConfig) -> MountedCamera {
                     status: "failed".to_string(),
                     message: error.to_string(),
                     failed_fields: vec!["read_state".to_string()],
-                    unsupported_fields: unsupported_fields(camera, &capabilities),
+                    unsupported_fields: unsupported_fields(cfg, camera, &capabilities),
                     ..Default::default()
                 },
             }
@@ -1489,6 +1632,8 @@ fn capabilities_for_observed(
 ) -> CameraCapabilitySet {
     if camera.driver_id.trim() == DRIVER_ID_REOLINK {
         capabilities = reolink_runtime_capabilities(capabilities, observed);
+    } else if camera.driver_id.trim() == DRIVER_ID_GENERIC_ONVIF_RTSP {
+        capabilities = generic_onvif_runtime_capabilities(capabilities, observed);
     }
     if observed.ptz_capable {
         capabilities.ptz = true;
@@ -1501,15 +1646,25 @@ fn reolink_runtime_capabilities(
     observed: &ObservedCameraState,
 ) -> CameraCapabilitySet {
     match observed_management_plane(observed).as_deref() {
-        Some("onvif") => {
+        Some("hybrid") | Some("onvif") => {
             capabilities.time_sync = true;
-            let bridge_capable = reolink_onvif_bridge_capable(observed);
-            capabilities.manual_time = bridge_capable;
-            capabilities.timezone = bridge_capable;
-            capabilities.overlay_text = bridge_capable;
-            capabilities.overlay_timestamp = bridge_capable;
-            capabilities.password_rotate = bridge_capable;
-            capabilities.hardening_profile = bridge_capable;
+            capabilities.manual_time = false;
+            capabilities.timezone = true;
+            capabilities.overlay_text = true;
+            capabilities.overlay_timestamp = true;
+            capabilities.password_rotate = true;
+            capabilities.hardening_profile = true;
+            capabilities.raw_probe = true;
+            capabilities.ptz = observed.ptz_capable;
+        }
+        Some("cgi") => {
+            capabilities.time_sync = false;
+            capabilities.manual_time = false;
+            capabilities.timezone = false;
+            capabilities.overlay_text = true;
+            capabilities.overlay_timestamp = true;
+            capabilities.password_rotate = true;
+            capabilities.hardening_profile = true;
             capabilities.raw_probe = true;
             capabilities.ptz = observed.ptz_capable;
         }
@@ -1529,6 +1684,29 @@ fn reolink_runtime_capabilities(
     capabilities
 }
 
+fn generic_onvif_runtime_capabilities(
+    mut capabilities: CameraCapabilitySet,
+    observed: &ObservedCameraState,
+) -> CameraCapabilitySet {
+    match observed_management_plane(observed).as_deref() {
+        Some("onvif") => {
+            capabilities.time_sync = true;
+            capabilities.manual_time = false;
+            capabilities.timezone = true;
+            capabilities.raw_probe = true;
+        }
+        Some("transport_only") | Some("unreachable") => {
+            capabilities.time_sync = false;
+            capabilities.manual_time = false;
+            capabilities.timezone = false;
+            capabilities.ptz = false;
+            capabilities.raw_probe = true;
+        }
+        _ => {}
+    }
+    capabilities
+}
+
 fn observed_management_plane(observed: &ObservedCameraState) -> Option<String> {
     observed
         .raw
@@ -1536,15 +1714,6 @@ fn observed_management_plane(observed: &ObservedCameraState) -> Option<String> {
         .and_then(Value::as_str)
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
-}
-
-fn reolink_onvif_bridge_capable(observed: &ObservedCameraState) -> bool {
-    observed
-        .raw
-        .get("onvif")
-        .and_then(|value| value.get("networkProtocolsSupported"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
 }
 
 async fn apply_driver_mount(cfg: &Config, camera: &CameraConfig) -> Result<CameraConfig> {
@@ -1561,8 +1730,25 @@ async fn apply_driver_desired(
 ) -> Result<CameraConfig> {
     match next.driver_id.trim() {
         DRIVER_ID_REOLINK => apply_reolink_desired(cfg, existing, next).await,
+        DRIVER_ID_GENERIC_ONVIF_RTSP => apply_generic_onvif_desired(cfg, next).await,
         _ => Ok(next.clone()),
     }
+}
+
+async fn apply_generic_onvif_desired(cfg: &Config, next: &CameraConfig) -> Result<CameraConfig> {
+    let policy = site_time_policy(cfg);
+    if !policy.ntp_enabled {
+        return Ok(next.clone());
+    }
+    let _ = onvif::apply_site_time_settings(
+        &next.onvif_host,
+        next.onvif_port.max(1),
+        &next.username,
+        &next.password,
+        &to_onvif_site_time_policy(&policy),
+    )
+    .await;
+    Ok(next.clone())
 }
 
 async fn apply_reolink_desired(
@@ -1585,7 +1771,7 @@ async fn apply_reolink_desired(
             existing,
             next,
             ports.onvif && next.desired.hardening.enable_onvif,
-            !ports.onvif,
+            ports.onvif && next.desired.hardening.enable_onvif,
         )
         .await;
     }
@@ -1608,8 +1794,6 @@ fn reolink_desired_requires_cgi(existing: &CameraConfig, next: &CameraConfig) ->
         || !desired.desired_password.trim().is_empty()
         || desired.overlay_text != current.overlay_text
         || desired.overlay_timestamp != current.overlay_timestamp
-        || desired.timezone != current.timezone
-        || desired.manual_time != current.manual_time
         || desired.hardening.enable_onvif != current.hardening.enable_onvif
         || desired.hardening.enable_rtsp != current.hardening.enable_rtsp
         || desired.hardening.disable_p2p != current.hardening.disable_p2p
@@ -1626,7 +1810,7 @@ async fn apply_reolink_onvif_bridge_desired(
 ) -> Result<CameraConfig> {
     let _ = apply_reolink_onvif_desired(cfg, existing, next).await?;
     ensure_reolink_cgi_lane_via_onvif(existing).await?;
-    apply_reolink_cgi_desired(cfg, existing, next, true, false).await
+    apply_reolink_cgi_desired(cfg, existing, next, true, true).await
 }
 
 async fn apply_reolink_cgi_desired(
@@ -1634,7 +1818,7 @@ async fn apply_reolink_cgi_desired(
     existing: &CameraConfig,
     next: &CameraConfig,
     allow_onvif_only_final_state: bool,
-    apply_time_via_cgi: bool,
+    apply_site_time_via_onvif: bool,
 ) -> Result<CameraConfig> {
     let desired = &next.desired;
     let final_cgi_disabled = desired.hardening.disable_http && desired.hardening.disable_https;
@@ -1742,33 +1926,42 @@ async fn apply_reolink_cgi_desired(
         );
     }
 
-    if let Err(error) =
-        reolink_cgi::apply_presentation_state(&reolink_cgi::ReolinkPresentationApplyRequest {
-            connection: active_connection.clone(),
-            time_mode: apply_time_via_cgi.then(|| time_mode_label(&desired.time_mode).to_string()),
-            ntp_server: if apply_time_via_cgi {
-                nonempty_option(&first_nonempty(
-                    &desired.ntp_server,
-                    &cfg.camera_network.ntp_server,
-                ))
-            } else {
-                None
-            },
-            manual_time: if apply_time_via_cgi {
-                nonempty_option(&desired.manual_time)
-            } else {
-                None
-            },
-            timezone: if apply_time_via_cgi {
-                nonempty_option(&desired.timezone)
-            } else {
-                None
-            },
-            overlay_text: nonempty_option(&desired.overlay_text),
-            overlay_timestamp: Some(desired.overlay_timestamp),
-        })
+    let site_time = site_time_policy(cfg);
+    if apply_site_time_via_onvif && site_time.ntp_enabled {
+        if let Err(error) = onvif::apply_site_time_settings(
+            &next.onvif_host,
+            next.onvif_port.max(1),
+            &next.username,
+            &active_password,
+            &to_onvif_site_time_policy(&site_time),
+        )
         .await
-    {
+        {
+            let suffix = format!("failed applying site time policy through ONVIF: {error}");
+            updated.credentials.last_rotation_error =
+                if updated.credentials.last_rotation_error.trim().is_empty() {
+                    suffix
+                } else {
+                    format!("{}; {}", updated.credentials.last_rotation_error, suffix)
+                };
+        }
+    }
+
+    if let Err(error) = reolink_cgi::apply_presentation_state(&reolink_cgi::ReolinkPresentationApplyRequest {
+        connection: active_connection.clone(),
+        // Reolink keeps the feed-facing clock presentation in CGI. Apply the
+        // feed-facing fields on that lane and seed the current site-local wall
+        // clock so the baked timestamp converges immediately instead of waiting
+        // for the camera's next NTP poll. NTP mode/server remain ONVIF-owned.
+        time_mode: None,
+        ntp_server: None,
+        manual_time: site_local_time_string(&site_time.timezone, Utc::now()),
+        timezone: nonempty_option(&site_time.timezone),
+        enforce_clock_display: true,
+        overlay_text: nonempty_option(&desired.overlay_text),
+        overlay_timestamp: Some(desired.overlay_timestamp),
+    })
+    .await {
         let suffix = format!("failed applying presentation state: {error}");
         updated.credentials.last_rotation_error =
             if updated.credentials.last_rotation_error.trim().is_empty() {
@@ -1844,17 +2037,14 @@ async fn apply_reolink_onvif_desired(
     existing: &CameraConfig,
     next: &CameraConfig,
 ) -> Result<CameraConfig> {
-    let desired = &next.desired;
     let mut updated = next.clone();
-    let ntp_server = first_nonempty(&desired.ntp_server, &cfg.camera_network.ntp_server);
-    let mut normalized_desired = desired.clone();
-    normalized_desired.ntp_server = ntp_server;
-    onvif::apply_time_settings(
+    let site_time = site_time_policy(cfg);
+    onvif::apply_site_time_settings(
         &next.onvif_host,
         next.onvif_port.max(1),
         &next.username,
         &existing.password,
-        &normalized_desired,
+        &to_onvif_site_time_policy(&site_time),
     )
     .await?;
     adopt_camera_active_password(
@@ -2063,33 +2253,54 @@ async fn read_reolink_observed_state(camera: &CameraConfig) -> Result<ObservedCa
             let presentation = reolink_cgi::read_presentation_state(&connection)
                 .await
                 .unwrap_or_default();
+            let onvif_state = if ports.onvif {
+                onvif::read_state(
+                    &camera.onvif_host,
+                    camera.onvif_port.max(1),
+                    &camera.username,
+                    &connection.password,
+                )
+                .await
+                .ok()
+            } else {
+                None
+            };
             let ptz_capable = reolink_ptz_capable(camera, &probe, &presentation);
             let native_ptz = if probe.proprietary_port_open {
                 try_reolink_native_ptz_observation(camera, &[connection.password.clone()]).await
             } else {
                 None
             };
+            let management_plane = if onvif_state.is_some() {
+                "hybrid"
+            } else {
+                "cgi"
+            };
             return Ok(ObservedCameraState {
-                display_name: camera_display_name(camera),
+                display_name: presentation.overlay_text.trim().to_string(),
                 driver_id: camera.driver_id.clone(),
-                vendor: first_nonempty(&camera.vendor, "Reolink"),
-                model: first_nonempty(&camera.model, &presentation.model),
+                vendor: first_nonempty(
+                    &camera.vendor,
+                    &onvif_state
+                        .as_ref()
+                        .map(|state| first_nonempty(&state.manufacturer, "Reolink"))
+                        .unwrap_or_else(|| "Reolink".to_string()),
+                ),
+                model: first_nonempty(
+                    &camera.model,
+                    &onvif_state
+                        .as_ref()
+                        .map(|state| first_nonempty(&state.model, &presentation.model))
+                        .unwrap_or_else(|| presentation.model.clone()),
+                ),
                 ip: camera.onvif_host.clone(),
                 mac_address: camera.mac_address.clone(),
-                time_mode: first_nonempty(
-                    &presentation.time_mode,
-                    time_mode_label(&camera.desired.time_mode),
-                ),
-                ntp_server: first_nonempty(&presentation.ntp_server, &camera.desired.ntp_server),
-                manual_time: first_nonempty(&presentation.manual_time, &camera.desired.manual_time),
-                timezone: first_nonempty(&presentation.timezone, &camera.desired.timezone),
-                overlay_text: first_nonempty(
-                    &presentation.overlay_text,
-                    &camera.desired.overlay_text,
-                ),
-                overlay_timestamp: presentation
-                    .overlay_timestamp
-                    .or(Some(camera.desired.overlay_timestamp)),
+                time_mode: reolink_observed_time_mode(onvif_state.as_ref(), &presentation),
+                ntp_server: reolink_observed_ntp_server(onvif_state.as_ref(), &presentation),
+                manual_time: reolink_observed_manual_time(onvif_state.as_ref(), &presentation),
+                timezone: reolink_observed_timezone(onvif_state.as_ref(), &presentation),
+                overlay_text: presentation.overlay_text.clone(),
+                overlay_timestamp: presentation.overlay_timestamp,
                 ptz_capable,
                 current_pose: native_ptz
                     .as_ref()
@@ -2106,7 +2317,11 @@ async fn read_reolink_observed_state(camera: &CameraConfig) -> Result<ObservedCa
                     "cgi".to_string()
                 },
                 services: json!({
-                    "managementPlane": "cgi",
+                    "managementPlane": management_plane,
+                    "timeManagementPlane": if onvif_state.is_some() { "hybrid" } else { "cgi" },
+                    "normalizedTimeManagementPlane": if onvif_state.is_some() { "onvif" } else { "cgi" },
+                    "feedClockManagementPlane": "cgi",
+                    "presentationManagementPlane": "cgi",
                     "ptzManagementPlane": if native_ptz.is_some() { "reolink_native_absolute" } else { "cgi" },
                     "http": state.state.normal.get("iHttpPortEnable").cloned().unwrap_or(json!(0)),
                     "https": state.state.normal.get("iHttpsPortEnable").cloned().unwrap_or(json!(0)),
@@ -2115,12 +2330,15 @@ async fn read_reolink_observed_state(camera: &CameraConfig) -> Result<ObservedCa
                     "p2p": state.state.p2p.get("iEnable").cloned().unwrap_or(json!(0)),
                     "proprietary9000": probe.proprietary_port_open,
                     "onvifXAddr": probe.onvif_xaddr,
+                    "networkProtocols": onvif_state.as_ref().map(|state| state.network_protocols.clone()).unwrap_or_default(),
+                    "networkProtocolsSupported": onvif_state.as_ref().map(|state| state.network_protocols_writable).unwrap_or(false),
                 }),
                 raw: json!({
-                    "managementPlane": "cgi",
+                    "managementPlane": management_plane,
                     "probe": probe,
                     "state": state.state,
                     "presentation": presentation,
+                    "onvif": onvif_state.as_ref().map(|state| state.raw.clone()),
                     "nativePtz": native_ptz.as_ref().map(reolink_native_ptz_json),
                 }),
             });
@@ -2152,8 +2370,16 @@ async fn read_reolink_observed_state(camera: &CameraConfig) -> Result<ObservedCa
             } else {
                 None
             };
+            let management_plane = if !presentation.overlay_text.trim().is_empty()
+                || presentation.overlay_timestamp.is_some()
+                || !presentation.clock_date_format.trim().is_empty()
+            {
+                "hybrid"
+            } else {
+                "onvif"
+            };
             return Ok(ObservedCameraState {
-                display_name: camera_display_name(camera),
+                display_name: presentation.overlay_text.trim().to_string(),
                 driver_id: camera.driver_id.clone(),
                 vendor: first_nonempty(
                     &camera.vendor,
@@ -2162,26 +2388,11 @@ async fn read_reolink_observed_state(camera: &CameraConfig) -> Result<ObservedCa
                 model: first_nonempty(&camera.model, &onvif_state.model),
                 ip: camera.onvif_host.clone(),
                 mac_address: camera.mac_address.clone(),
-                time_mode: first_nonempty(
-                    &onvif_state.time_mode,
-                    &first_nonempty(
-                        &presentation.time_mode,
-                        time_mode_label(&camera.desired.time_mode),
-                    ),
-                ),
-                ntp_server: first_nonempty(&onvif_state.ntp_server, &camera.desired.ntp_server),
-                manual_time: first_nonempty(
-                    &onvif_state.manual_time,
-                    &first_nonempty(&presentation.manual_time, &camera.desired.manual_time),
-                ),
-                timezone: first_nonempty(
-                    &onvif_state.timezone,
-                    &first_nonempty(&presentation.timezone, &camera.desired.timezone),
-                ),
-                overlay_text: first_nonempty(
-                    &presentation.overlay_text,
-                    &camera.desired.overlay_text,
-                ),
+                time_mode: reolink_observed_time_mode(Some(&onvif_state), &presentation),
+                ntp_server: reolink_observed_ntp_server(Some(&onvif_state), &presentation),
+                manual_time: reolink_observed_manual_time(Some(&onvif_state), &presentation),
+                timezone: reolink_observed_timezone(Some(&onvif_state), &presentation),
+                overlay_text: presentation.overlay_text.clone(),
                 overlay_timestamp: presentation.overlay_timestamp,
                 ptz_capable,
                 current_pose: native_ptz
@@ -2203,7 +2414,11 @@ async fn read_reolink_observed_state(camera: &CameraConfig) -> Result<ObservedCa
                     "onvif".to_string()
                 },
                 services: json!({
-                    "managementPlane": "onvif",
+                    "managementPlane": management_plane,
+                    "timeManagementPlane": if management_plane == "hybrid" { "hybrid" } else { "onvif" },
+                    "normalizedTimeManagementPlane": "onvif",
+                    "feedClockManagementPlane": if management_plane == "hybrid" { "cgi" } else { "onvif" },
+                    "presentationManagementPlane": if management_plane == "hybrid" { "cgi" } else { "onvif" },
                     "ptzManagementPlane": if native_ptz.is_some() { "reolink_native_absolute" } else { "onvif" },
                     "http": ports.http,
                     "https": ports.https,
@@ -2218,7 +2433,7 @@ async fn read_reolink_observed_state(camera: &CameraConfig) -> Result<ObservedCa
                     "networkProtocolsSupported": onvif_state.network_protocols_writable,
                 }),
                 raw: json!({
-                    "managementPlane": "onvif",
+                    "managementPlane": management_plane,
                     "probe": probe,
                     "onvif": onvif_state.raw,
                     "presentation": presentation,
@@ -2347,16 +2562,19 @@ async fn probe_reolink_candidate(
                 "vendor": first_nonempty(&candidate.signatures.vendor, &first_nonempty(&onvif_state.manufacturer, "Reolink")),
                 "model": first_nonempty(&onvif_state.model, &candidate.signatures.model),
                 "ip": candidate.ip,
-                "timeMode": onvif_state.time_mode,
-                "ntpServer": onvif_state.ntp_server,
+                "timeMode": reolink_observed_time_mode(Some(&onvif_state), &presentation),
+                "ntpServer": reolink_observed_ntp_server(Some(&onvif_state), &presentation),
                 "manualTime": first_nonempty(&onvif_state.manual_time, &presentation.manual_time),
-                "timezone": first_nonempty(&onvif_state.timezone, &presentation.timezone),
+                "timezone": reolink_observed_timezone(Some(&onvif_state), &presentation),
                 "overlayText": presentation.overlay_text,
                 "overlayTimestamp": presentation.overlay_timestamp,
                 "ptzCapable": ptz_capable,
             },
             "services": {
                 "managementPlane": "onvif",
+                "timeManagementPlane": if presentation.timezone.trim().is_empty() { "onvif" } else { "hybrid" },
+                "normalizedTimeManagementPlane": "onvif",
+                "feedClockManagementPlane": if presentation.timezone.trim().is_empty() { "onvif" } else { "cgi" },
                 "http": ports.http,
                 "https": ports.https,
                 "onvif": ports.onvif,
@@ -2385,6 +2603,53 @@ async fn probe_reolink_candidate(
 
 async fn read_generic_observed_state(camera: &CameraConfig) -> Result<ObservedCameraState> {
     let ports = probe_common_ports(&camera.onvif_host).await;
+    if ports.onvif {
+        if let Ok(onvif_state) = onvif::read_state(
+            &camera.onvif_host,
+            camera.onvif_port.max(1),
+            &camera.username,
+            &camera.password,
+        )
+        .await
+        {
+            return Ok(ObservedCameraState {
+                display_name: camera_display_name(camera),
+                driver_id: camera.driver_id.clone(),
+                vendor: first_nonempty(&camera.vendor, &onvif_state.manufacturer),
+                model: first_nonempty(&camera.model, &onvif_state.model),
+                ip: camera.onvif_host.clone(),
+                mac_address: camera.mac_address.clone(),
+                time_mode: onvif_state.time_mode.clone(),
+                ntp_server: onvif_state.ntp_server.clone(),
+                manual_time: onvif_state.manual_time.clone(),
+                timezone: onvif_state.timezone.clone(),
+                overlay_text: camera.desired.overlay_text.clone(),
+                overlay_timestamp: Some(camera.desired.overlay_timestamp),
+                ptz_capable: camera.ptz_capable || onvif_state.ptz_capable,
+                current_pose: CameraPose {
+                    pan: onvif_state.current_pose.as_ref().and_then(|pose| pose.pan),
+                    tilt: onvif_state.current_pose.as_ref().and_then(|pose| pose.tilt),
+                    zoom: onvif_state.current_pose.as_ref().and_then(|pose| pose.zoom),
+                },
+                pose_status: onvif_state.pose_status.clone(),
+                pose_source: "onvif".to_string(),
+                services: json!({
+                    "managementPlane": "onvif",
+                    "http": ports.http,
+                    "https": ports.https,
+                    "rtsp": ports.rtsp,
+                    "onvif": ports.onvif,
+                    "proprietary9000": ports.proprietary_9000,
+                    "mediaService": onvif_state.media_service_url,
+                    "ptzService": onvif_state.ptz_service_url,
+                }),
+                raw: json!({
+                    "managementPlane": "onvif",
+                    "onvif": onvif_state.raw,
+                }),
+            });
+        }
+    }
     Ok(ObservedCameraState {
         display_name: camera_display_name(camera),
         driver_id: camera.driver_id.clone(),
@@ -2392,10 +2657,10 @@ async fn read_generic_observed_state(camera: &CameraConfig) -> Result<ObservedCa
         model: camera.model.clone(),
         ip: camera.onvif_host.clone(),
         mac_address: camera.mac_address.clone(),
-        time_mode: time_mode_label(&camera.desired.time_mode).to_string(),
-        ntp_server: camera.desired.ntp_server.clone(),
-        manual_time: camera.desired.manual_time.clone(),
-        timezone: camera.desired.timezone.clone(),
+        time_mode: String::new(),
+        ntp_server: String::new(),
+        manual_time: String::new(),
+        timezone: String::new(),
         overlay_text: camera.desired.overlay_text.clone(),
         overlay_timestamp: Some(camera.desired.overlay_timestamp),
         ptz_capable: camera.ptz_capable,
@@ -2403,13 +2668,16 @@ async fn read_generic_observed_state(camera: &CameraConfig) -> Result<ObservedCa
         pose_status: String::new(),
         pose_source: String::new(),
         services: json!({
+            "managementPlane": if ports.onvif { "transport_only" } else { "unreachable" },
             "http": ports.http,
             "https": ports.https,
             "rtsp": ports.rtsp,
             "onvif": ports.onvif,
             "proprietary9000": ports.proprietary_9000,
         }),
-        raw: json!({}),
+        raw: json!({
+            "managementPlane": if ports.onvif { "transport_only" } else { "unreachable" },
+        }),
     })
 }
 
@@ -2447,21 +2715,29 @@ async fn fallback_observed_state(camera: &CameraConfig) -> ObservedCameraState {
 }
 
 fn verification_for_observed(
+    cfg: &Config,
     camera: &CameraConfig,
     observed: &ObservedCameraState,
     capabilities: &CameraCapabilitySet,
     failed_fields: Vec<String>,
 ) -> CameraReconcileResult {
+    let site_time = site_time_policy(cfg);
     let mut drift_fields = Vec::new();
+    if !camera.desired.display_name.trim().is_empty()
+        && camera.desired.display_name.trim() != observed.display_name.trim()
+    {
+        drift_fields.push("display_name".to_string());
+    }
     if capabilities.time_sync
-        && observed.time_mode.trim() != time_mode_label(&camera.desired.time_mode)
+        && site_time.ntp_enabled
+        && observed.time_mode.trim() != "ntp"
     {
         drift_fields.push("time_mode".to_string());
     }
     if capabilities.time_sync
-        && !camera.desired.ntp_server.trim().is_empty()
-        && !camera
-            .desired
+        && site_time.ntp_enabled
+        && !site_time.ntp_server.trim().is_empty()
+        && !site_time
             .ntp_server
             .trim()
             .eq_ignore_ascii_case(observed.ntp_server.trim())
@@ -2469,10 +2745,24 @@ fn verification_for_observed(
         drift_fields.push("ntp_server".to_string());
     }
     if capabilities.timezone
-        && !camera.desired.timezone.trim().is_empty()
-        && camera.desired.timezone.trim() != observed.timezone.trim()
+        && site_time.ntp_enabled
+        && !site_time.timezone.trim().is_empty()
+        && site_time.timezone.trim() != observed.timezone.trim()
     {
         drift_fields.push("timezone".to_string());
+    }
+    if capabilities.time_sync
+        && site_time.ntp_enabled
+        && !site_time.timezone.trim().is_empty()
+        && !observed.manual_time.trim().is_empty()
+        && observed_site_time_offset_secs(
+            &site_time.timezone,
+            &observed.manual_time,
+            Utc::now(),
+        )
+        .is_some_and(|offset| offset > CAMERA_TIME_MAX_DRIFT_SECS)
+    {
+        drift_fields.push("time_clock".to_string());
     }
     if capabilities.overlay_text
         && !camera.desired.overlay_text.trim().is_empty()
@@ -2500,25 +2790,27 @@ fn verification_for_observed(
             "drift" => "camera configuration drift detected".to_string(),
             _ => "camera configuration verified".to_string(),
         },
-        applied_fields: applied_fields(camera, capabilities),
+        applied_fields: applied_fields(cfg, camera, capabilities),
         failed_fields,
-        unsupported_fields: unsupported_fields(camera, capabilities),
+        unsupported_fields: unsupported_fields(cfg, camera, capabilities),
         drift_fields,
         verified: status == "verified",
     }
 }
 
-fn applied_fields(camera: &CameraConfig, capabilities: &CameraCapabilitySet) -> Vec<String> {
+fn applied_fields(
+    cfg: &Config,
+    camera: &CameraConfig,
+    capabilities: &CameraCapabilitySet,
+) -> Vec<String> {
+    let site_time = site_time_policy(cfg);
     let mut fields = vec!["display_name".to_string()];
-    if capabilities.time_sync {
+    if capabilities.time_sync && site_time.ntp_enabled {
         fields.extend(
             ["time_mode", "ntp_server", "timezone"]
                 .into_iter()
                 .map(String::from),
         );
-    }
-    if capabilities.manual_time {
-        fields.push("manual_time".to_string());
     }
     if capabilities.overlay_text {
         fields.push("overlay_text".to_string());
@@ -2537,15 +2829,17 @@ fn applied_fields(camera: &CameraConfig, capabilities: &CameraCapabilitySet) -> 
     fields
 }
 
-fn unsupported_fields(camera: &CameraConfig, capabilities: &CameraCapabilitySet) -> Vec<String> {
+fn unsupported_fields(
+    cfg: &Config,
+    camera: &CameraConfig,
+    capabilities: &CameraCapabilitySet,
+) -> Vec<String> {
+    let site_time = site_time_policy(cfg);
     let mut fields = Vec::new();
-    if !capabilities.time_sync && !camera.desired.ntp_server.trim().is_empty() {
+    if !capabilities.time_sync && site_time.ntp_enabled {
         fields.push("ntp_server".to_string());
     }
-    if !capabilities.manual_time && !camera.desired.manual_time.trim().is_empty() {
-        fields.push("manual_time".to_string());
-    }
-    if !capabilities.timezone && !camera.desired.timezone.trim().is_empty() {
+    if !capabilities.timezone && site_time.ntp_enabled {
         fields.push("timezone".to_string());
     }
     if !capabilities.overlay_text && !camera.desired.overlay_text.trim().is_empty() {
@@ -2988,13 +3282,6 @@ fn push_unique_string(items: &mut Vec<String>, value: &str) {
     }
 }
 
-fn time_mode_label(mode: &CameraTimeMode) -> &'static str {
-    match mode {
-        CameraTimeMode::Ntp => "ntp",
-        CameraTimeMode::Manual => "manual",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3138,12 +3425,12 @@ mod tests {
         let caps = capabilities_for_observed(&camera, driver_capabilities(&camera), &observed);
         assert!(caps.time_sync);
         assert!(!caps.manual_time);
-        assert!(!caps.timezone);
+        assert!(caps.timezone);
         assert!(caps.ptz);
-        assert!(!caps.overlay_text);
-        assert!(!caps.overlay_timestamp);
-        assert!(!caps.password_rotate);
-        assert!(!caps.hardening_profile);
+        assert!(caps.overlay_text);
+        assert!(caps.overlay_timestamp);
+        assert!(caps.password_rotate);
+        assert!(caps.hardening_profile);
     }
 
     #[test]
@@ -3356,4 +3643,317 @@ mod tests {
 
         assert!(reolink_observed_step_plan(profile, requested, target, observed).is_none());
     }
+
+    #[test]
+    fn display_name_change_keeps_overlay_text_linked_by_default() {
+        let existing = CameraConfig {
+            source_id: "cam".to_string(),
+            name: "Front Door".to_string(),
+            onvif_host: "10.0.0.1".to_string(),
+            onvif_port: 8000,
+            rtsp_url: String::new(),
+            username: String::new(),
+            password: String::new(),
+            driver_id: DRIVER_ID_REOLINK.to_string(),
+            vendor: String::new(),
+            model: String::new(),
+            mac_address: String::new(),
+            rtsp_port: 554,
+            ptz_capable: false,
+            enabled: true,
+            segment_secs: 10,
+            desired: CameraDesiredConfig {
+                display_name: "Front Door".to_string(),
+                overlay_text: "Front Door".to_string(),
+                ..Default::default()
+            },
+            credentials: Default::default(),
+        };
+        let mut next = existing.clone();
+        next.desired.display_name = "Driveway".to_string();
+        next.desired.overlay_text = "Front Door".to_string();
+
+        sync_display_name_and_linked_overlay(&existing, &mut next);
+
+        assert_eq!(next.name, "Driveway");
+        assert_eq!(next.desired.overlay_text, "Driveway");
+    }
+
+    #[test]
+    fn display_name_change_preserves_custom_overlay_text() {
+        let existing = CameraConfig {
+            source_id: "cam".to_string(),
+            name: "Front Door".to_string(),
+            onvif_host: "10.0.0.1".to_string(),
+            onvif_port: 8000,
+            rtsp_url: String::new(),
+            username: String::new(),
+            password: String::new(),
+            driver_id: DRIVER_ID_REOLINK.to_string(),
+            vendor: String::new(),
+            model: String::new(),
+            mac_address: String::new(),
+            rtsp_port: 554,
+            ptz_capable: false,
+            enabled: true,
+            segment_secs: 10,
+            desired: CameraDesiredConfig {
+                display_name: "Front Door".to_string(),
+                overlay_text: "Package Zone".to_string(),
+                ..Default::default()
+            },
+            credentials: Default::default(),
+        };
+        let mut next = existing.clone();
+        next.desired.display_name = "Driveway".to_string();
+        next.desired.overlay_text = "Package Zone".to_string();
+
+        sync_display_name_and_linked_overlay(&existing, &mut next);
+
+        assert_eq!(next.name, "Driveway");
+        assert_eq!(next.desired.overlay_text, "Package Zone");
+    }
+
+    #[test]
+    fn reolink_observed_timezone_prefers_feed_truth_from_presentation() {
+        let onvif_state = onvif::OnvifState {
+            timezone: "UTC+7:00:00DST+6:00:00,M3.2.0/02:00:00,M10.5.0/02:00:00".to_string(),
+            ..Default::default()
+        };
+        let presentation = reolink_cgi::ReolinkPresentationState {
+            timezone: "America/Phoenix".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            reolink_observed_timezone(Some(&onvif_state), &presentation),
+            "America/Phoenix"
+        );
+    }
+
+    #[test]
+    fn reolink_observed_manual_time_prefers_feed_truth_from_presentation() {
+        let onvif_state = onvif::OnvifState {
+            manual_time: "2026-04-17T18:04:28".to_string(),
+            ..Default::default()
+        };
+        let presentation = reolink_cgi::ReolinkPresentationState {
+            manual_time: "2026-04-17T17:59:13".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            reolink_observed_manual_time(Some(&onvif_state), &presentation),
+            "2026-04-17T17:59:13"
+        );
+    }
+
+    #[test]
+    fn reolink_verification_accepts_site_timezone_when_feed_truth_matches() {
+        let cfg: Config = serde_json::from_value(json!({
+            "node_id": "nvr-test",
+            "service_version": "0.1.0",
+            "nostr_pubkey": "pk",
+            "nostr_sk_hex": "sk",
+            "swarm": {
+                "bind": "0.0.0.0:4050",
+                "peers": [],
+                "zones": [],
+                "endpoint_hint": ""
+            },
+            "api": {
+                "bind": "127.0.0.1:8456",
+                "identity_id": "id-test",
+                "identity_secret_hex": "secret",
+                "server_secret_hex": "server"
+            },
+            "storage": {
+                "root": "/tmp/constitute-nvr",
+                "encryption_key_hex": "key"
+            },
+            "update": {},
+            "camera_network": {
+                "ntp_enabled": true,
+                "ntp_server": "192.168.250.1",
+                "timezone": "America/Phoenix"
+            }
+        }))
+        .expect("config");
+
+        let camera = CameraConfig {
+            source_id: "cam".to_string(),
+            name: "Carport".to_string(),
+            onvif_host: "10.0.0.1".to_string(),
+            onvif_port: 8000,
+            rtsp_url: String::new(),
+            username: String::new(),
+            password: String::new(),
+            driver_id: DRIVER_ID_REOLINK.to_string(),
+            vendor: "Reolink".to_string(),
+            model: "E1 Outdoor SE".to_string(),
+            mac_address: String::new(),
+            rtsp_port: 554,
+            ptz_capable: true,
+            enabled: true,
+            segment_secs: 10,
+            desired: CameraDesiredConfig {
+                display_name: "Carport".to_string(),
+                overlay_text: "Carport".to_string(),
+                overlay_timestamp: true,
+                ..Default::default()
+            },
+            credentials: Default::default(),
+        };
+        let observed = ObservedCameraState {
+            display_name: "Carport".to_string(),
+            driver_id: DRIVER_ID_REOLINK.to_string(),
+            time_mode: "ntp".to_string(),
+            ntp_server: "192.168.250.1".to_string(),
+            timezone: "America/Phoenix".to_string(),
+            overlay_text: "Carport".to_string(),
+            overlay_timestamp: Some(true),
+            raw: json!({
+                "managementPlane": "hybrid",
+                "presentation": { "timezone": "America/Phoenix" },
+                "onvif": { "time": { "timezone": "UTC+7:00:00DST+6:00:00,M3.2.0/02:00:00,M10.5.0/02:00:00" } }
+            }),
+            ..Default::default()
+        };
+        let verification = verification_for_observed(
+            &cfg,
+            &camera,
+            &observed,
+            &CameraCapabilitySet {
+                time_sync: true,
+                timezone: true,
+                overlay_text: true,
+                overlay_timestamp: true,
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        assert!(verification.verified);
+        assert!(verification.drift_fields.is_empty());
+    }
+
+    #[test]
+    fn observed_site_time_offset_secs_accepts_current_phoenix_time() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 18, 0, 45, 0).single().unwrap();
+        assert_eq!(
+            observed_site_time_offset_secs("America/Phoenix", "2026-04-17T17:45:30", now),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn site_local_time_string_formats_current_phoenix_time() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 18, 0, 45, 0).single().unwrap();
+        assert_eq!(
+            site_local_time_string("America/Phoenix", now).as_deref(),
+            Some("2026-04-17T17:45:00")
+        );
+    }
+
+    #[test]
+    fn observed_site_time_offset_secs_detects_large_clock_lead() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 18, 0, 45, 0).single().unwrap();
+        assert_eq!(
+            observed_site_time_offset_secs("America/Phoenix", "2026-04-17T17:50:30", now),
+            Some(330)
+        );
+    }
+
+    #[test]
+    fn requested_apply_fields_include_display_and_overlay_changes() {
+        let existing = CameraConfig {
+            source_id: "cam".to_string(),
+            name: "Front Door".to_string(),
+            onvif_host: "10.0.0.1".to_string(),
+            onvif_port: 8000,
+            rtsp_url: String::new(),
+            username: String::new(),
+            password: String::new(),
+            driver_id: DRIVER_ID_REOLINK.to_string(),
+            vendor: String::new(),
+            model: String::new(),
+            mac_address: String::new(),
+            rtsp_port: 554,
+            ptz_capable: false,
+            enabled: true,
+            segment_secs: 10,
+            desired: CameraDesiredConfig {
+                display_name: "Front Door".to_string(),
+                overlay_text: "Front Door".to_string(),
+                ..Default::default()
+            },
+            credentials: Default::default(),
+        };
+        let mut next = existing.clone();
+        next.desired.display_name = "Carport".to_string();
+        next.desired.overlay_text = "Carport".to_string();
+        next.name = "Carport".to_string();
+
+        let fields = requested_apply_fields(&existing, &next);
+        assert!(fields.iter().any(|field| field == "display_name"));
+        assert!(fields.iter().any(|field| field == "overlay_text"));
+    }
+
+    #[test]
+    fn requested_verification_failures_intersect_requested_fields_only() {
+        let verification = CameraReconcileResult {
+            status: "drift".to_string(),
+            message: "camera configuration drift detected".to_string(),
+            drift_fields: vec![
+                "display_name".to_string(),
+                "timezone".to_string(),
+                "overlay_text".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let failures = requested_verification_failures(
+            &verification,
+            &["display_name".to_string(), "overlay_text".to_string()],
+        );
+        assert_eq!(failures, vec!["display_name".to_string(), "overlay_text".to_string()]);
+    }
+}
+
+fn requested_apply_fields(existing: &CameraConfig, next: &CameraConfig) -> Vec<String> {
+    let mut fields = Vec::new();
+    if next.desired.display_name.trim() != existing.desired.display_name.trim()
+        || next.name.trim() != existing.name.trim()
+    {
+        fields.push("display_name".to_string());
+    }
+    if next.desired.overlay_text.trim() != existing.desired.overlay_text.trim() {
+        fields.push("overlay_text".to_string());
+    }
+    if next.desired.overlay_timestamp != existing.desired.overlay_timestamp {
+        fields.push("overlay_timestamp".to_string());
+    }
+    if next.desired.desired_password.trim() != existing.desired.desired_password.trim()
+        || next.desired.generate_password != existing.desired.generate_password
+    {
+        fields.push("password_rotate".to_string());
+    }
+    if next.desired.hardening != existing.desired.hardening {
+        fields.push("hardening".to_string());
+    }
+    fields
+}
+
+fn requested_verification_failures(
+    verification: &CameraReconcileResult,
+    requested_fields: &[String],
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for field in requested_fields {
+        if verification.failed_fields.iter().any(|item| item == field)
+            || verification.drift_fields.iter().any(|item| item == field)
+        {
+            failures.push(field.clone());
+        }
+    }
+    failures.sort();
+    failures.dedup();
+    failures
 }
