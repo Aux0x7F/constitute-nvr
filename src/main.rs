@@ -1,25 +1,22 @@
 mod api;
-mod camera;
+mod camera_device;
 mod config;
 mod crypto;
-mod drivers;
 mod hosted_registry;
 mod live;
 mod nostr;
-mod onvif;
-mod reolink;
-mod reolink_cgi;
-#[allow(dead_code)]
-mod reolink_proto;
+mod media;
+mod recording;
 mod storage;
 mod swarm;
 mod update;
 mod util;
-mod xm;
 
 use anyhow::Result;
 use clap::Parser;
-use config::{CameraConfig, Config};
+use camera_device::drivers::reolink::driver as reolink;
+use config::{CameraDeviceConfig as CameraConfig, CameraDeviceDesiredConfig, Config};
+use recording::RecorderManager;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -65,23 +62,23 @@ struct Args {
     #[arg(long, default_value_t = 20)]
     bootstrap_reolink_timeout_secs: u64,
     #[arg(long)]
-    read_camera_source: Option<String>,
+    read_camera_device_source: Option<String>,
     #[arg(long)]
-    list_inventory: bool,
+    list_camera_device_inventory: bool,
     #[arg(long)]
-    probe_camera_source: Option<String>,
+    probe_camera_device_source: Option<String>,
     #[arg(long)]
-    probe_camera_ip: Option<String>,
+    probe_camera_device_ip: Option<String>,
     #[arg(long, default_value = "admin")]
-    probe_camera_username: String,
+    probe_camera_device_username: String,
     #[arg(long)]
-    probe_camera_password: Option<String>,
+    probe_camera_device_password: Option<String>,
     #[arg(long)]
-    probe_camera_driver_id: Option<String>,
+    probe_camera_device_driver_id: Option<String>,
     #[arg(long)]
-    apply_camera_source: Option<String>,
+    apply_camera_device_source: Option<String>,
     #[arg(long)]
-    apply_camera_desired_json: Option<PathBuf>,
+    apply_camera_device_desired_json: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -90,7 +87,7 @@ async fn main() -> Result<()> {
     init_logging(&args.log_level);
 
     if args.discover_onvif {
-        let discovered = camera::discover_onvif(3).await?;
+        let discovered = recording::discover_onvif(3).await?;
         println!("{}", serde_json::to_string_pretty(&discovered)?);
         return Ok(());
     }
@@ -203,22 +200,22 @@ async fn main() -> Result<()> {
         warn!(error = %err, "failed writing hosted-service manifest");
     }
 
-    if let Some(source_id) = &args.read_camera_source {
-        let mounted = drivers::read_camera(&cfg, source_id).await?;
+    if let Some(source_id) = &args.read_camera_device_source {
+        let mounted = camera_device::read_camera_device(&cfg, source_id).await?;
         println!("{}", serde_json::to_string_pretty(&mounted)?);
         return Ok(());
     }
 
-    if args.list_inventory {
-        let inventory = drivers::list_inventory(&cfg).await?;
+    if args.list_camera_device_inventory {
+        let inventory = camera_device::list_camera_device_inventory(&cfg).await?;
         println!("{}", serde_json::to_string_pretty(&inventory)?);
         return Ok(());
     }
 
-    if let Some(source_id) = &args.probe_camera_source {
-        let result = drivers::probe_camera(
+    if let Some(source_id) = &args.probe_camera_device_source {
+        let result = camera_device::probe_camera_device(
             &cfg,
-            drivers::ProbeCameraRequest {
+            camera_device::ProbeCameraRequest {
                 source_id: source_id.trim().to_string(),
                 ..Default::default()
             },
@@ -228,14 +225,17 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(ip) = &args.probe_camera_ip {
-        let result = drivers::probe_camera(
+    if let Some(ip) = &args.probe_camera_device_ip {
+        let result = camera_device::probe_camera_device(
             &cfg,
-            drivers::ProbeCameraRequest {
+            camera_device::ProbeCameraRequest {
                 ip: ip.trim().to_string(),
-                username: args.probe_camera_username.clone(),
-                password: args.probe_camera_password.clone().unwrap_or_default(),
-                driver_id: args.probe_camera_driver_id.clone().unwrap_or_default(),
+                username: args.probe_camera_device_username.clone(),
+                password: args.probe_camera_device_password.clone().unwrap_or_default(),
+                driver_id: args
+                    .probe_camera_device_driver_id
+                    .clone()
+                    .unwrap_or_default(),
                 ..Default::default()
             },
         )
@@ -244,22 +244,22 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(source_id) = &args.apply_camera_source {
-        let desired_path = args.apply_camera_desired_json.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("--apply-camera-desired-json is required with --apply-camera-source")
+    if let Some(source_id) = &args.apply_camera_device_source {
+        let desired_path = args.apply_camera_device_desired_json.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("--apply-camera-device-desired-json is required with --apply-camera-device-source")
         })?;
-        let desired: config::CameraDesiredConfig =
+        let desired: CameraDeviceDesiredConfig =
             serde_json::from_str(&fs::read_to_string(desired_path)?)?;
-        let applied = drivers::apply_mounted_camera(
+        let applied = camera_device::apply_camera_device_config(
             &cfg,
-            drivers::ApplyMountedCameraRequest {
+            camera_device::ApplyMountedCameraRequest {
                 source_id: source_id.trim().to_string(),
                 desired,
             },
         )
         .await?;
         if let Some(existing) = cfg
-            .cameras
+            .camera_devices
             .iter_mut()
             .find(|camera| camera.source_id.trim() == source_id.trim())
         {
@@ -276,7 +276,7 @@ async fn main() -> Result<()> {
     storage.ensure_dirs().await?;
     storage.start_encryptor(cfg.storage.encrypt_interval_secs);
 
-    let recorder = camera::RecorderManager::new();
+    let recorder = RecorderManager::new();
     recorder.ensure_started(&cfg).await;
 
     let swarm_handle = swarm::start(cfg.clone()).await?;
@@ -303,7 +303,7 @@ async fn main() -> Result<()> {
         role = %cfg.node_role,
         identity_id = %cfg.api.identity_id,
         storage = %cfg.storage.root,
-        camera_count = cfg.cameras.len(),
+        camera_count = cfg.camera_devices.len(),
         "constitute-nvr starting"
     );
 
@@ -371,7 +371,7 @@ fn warn_if_camera_network_not_ready(cfg: &Config) {
 }
 
 fn warn_if_template_cameras(cfg: &Config) {
-    for cam in &cfg.cameras {
+    for cam in &cfg.camera_devices {
         if looks_like_template_camera(cam) {
             warn!(
                 source = %cam.source_id,
@@ -483,7 +483,7 @@ async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<
         );
 
         let mut found = false;
-        for cam in &mut cfg.cameras {
+        for cam in &mut cfg.camera_devices {
             if cam.source_id == source_id || cam.onvif_host == ip {
                 cam.source_id = source_id.clone();
                 cam.name = source_name.clone();
@@ -500,7 +500,7 @@ async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<
         }
 
         if !found {
-            cfg.cameras.push(CameraConfig {
+            cfg.camera_devices.push(CameraConfig {
                 source_id: source_id.clone(),
                 name: source_name.clone(),
                 onvif_host: ip.clone(),
@@ -508,7 +508,7 @@ async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<
                 rtsp_url: rtsp_url.clone(),
                 username: username.clone(),
                 password: effective_password.clone(),
-                driver_id: drivers::DRIVER_ID_REOLINK.to_string(),
+                driver_id: camera_device::registry::DRIVER_ID_REOLINK.to_string(),
                 vendor: "Reolink".to_string(),
                 model: device.model.clone(),
                 mac_address: device.mac.clone(),
@@ -517,7 +517,7 @@ async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<
                     || device.model.to_ascii_lowercase().contains("ptz"),
                 enabled: true,
                 segment_secs: 10,
-                desired: config::CameraDesiredConfig {
+                desired: CameraDeviceDesiredConfig {
                     display_name: source_name.clone(),
                     overlay_text: source_name.clone(),
                     overlay_timestamp: true,
@@ -533,7 +533,7 @@ async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<
 
     if changed {
         cfg.persist(cfg_path)?;
-        info!(path = %cfg_path.display(), camera_count = cfg.cameras.len(), "persisted auto-provisioned camera config");
+        info!(path = %cfg_path.display(), camera_count = cfg.camera_devices.len(), "persisted auto-provisioned camera config");
     }
 
     Ok(())

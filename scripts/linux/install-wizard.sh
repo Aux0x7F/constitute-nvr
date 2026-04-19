@@ -856,11 +856,11 @@ live_preview['udp_port_min'] = preview_udp_port_min
 live_preview['udp_port_max'] = preview_udp_port_max
 
 if first_install or (
-    isinstance(raw.get('cameras'), list)
-    and raw['cameras']
-    and all(looks_like_template_camera(item) for item in raw['cameras'])
+    isinstance(raw.get('camera_devices'), list)
+    and raw['camera_devices']
+    and all(looks_like_template_camera(item) for item in raw['camera_devices'])
 ):
-    raw['cameras'] = []
+    raw['camera_devices'] = []
 
 path.write_text(json.dumps(raw, indent=2) + '\n', encoding='utf-8')
 PY

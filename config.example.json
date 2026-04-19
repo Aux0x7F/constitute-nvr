@@ -64,7 +64,7 @@
     "udp_port_min": 41000,
     "udp_port_max": 41031
   },
-  "cameras": [],
+  "camera_devices": [],
   "autoprovision": {
     "reolink_enabled": false,
     "reolink_username": "admin",

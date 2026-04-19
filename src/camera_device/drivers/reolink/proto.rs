@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use aes::Aes128;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};

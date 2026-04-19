@@ -62,7 +62,7 @@ Optional auto-provision flags:
 - `update.interval_secs`, `update.mode`, `update.build_user`
 - `gateway.host_gateway_pk`
 - `camera_network.*`
-- `cameras[]` ONVIF/RTSP source definitions
+- `camera_devices[]` ONVIF/RTSP source definitions
 
 ## Security Model (Current)
 - Segment-at-rest encryption uses service storage key.

@@ -8,7 +8,8 @@
 //! - CGI/ONVIF presentation and site-time behavior are split by concern
 //! - PTZ remains model-sensitive and partially hidden pending full native actuation
 
-use crate::{camera, reolink_cgi, reolink_proto};
+use crate::recording;
+use super::{cgi as reolink_cgi, proto as reolink_proto};
 use anyhow::{Context, Result, anyhow};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -550,7 +551,7 @@ pub async fn probe(ip: &str, timeout_secs: u64) -> Result<ReolinkProbe> {
 
     let onvif_xaddr = if onvif_port_open {
         let expected = format!("http://{}:8000/onvif/device_service", target);
-        let discovered = camera::discover_onvif(timeout_secs.min(3))
+        let discovered = recording::discover_onvif(timeout_secs.min(3))
             .await
             .unwrap_or_default();
         discovered

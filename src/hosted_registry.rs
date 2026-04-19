@@ -21,7 +21,7 @@ pub struct HostedServiceManifest {
     pub api_bind: String,
     pub api_base_url: String,
     pub health_url: String,
-    pub cameras: Vec<Value>,
+    pub camera_devices: Vec<Value>,
     pub updated_at: u64,
 }
 
@@ -90,8 +90,8 @@ impl HostedServiceManifest {
             api_bind: cfg.api.bind.trim().to_string(),
             api_base_url,
             health_url,
-            cameras: cfg
-                .cameras
+            camera_devices: cfg
+                .camera_devices
                 .iter()
                 .map(|camera| {
                     json!({

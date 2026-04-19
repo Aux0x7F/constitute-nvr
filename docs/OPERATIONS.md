@@ -68,7 +68,7 @@ Critical fields before ingest:
 - `camera_network.ntp_server`
 - `camera_network.timezone`
 - `autoprovision.reolink_*` (when auto-provision enabled)
-- `cameras[]`
+- `camera_devices[]`
 
 Camera-NIC onboarding aliases:
 - use `bootstrap-camera-network.sh --onboarding-alias <cidr>` to add explicit extra `/24` addresses on the dedicated camera NIC for factory-static cameras
@@ -114,6 +114,7 @@ curl -s http://127.0.0.1:8456/health | jq .
 
 Notes:
 - `/health` is intentionally redacted; camera credentials and raw credential-bearing RTSP URLs are never returned.
+- `/health` uses `cameraDevices` as the active pre-prod NVR camera payload key.
 - `cameraNetwork` should reflect the provisioned camera NIC, DHCP range, and active site-time policy (`ntp_enabled`, `ntp_server`, `timezone`).
 
 ## 7) Camera Hardening Script

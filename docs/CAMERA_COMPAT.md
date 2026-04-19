@@ -1,5 +1,11 @@
 # Camera Compatibility Matrix (Iteration-1)
 
+Driver-model-specific implementation notes now belong primarily in:
+- `src/camera_device/drivers/<driver>/driver.rs`
+- `src/camera_device/drivers/<driver>/identification.rs`
+
+This file stays at operator/compatibility-summary level.
+
 ## Validation Target Models
 
 ### Anypiz IPC-B8743-S (4MP PoE U series)
