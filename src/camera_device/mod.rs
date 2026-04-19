@@ -6,6 +6,7 @@ pub mod identification;
 pub mod inventory;
 pub mod mount;
 pub mod protocol;
+pub mod reconcile;
 pub mod registry;
 pub mod types;
 
@@ -234,6 +235,7 @@ pub use apply::apply_camera_device_config;
 pub use control::control_camera_device;
 pub use inventory::{list_camera_device_inventory, read_camera_device};
 pub use mount::mount_camera_device;
+pub use reconcile::reconcile_camera_device;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

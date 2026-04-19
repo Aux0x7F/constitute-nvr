@@ -48,11 +48,13 @@ This file stays at operator/compatibility-summary level.
   - preview note:
     - live preview depends on host HEVC decode because the validated RTSP profiles are HEVC
     - installer/runtime now treat decoder-capable `ffmpeg` as part of the supported contract
+    - temporary hard down/up should resume live preview without relaunch once the camera becomes reachable again
   - XM-specific management notes:
     - baked feed title is controlled by `TitleOverlay.TitleUtf8`
     - site time is controlled by `/setTimeConfig` with manual seed -> NTP transition
     - the effective NTP alias for this camera is `192.168.0.2`
     - a second XM `UserOverlay` lane can leak stale text into the lower-left corner; the active driver now clears that lane on apply so the feed only shows the main title and clock
+    - service-side reconcile is expected to reassert baked title and site NTP/time settings after reboot-driven drift when the camera is reachable again
 - PTZ is not supported on this model
 - Recommended status: supported for discovery, ingest, live preview, baked title, and site time when an onboarding alias exists on the camera NIC
 
@@ -82,6 +84,7 @@ This file stays at operator/compatibility-summary level.
   - current verification matches that split:
     - `time_mode` / `ntp_server` verify from ONVIF
     - `timezone` verifies from the feed-facing CGI time payload
+  - service-side reconcile is expected to reoffer supported site-time settings after reboot-driven drift when the camera is reachable again
   - follow-up live proof on `2026-04-17`:
     - the lab Fedora host required `confdir /etc/chrony.d` in `/etc/chrony.conf` before the bootstrap-written chrony drop-in was actually loaded and UDP `123` was served on the camera NIC
     - Reolink apply now also seeds the current site-local wall clock in the CGI time payload while leaving NTP enabled, so the baked feed clock converges immediately instead of waiting for the camera's next poll
