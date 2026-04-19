@@ -27,10 +27,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio::time::{Duration, MissedTickBehavior, interval};
 use tracing::{debug, info, warn};
 
 const INSECURE_HELLO_SECRET_HEX: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
+const CAMERA_RECONCILE_INITIAL_DELAY_SECS: u64 = 5;
+const CAMERA_RECONCILE_INTERVAL_SECS: u64 = 20;
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -87,6 +90,7 @@ pub async fn run(
         storage,
         recorder,
     });
+    spawn_camera_reconcile_loop(Arc::clone(&state));
 
     let app = Router::new()
         .route("/health", get(health))
@@ -100,6 +104,53 @@ pub async fn run(
     let listener = TcpListener::bind(&bind).await?;
     info!(bind = %bind, "api listener ready");
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn spawn_camera_reconcile_loop(state: Arc<ApiState>) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(CAMERA_RECONCILE_INITIAL_DELAY_SECS)).await;
+        let mut ticker = interval(Duration::from_secs(CAMERA_RECONCILE_INTERVAL_SECS));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if let Err(err) = run_camera_reconcile_cycle(state.as_ref()).await {
+                warn!(error = %err, "camera reconcile cycle failed");
+            }
+        }
+    });
+}
+
+async fn run_camera_reconcile_cycle(state: &ApiState) -> Result<()> {
+    let cfg = state.cfg.lock().await.clone();
+    for camera in cfg.camera_devices.iter().filter(|camera| camera.enabled).cloned() {
+        match camera_device::reconcile_camera_device(&cfg, &camera).await {
+            Ok(Some(outcome)) => {
+                let changed = camera_device::reconcile::camera_config_changed(
+                    &camera,
+                    &outcome.configured,
+                );
+                if changed {
+                    persist_camera_source(state, outcome.configured.clone()).await?;
+                }
+                info!(
+                    source = %camera.source_id,
+                    changed,
+                    drift_fields = ?outcome.initial_drift_fields,
+                    verification_status = %outcome.mounted.verification.status,
+                    "camera drift reconcile applied"
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(
+                    source = %camera.source_id,
+                    error = %err,
+                    "camera drift reconcile failed"
+                );
+            }
+        }
+    }
     Ok(())
 }
 

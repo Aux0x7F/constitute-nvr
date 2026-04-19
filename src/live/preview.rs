@@ -2,6 +2,7 @@ use crate::camera_device::registry::driver_is_xm;
 use crate::config::{CameraDeviceConfig as CameraConfig, Config, LivePreviewConfig};
 use crate::media::{ffmpeg, planner, types::OutputCodec};
 use crate::nostr::{self, NostrEvent};
+use crate::recording::runtime::backoff_secs;
 use anyhow::{Context, Result, anyhow};
 use rtp::packet::Packet as RtpPacket;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,7 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::process::Command;
 use tokio::sync::{Mutex, watch};
+use tokio::time::{Duration, Instant, sleep, timeout};
 use tracing::{info, warn};
 use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_VP8, MediaEngine};
@@ -795,63 +797,222 @@ async fn run_camera_forwarder(
             return;
         }
     };
-
-    let mut ffmpeg = Command::new("ffmpeg");
-    ffmpeg.args(ffmpeg::build_live_preview_ffmpeg_args(
-        &plan,
-        local_addr.port(),
-    ));
-
-    let mut child = match ffmpeg
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(err) => {
-            warn!(source = %camera.source_id, error = %err, "failed to launch ffmpeg live preview");
-            return;
-        }
-    };
-
-    info!(
-        source = %camera.source_id,
-        url = %preview_url,
-        codec = codec.label(),
-        "live preview forwarder started"
-    );
     let mut buf = vec![0u8; 1600];
+    let mut restart_attempt = 0_u64;
+    let mut restart_deadline: Option<Instant> = None;
+    let mut continuity = PreviewRtpContinuity::default();
+
     loop {
-        tokio::select! {
-            _ = stop_rx.changed() => {
-                break;
-            }
-            recv = socket.recv_from(&mut buf) => {
-                let (len, _) = match recv {
-                    Ok(v) => v,
-                    Err(err) => {
-                        warn!(source = %camera.source_id, error = %err, "live preview RTP recv failed");
-                        break;
-                    }
-                };
-                let mut slice = &buf[..len];
-                let packet = match RtpPacket::unmarshal(&mut slice) {
-                    Ok(packet) => packet,
-                    Err(err) => {
-                        warn!(source = %camera.source_id, error = %err, "live preview RTP unmarshal failed");
-                        continue;
-                    }
-                };
-                if let Err(err) = track.write_rtp(&packet).await {
-                    warn!(source = %camera.source_id, error = %err, "live preview RTP write failed");
+        if *stop_rx.borrow() {
+            break;
+        }
+
+        if let Some(deadline) = restart_deadline.take() {
+            let mut stop_wait = stop_rx.clone();
+            tokio::select! {
+                _ = stop_wait.changed() => {
+                    break;
                 }
+                _ = sleep(deadline.saturating_duration_since(Instant::now())) => {}
+            }
+        }
+
+        let mut ffmpeg = Command::new("ffmpeg");
+        ffmpeg.args(ffmpeg::build_live_preview_ffmpeg_args(
+            &plan,
+            local_addr.port(),
+        ));
+
+        let mut child = match ffmpeg
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => {
+                restart_attempt += 1;
+                let backoff = backoff_secs(restart_attempt);
+                warn!(
+                    source = %camera.source_id,
+                    error = %err,
+                    backoff_secs = backoff,
+                    "failed to launch ffmpeg live preview; will retry"
+                );
+                restart_deadline = Some(Instant::now() + Duration::from_secs(backoff));
+                continue;
+            }
+        };
+
+        info!(
+            source = %camera.source_id,
+            url = %preview_url,
+            codec = codec.label(),
+            restart_attempt,
+            "live preview forwarder started"
+        );
+
+        let exit_reason = loop {
+            tokio::select! {
+                _ = stop_rx.changed() => {
+                    break PreviewExitReason::Stopped;
+                }
+                status = child.wait() => {
+                    break match status {
+                        Ok(status) => PreviewExitReason::ChildExited(format!("ffmpeg exited with status {}", status)),
+                        Err(err) => PreviewExitReason::ChildWaitFailed(err.to_string()),
+                    };
+                }
+                recv = timeout(Duration::from_secs(preview_no_packet_timeout_secs()), socket.recv_from(&mut buf)) => {
+                    match recv {
+                        Ok(Ok((len, _))) => {
+                            restart_attempt = 0;
+                            let mut slice = &buf[..len];
+                            let mut packet = match RtpPacket::unmarshal(&mut slice) {
+                                Ok(packet) => packet,
+                                Err(err) => {
+                                    warn!(source = %camera.source_id, error = %err, "live preview RTP unmarshal failed");
+                                    continue;
+                                }
+                            };
+                            continuity.rewrite(&mut packet);
+                            if let Err(err) = track.write_rtp(&packet).await {
+                                warn!(source = %camera.source_id, error = %err, "live preview RTP write failed");
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            break PreviewExitReason::SocketRecvFailed(err.to_string());
+                        }
+                        Err(_) => {
+                            break PreviewExitReason::NoPackets(preview_no_packet_timeout_secs());
+                        }
+                    }
+                }
+            }
+        };
+
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+
+        match exit_reason {
+            PreviewExitReason::Stopped => break,
+            PreviewExitReason::ChildExited(message)
+            | PreviewExitReason::ChildWaitFailed(message)
+            | PreviewExitReason::SocketRecvFailed(message) => {
+                restart_attempt += 1;
+                let backoff = backoff_secs(restart_attempt);
+                warn!(
+                    source = %camera.source_id,
+                    message,
+                    backoff_secs = backoff,
+                    "live preview forwarder exited; restarting"
+                );
+                restart_deadline = Some(Instant::now() + Duration::from_secs(backoff));
+            }
+            PreviewExitReason::NoPackets(timeout_secs) => {
+                restart_attempt += 1;
+                let backoff = backoff_secs(restart_attempt);
+                warn!(
+                    source = %camera.source_id,
+                    idle_timeout_secs = timeout_secs,
+                    backoff_secs = backoff,
+                    "live preview forwarder stalled without RTP; restarting"
+                );
+                restart_deadline = Some(Instant::now() + Duration::from_secs(backoff));
             }
         }
     }
 
-    let _ = child.kill().await;
-    let _ = child.wait().await;
     info!(source = %camera.source_id, "live preview forwarder stopped");
+}
+
+#[derive(Debug)]
+enum PreviewExitReason {
+    Stopped,
+    ChildExited(String),
+    ChildWaitFailed(String),
+    SocketRecvFailed(String),
+    NoPackets(u64),
+}
+
+#[derive(Debug, Default)]
+struct PreviewRtpContinuity {
+    last_source_sequence: Option<u16>,
+    last_source_timestamp: Option<u32>,
+    last_output_sequence: Option<u16>,
+    last_output_timestamp: Option<u32>,
+    last_timestamp_step: u32,
+}
+
+impl PreviewRtpContinuity {
+    fn rewrite(&mut self, packet: &mut RtpPacket) {
+        let source_sequence = packet.header.sequence_number;
+        let source_timestamp = packet.header.timestamp;
+
+        match (
+            self.last_source_sequence,
+            self.last_source_timestamp,
+            self.last_output_sequence,
+            self.last_output_timestamp,
+        ) {
+            (Some(prev_src_seq), Some(prev_src_ts), Some(prev_out_seq), Some(prev_out_ts)) => {
+                let sequence_step = continuity_sequence_step(prev_src_seq, source_sequence);
+                let timestamp_step = continuity_timestamp_step(
+                    prev_src_ts,
+                    source_timestamp,
+                    self.last_timestamp_step,
+                );
+                let output_sequence = prev_out_seq.wrapping_add(sequence_step);
+                let output_timestamp = prev_out_ts.wrapping_add(timestamp_step);
+                packet.header.sequence_number = output_sequence;
+                packet.header.timestamp = output_timestamp;
+                self.last_output_sequence = Some(output_sequence);
+                self.last_output_timestamp = Some(output_timestamp);
+                self.last_timestamp_step = timestamp_step.max(1);
+            }
+            _ => {
+                packet.header.sequence_number = source_sequence;
+                packet.header.timestamp = source_timestamp;
+                self.last_output_sequence = Some(source_sequence);
+                self.last_output_timestamp = Some(source_timestamp);
+                self.last_timestamp_step = default_preview_timestamp_step();
+            }
+        }
+
+        self.last_source_sequence = Some(source_sequence);
+        self.last_source_timestamp = Some(source_timestamp);
+    }
+}
+
+fn continuity_sequence_step(previous: u16, current: u16) -> u16 {
+    let delta = current.wrapping_sub(previous);
+    if delta == 0 || delta > 4096 {
+        1
+    } else {
+        delta
+    }
+}
+
+fn continuity_timestamp_step(previous: u32, current: u32, last_step: u32) -> u32 {
+    let delta = current.wrapping_sub(previous);
+    if delta == 0 {
+        0
+    } else if delta > continuity_restart_timestamp_threshold() {
+        last_step.max(default_preview_timestamp_step())
+    } else {
+        delta
+    }
+}
+
+fn default_preview_timestamp_step() -> u32 {
+    3000
+}
+
+fn continuity_restart_timestamp_threshold() -> u32 {
+    90_000 * 5
+}
+
+fn preview_no_packet_timeout_secs() -> u64 {
+    8
 }
 
 #[cfg(test)]
@@ -1238,5 +1399,35 @@ mod tests {
         assert!(output.contains("a=msid-semantic:WMS *\r\n"));
         assert!(output.contains("a=mid:0\r\na=msid:session-1 cam-1\r\n"));
         assert!(output.contains("a=mid:1\r\na=msid:session-1 cam-2\r\n"));
+    }
+
+    #[test]
+    fn preview_no_packet_timeout_stays_short() {
+        assert_eq!(preview_no_packet_timeout_secs(), 8);
+    }
+
+    #[test]
+    fn preview_rtp_continuity_rewrites_large_restart_jumps() {
+        let mut continuity = PreviewRtpContinuity::default();
+        let mut first = RtpPacket::default();
+        first.header.sequence_number = 40_000;
+        first.header.timestamp = 120_000;
+        continuity.rewrite(&mut first);
+        assert_eq!(first.header.sequence_number, 40_000);
+        assert_eq!(first.header.timestamp, 120_000);
+
+        let mut second = RtpPacket::default();
+        second.header.sequence_number = 40_003;
+        second.header.timestamp = 123_000;
+        continuity.rewrite(&mut second);
+        assert_eq!(second.header.sequence_number, 40_003);
+        assert_eq!(second.header.timestamp, 123_000);
+
+        let mut restarted = RtpPacket::default();
+        restarted.header.sequence_number = 7;
+        restarted.header.timestamp = 9_000;
+        continuity.rewrite(&mut restarted);
+        assert_eq!(restarted.header.sequence_number, 40_004);
+        assert_eq!(restarted.header.timestamp, 126_000);
     }
 }
