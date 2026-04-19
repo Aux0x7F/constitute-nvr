@@ -149,7 +149,7 @@ impl Default for CameraHardeningConfig {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct CameraDesiredConfig {
+pub struct CameraDeviceDesiredConfig {
     #[serde(default, alias = "displayName")]
     pub display_name: String,
     #[serde(default, alias = "timeMode")]
@@ -201,7 +201,7 @@ pub struct CameraCredentialState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CameraConfig {
+pub struct CameraDeviceConfig {
     pub source_id: String,
     pub name: String,
     pub onvif_host: String,
@@ -229,7 +229,7 @@ pub struct CameraConfig {
     #[serde(default = "default_segment_secs")]
     pub segment_secs: u64,
     #[serde(default)]
-    pub desired: CameraDesiredConfig,
+    pub desired: CameraDeviceDesiredConfig,
     #[serde(default)]
     pub credentials: CameraCredentialState,
 }
@@ -343,7 +343,7 @@ pub struct Config {
     #[serde(default)]
     pub live_preview: LivePreviewConfig,
     #[serde(default)]
-    pub cameras: Vec<CameraConfig>,
+    pub camera_devices: Vec<CameraDeviceConfig>,
 }
 
 impl Config {
@@ -464,8 +464,8 @@ impl Config {
 
         changed |= apply_camera_network_defaults(&mut self.camera_network);
         changed |= apply_live_preview_defaults(&mut self.live_preview);
-        for camera in &mut self.cameras {
-            changed |= apply_camera_defaults(camera, &self.camera_network);
+        for camera in &mut self.camera_devices {
+            changed |= apply_camera_device_defaults(camera, &self.camera_network);
         }
 
         if self.swarm.zones.is_empty() {
@@ -545,7 +545,7 @@ impl Config {
             autoprovision: AutoProvisionConfig::default(),
             camera_network: CameraNetworkConfig::default(),
             live_preview: LivePreviewConfig::default(),
-            cameras: Vec::new(),
+            camera_devices: Vec::new(),
         }
     }
 }
@@ -729,7 +729,10 @@ fn apply_live_preview_defaults(cfg: &mut LivePreviewConfig) -> bool {
     changed
 }
 
-fn apply_camera_defaults(camera: &mut CameraConfig, _network: &CameraNetworkConfig) -> bool {
+fn apply_camera_device_defaults(
+    camera: &mut CameraDeviceConfig,
+    _network: &CameraNetworkConfig,
+) -> bool {
     let mut changed = false;
     if camera.driver_id.trim().is_empty() {
         camera.driver_id = if camera.source_id.trim().starts_with("reolink-") {
@@ -754,7 +757,7 @@ fn apply_camera_defaults(camera: &mut CameraConfig, _network: &CameraNetworkConf
         changed = true;
     }
     if camera.model.trim().is_empty() {
-        let inferred_model = infer_camera_model(camera);
+        let inferred_model = infer_camera_device_model(camera);
         if !inferred_model.is_empty() {
             camera.model = inferred_model;
             changed = true;
@@ -790,7 +793,7 @@ fn apply_camera_defaults(camera: &mut CameraConfig, _network: &CameraNetworkConf
         camera.desired.hardening.disable_http = false;
         changed = true;
     }
-    changed |= sync_camera_credential_state(camera);
+    changed |= sync_camera_device_credential_state(camera);
     changed
 }
 
@@ -843,7 +846,7 @@ fn normalize_site_timezone_candidate(value: &str) -> Option<String> {
     None
 }
 
-fn infer_camera_model(camera: &CameraConfig) -> String {
+fn infer_camera_device_model(camera: &CameraDeviceConfig) -> String {
     let name = camera.name.trim();
     if name.is_empty() {
         return String::new();
@@ -862,7 +865,7 @@ fn infer_camera_model(camera: &CameraConfig) -> String {
 
 const MAX_CAMERA_CREDENTIAL_HISTORY: usize = 8;
 
-pub fn camera_credential_candidates(camera: &CameraConfig) -> Vec<String> {
+pub fn camera_device_credential_candidates(camera: &CameraDeviceConfig) -> Vec<String> {
     let mut candidates = Vec::new();
     push_unique_password(&mut candidates, &camera.password);
     push_unique_password(&mut candidates, &camera.credentials.pending_password);
@@ -873,7 +876,7 @@ pub fn camera_credential_candidates(camera: &CameraConfig) -> Vec<String> {
 }
 
 pub fn mark_camera_rotation_pending(
-    camera: &mut CameraConfig,
+    camera: &mut CameraDeviceConfig,
     pending_password: &str,
     note: &str,
 ) -> bool {
@@ -906,7 +909,7 @@ pub fn mark_camera_rotation_pending(
     changed
 }
 
-pub fn mark_camera_rotation_failed(camera: &mut CameraConfig, error: &str) -> bool {
+pub fn mark_camera_device_rotation_failed(camera: &mut CameraDeviceConfig, error: &str) -> bool {
     let error = error.trim();
     let mut changed = set_rotation_status(camera, "failed", error);
     if !camera.credentials.pending_password.trim().is_empty() {
@@ -926,7 +929,7 @@ pub fn mark_camera_rotation_failed(camera: &mut CameraConfig, error: &str) -> bo
 }
 
 pub fn finalize_camera_password_rotation(
-    camera: &mut CameraConfig,
+    camera: &mut CameraDeviceConfig,
     active_password: &str,
     status: &str,
     note: &str,
@@ -935,7 +938,7 @@ pub fn finalize_camera_password_rotation(
 }
 
 pub fn adopt_camera_active_password(
-    camera: &mut CameraConfig,
+    camera: &mut CameraDeviceConfig,
     active_password: &str,
     status: &str,
     note: &str,
@@ -986,7 +989,7 @@ pub fn adopt_camera_active_password(
     changed
 }
 
-fn sync_camera_credential_state(camera: &mut CameraConfig) -> bool {
+fn sync_camera_device_credential_state(camera: &mut CameraDeviceConfig) -> bool {
     let mut changed = false;
     if !camera.password.trim().is_empty() {
         let current = camera.password.clone();
@@ -1016,7 +1019,7 @@ fn sync_camera_credential_state(camera: &mut CameraConfig) -> bool {
 }
 
 fn ensure_password_history(
-    camera: &mut CameraConfig,
+    camera: &mut CameraDeviceConfig,
     password: &str,
     status: &str,
     note: &str,
@@ -1052,7 +1055,7 @@ fn ensure_password_history(
 }
 
 fn record_password_history(
-    camera: &mut CameraConfig,
+    camera: &mut CameraDeviceConfig,
     password: &str,
     status: &str,
     note: &str,
@@ -1084,7 +1087,7 @@ fn record_password_history(
     true
 }
 
-fn set_rotation_status(camera: &mut CameraConfig, status: &str, error: &str) -> bool {
+fn set_rotation_status(camera: &mut CameraDeviceConfig, status: &str, error: &str) -> bool {
     let mut changed = false;
     let status = status.trim();
     let error = error.trim();
@@ -1230,7 +1233,7 @@ mod tests {
 
     #[test]
     fn camera_desired_config_accepts_camel_case_api_fields() {
-        let desired: CameraDesiredConfig = serde_json::from_value(serde_json::json!({
+        let desired: CameraDeviceDesiredConfig = serde_json::from_value(serde_json::json!({
             "displayName": "Carport",
             "timeMode": "ntp",
             "ntpServer": "192.168.250.1",
@@ -1328,7 +1331,7 @@ mod tests {
 
     #[test]
     fn credential_rotation_history_retains_previous_and_pending_passwords() {
-        let mut camera = CameraConfig {
+        let mut camera = CameraDeviceConfig {
             source_id: "cam-1".to_string(),
             name: "Front".to_string(),
             onvif_host: "10.0.0.10".to_string(),
@@ -1344,7 +1347,7 @@ mod tests {
             ptz_capable: true,
             enabled: true,
             segment_secs: 10,
-            desired: CameraDesiredConfig::default(),
+            desired: CameraDeviceDesiredConfig::default(),
             credentials: CameraCredentialState::default(),
         };
 
@@ -1353,7 +1356,7 @@ mod tests {
             "new-secret",
             "test rotation request",
         ));
-        let candidates = camera_credential_candidates(&camera);
+        let candidates = camera_device_credential_candidates(&camera);
         assert_eq!(candidates[0], "old-secret");
         assert_eq!(candidates[1], "new-secret");
 
@@ -1363,7 +1366,7 @@ mod tests {
             "verified",
             "rotation verified",
         ));
-        let candidates = camera_credential_candidates(&camera);
+        let candidates = camera_device_credential_candidates(&camera);
         assert_eq!(camera.password, "new-secret");
         assert_eq!(candidates[0], "new-secret");
         assert!(candidates.iter().any(|value| value == "old-secret"));
@@ -1373,7 +1376,7 @@ mod tests {
 
     #[test]
     fn failed_rotation_keeps_pending_candidate_for_recovery() {
-        let mut camera = CameraConfig {
+        let mut camera = CameraDeviceConfig {
             source_id: "cam-1".to_string(),
             name: "Front".to_string(),
             onvif_host: "10.0.0.10".to_string(),
@@ -1389,17 +1392,17 @@ mod tests {
             ptz_capable: true,
             enabled: true,
             segment_secs: 10,
-            desired: CameraDesiredConfig::default(),
+            desired: CameraDeviceDesiredConfig::default(),
             credentials: CameraCredentialState::default(),
         };
 
         mark_camera_rotation_pending(&mut camera, "candidate", "attempting rotation");
-        assert!(mark_camera_rotation_failed(
+        assert!(mark_camera_device_rotation_failed(
             &mut camera,
             "verification failed",
         ));
 
-        let candidates = camera_credential_candidates(&camera);
+        let candidates = camera_device_credential_candidates(&camera);
         assert_eq!(candidates[0], "known-good");
         assert!(candidates.iter().any(|value| value == "candidate"));
         assert_eq!(camera.credentials.last_rotation_status, "failed");
@@ -1412,7 +1415,7 @@ mod tests {
     #[test]
     fn apply_defaults_repairs_lockout_prone_hardening_defaults() {
         let mut cfg = Config::default_generated();
-        cfg.cameras.push(CameraConfig {
+        cfg.camera_devices.push(CameraDeviceConfig {
             source_id: "cam-1".to_string(),
             name: "Front".to_string(),
             onvif_host: "10.0.0.10".to_string(),
@@ -1428,7 +1431,7 @@ mod tests {
             ptz_capable: true,
             enabled: true,
             segment_secs: 10,
-            desired: CameraDesiredConfig {
+            desired: CameraDeviceDesiredConfig {
                 hardening: CameraHardeningConfig {
                     enable_onvif: false,
                     disable_http: true,
@@ -1441,14 +1444,14 @@ mod tests {
         });
 
         cfg.apply_defaults();
-        assert!(!cfg.cameras[0].desired.hardening.disable_http);
-        assert!(cfg.cameras[0].desired.hardening.disable_https);
+        assert!(!cfg.camera_devices[0].desired.hardening.disable_http);
+        assert!(cfg.camera_devices[0].desired.hardening.disable_https);
     }
 
     #[test]
     fn apply_defaults_allows_http_and_https_disabled_when_onvif_recovery_exists() {
         let mut cfg = Config::default_generated();
-        cfg.cameras.push(CameraConfig {
+        cfg.camera_devices.push(CameraDeviceConfig {
             source_id: "cam-1".to_string(),
             name: "Front".to_string(),
             onvif_host: "10.0.0.10".to_string(),
@@ -1464,7 +1467,7 @@ mod tests {
             ptz_capable: true,
             enabled: true,
             segment_secs: 10,
-            desired: CameraDesiredConfig {
+            desired: CameraDeviceDesiredConfig {
                 hardening: CameraHardeningConfig {
                     enable_onvif: true,
                     disable_http: true,
@@ -1477,15 +1480,15 @@ mod tests {
         });
 
         cfg.apply_defaults();
-        assert!(cfg.cameras[0].desired.hardening.disable_http);
-        assert!(cfg.cameras[0].desired.hardening.disable_https);
+        assert!(cfg.camera_devices[0].desired.hardening.disable_http);
+        assert!(cfg.camera_devices[0].desired.hardening.disable_https);
     }
 
     #[test]
     fn apply_defaults_normalizes_legacy_reolink_camera_metadata() {
         let mut cfg = Config::default_generated();
         cfg.camera_network.subnet_cidr = "192.168.250.0/24".to_string();
-        cfg.cameras.push(CameraConfig {
+        cfg.camera_devices.push(CameraDeviceConfig {
             source_id: "reolink-192-168-250-97".to_string(),
             name: "Reolink E1 Outdoor SE".to_string(),
             onvif_host: "192.168.250.97".to_string(),
@@ -1501,12 +1504,12 @@ mod tests {
             ptz_capable: false,
             enabled: true,
             segment_secs: 10,
-            desired: CameraDesiredConfig::default(),
+            desired: CameraDeviceDesiredConfig::default(),
             credentials: CameraCredentialState::default(),
         });
 
         cfg.apply_defaults();
-        let camera = &cfg.cameras[0];
+        let camera = &cfg.camera_devices[0];
         assert_eq!(camera.driver_id, "reolink");
         assert_eq!(camera.vendor, "Reolink");
         assert_eq!(camera.model, "E1 Outdoor SE");
@@ -1518,7 +1521,7 @@ mod tests {
     #[test]
     fn apply_defaults_migrates_legacy_xm_driver_to_xm_40e() {
         let mut cfg = Config::default_generated();
-        cfg.cameras.push(CameraConfig {
+        cfg.camera_devices.push(CameraDeviceConfig {
             source_id: "xm-192-168-0-201".to_string(),
             name: "XM Camera".to_string(),
             onvif_host: "192.168.0.201".to_string(),
@@ -1534,12 +1537,12 @@ mod tests {
             ptz_capable: false,
             enabled: true,
             segment_secs: 10,
-            desired: CameraDesiredConfig::default(),
+            desired: CameraDeviceDesiredConfig::default(),
             credentials: CameraCredentialState::default(),
         });
 
         cfg.apply_defaults();
-        let camera = &cfg.cameras[0];
+        let camera = &cfg.camera_devices[0];
         assert_eq!(camera.driver_id, "xm_40e");
         assert_eq!(camera.vendor, "XM/NetSurveillance");
         assert_eq!(camera.desired.display_name, "XM Camera");

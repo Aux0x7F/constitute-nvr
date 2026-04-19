@@ -1,17 +1,13 @@
-use crate::config::{CameraConfig, Config};
-use crate::drivers::driver_is_xm;
-use anyhow::{Result, anyhow};
+use crate::config::{CameraDeviceConfig as CameraConfig, Config};
+use anyhow::Result;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::process::Command;
 use tokio::sync::Mutex;
-use tokio::time::{Duration, sleep, timeout};
-use tracing::{info, warn};
+use tokio::time::{Duration, timeout};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiscoveredCamera {
@@ -49,7 +45,7 @@ impl RecorderManager {
 
     pub async fn ensure_started(&self, cfg: &Config) {
         let storage_root = cfg.storage_root();
-        for cam in &cfg.cameras {
+        for cam in &cfg.camera_devices {
             self.upsert_camera(storage_root.clone(), cam.clone()).await;
         }
     }
@@ -75,10 +71,15 @@ impl RecorderManager {
             let camera = cam.clone();
             let state_ref = Arc::clone(&state);
             Some(tokio::spawn(async move {
-                if let Err(err) = record_loop(storage_root, camera, Arc::clone(&state_ref)).await {
-                    warn!(error = %err, source = %source_id, "camera recorder exited");
-                    update_state(&state_ref, "failed", 0, String::from(err.to_string()), None)
-                        .await;
+                if let Err(err) = super::worker::record_loop(
+                    storage_root,
+                    camera,
+                    Arc::clone(&state_ref),
+                )
+                .await
+                {
+                    tracing::warn!(error = %err, source = %source_id, "camera recorder exited");
+                    update_state(&state_ref, "failed", 0, err.to_string(), None).await;
                 }
             }))
         } else {
@@ -90,7 +91,7 @@ impl RecorderManager {
     }
 
     pub async fn remove_camera(&self, source_id: &str) -> bool {
-        let source = String::from(source_id);
+        let source = source_id.to_string();
         let entry = {
             let mut guard = self.inner.lock().await;
             guard.remove(&source)
@@ -109,174 +110,19 @@ impl RecorderManager {
     pub async fn list_states(&self) -> Vec<SourceRuntimeState> {
         let entries: Vec<Arc<Mutex<SourceRuntimeState>>> = {
             let guard = self.inner.lock().await;
-            guard.values().map(|e| Arc::clone(&e.state)).collect()
+            guard.values().map(|entry| Arc::clone(&entry.state)).collect()
         };
 
         let mut out = Vec::with_capacity(entries.len());
         for state in entries {
             out.push(state.lock().await.clone());
         }
-        out.sort_by(|a, b| a.source_id.cmp(&b.source_id));
+        out.sort_by(|left, right| left.source_id.cmp(&right.source_id));
         out
     }
 }
 
-async fn record_loop(
-    storage_root: PathBuf,
-    cam: CameraConfig,
-    state: Arc<Mutex<SourceRuntimeState>>,
-) -> Result<()> {
-    let out_dir = storage_root.join("segments").join(sanitize(&cam.source_id));
-    tokio::fs::create_dir_all(&out_dir).await?;
-
-    let output_pattern = out_dir.join("%Y%m%dT%H%M%S.mp4");
-    let mut restart_attempt: u64 = 0;
-
-    loop {
-        update_state(&state, "starting", restart_attempt, String::new(), Some(0)).await;
-        let baseline_segments = count_segment_files(&out_dir).await?;
-
-        let mut cmd = Command::new("ffmpeg");
-        cmd.args(build_ffmpeg_record_args(&cam, &output_pattern))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-
-        info!(
-            source = %cam.source_id,
-            onvif_host = %cam.onvif_host,
-            segment_secs = cam.segment_secs,
-            "starting ffmpeg recorder"
-        );
-        update_state(
-            &state,
-            "connecting",
-            restart_attempt,
-            String::new(),
-            Some(0),
-        )
-        .await;
-
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    return Err(anyhow!("ffmpeg not found in PATH"));
-                }
-
-                let message = format!("failed to launch ffmpeg: {}", err);
-                warn!(source = %cam.source_id, error = %err, "failed to launch ffmpeg; retrying");
-                restart_attempt = restart_attempt.saturating_add(1);
-                let backoff = backoff_secs(restart_attempt);
-                update_state(&state, "backoff", restart_attempt, message, Some(backoff)).await;
-                sleep(Duration::from_secs(backoff)).await;
-                continue;
-            }
-        };
-
-        let mut marked_running = false;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let message = format!("ffmpeg exited with code {:?}", status.code());
-                    warn!(source = %cam.source_id, code = ?status.code(), "ffmpeg exited; restarting");
-                    restart_attempt = restart_attempt.saturating_add(1);
-                    let backoff = backoff_secs(restart_attempt);
-                    update_state(&state, "backoff", restart_attempt, message, Some(backoff)).await;
-                    sleep(Duration::from_secs(backoff)).await;
-                    break;
-                }
-                Ok(None) => {
-                    if !marked_running {
-                        let current_segments = count_segment_files(&out_dir)
-                            .await
-                            .unwrap_or(baseline_segments);
-                        if current_segments > baseline_segments {
-                            marked_running = true;
-                            update_state(
-                                &state,
-                                "running",
-                                restart_attempt,
-                                String::new(),
-                                Some(0),
-                            )
-                            .await;
-                        }
-                    }
-                    sleep(Duration::from_secs(1)).await;
-                }
-                Err(err) => {
-                    let message = format!("ffmpeg status check failed: {}", err);
-                    warn!(source = %cam.source_id, error = %err, "failed to inspect ffmpeg status; retrying");
-                    restart_attempt = restart_attempt.saturating_add(1);
-                    let backoff = backoff_secs(restart_attempt);
-                    update_state(&state, "backoff", restart_attempt, message, Some(backoff)).await;
-                    sleep(Duration::from_secs(backoff)).await;
-                    break;
-                }
-            }
-        }
-    }
-}
-
-async fn count_segment_files(out_dir: &PathBuf) -> Result<u64> {
-    let mut count = 0u64;
-    let mut reader = tokio::fs::read_dir(out_dir).await?;
-    while let Some(entry) = reader.next_entry().await? {
-        if entry
-            .path()
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("mp4"))
-            .unwrap_or(false)
-        {
-            count = count.saturating_add(1);
-        }
-    }
-    Ok(count)
-}
-
-fn backoff_secs(attempt: u64) -> u64 {
-    let p = attempt.clamp(1, 6);
-    let secs = 2_u64.pow(p as u32);
-    secs.min(30)
-}
-
-fn build_ffmpeg_record_args(cam: &CameraConfig, output_pattern: &std::path::Path) -> Vec<String> {
-    let mut args = vec![
-        "-hide_banner".to_string(),
-        "-loglevel".to_string(),
-        "warning".to_string(),
-        "-rtsp_transport".to_string(),
-        "tcp".to_string(),
-        "-i".to_string(),
-        cam.rtsp_url.clone(),
-    ];
-    if driver_is_xm(&cam.driver_id) {
-        args.extend([
-            "-map".to_string(),
-            "0:v:0".to_string(),
-            "-c:v".to_string(),
-            "copy".to_string(),
-        ]);
-    } else {
-        args.extend(["-c".to_string(), "copy".to_string()]);
-    }
-    args.extend([
-        "-f".to_string(),
-        "segment".to_string(),
-        "-segment_time".to_string(),
-        cam.segment_secs.to_string(),
-        "-reset_timestamps".to_string(),
-        "1".to_string(),
-        "-strftime".to_string(),
-        "1".to_string(),
-        output_pattern.to_string_lossy().to_string(),
-    ]);
-    args
-}
-
-async fn update_state(
+pub(crate) async fn update_state(
     state: &Arc<Mutex<SourceRuntimeState>>,
     status: &str,
     restart_attempt: u64,
@@ -289,6 +135,32 @@ async fn update_state(
     guard.backoff_secs = backoff_secs.unwrap_or(guard.backoff_secs);
     guard.last_error = last_error;
     guard.updated_at = now_ms();
+}
+
+pub(crate) fn backoff_secs(attempt: u64) -> u64 {
+    let p = attempt.clamp(1, 6);
+    let secs = 2_u64.pow(p as u32);
+    secs.min(30)
+}
+
+pub(crate) fn sanitize(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 pub async fn discover_onvif(timeout_secs: u64) -> Result<Vec<DiscoveredCamera>> {
@@ -315,12 +187,10 @@ pub async fn discover_onvif(timeout_secs: u64) -> Result<Vec<DiscoveredCamera>> 
         }
     }
 
-    let out = seen
+    Ok(seen
         .into_iter()
         .map(|(endpoint, from)| DiscoveredCamera { endpoint, from })
-        .collect::<Vec<_>>();
-
-    Ok(out)
+        .collect())
 }
 
 fn build_probe_xml() -> String {
@@ -362,29 +232,10 @@ fn extract_xaddrs(xml: &str) -> Vec<String> {
     out
 }
 
-fn sanitize(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::{ffmpeg, planner};
 
     #[test]
     fn parse_xaddr() {
@@ -421,7 +272,11 @@ mod tests {
             desired: Default::default(),
             credentials: Default::default(),
         };
-        let args = build_ffmpeg_record_args(&camera, &PathBuf::from("/tmp/out-%Y%m%dT%H%M%S.mp4"));
+        let plan = planner::recording_pipeline_plan(&camera);
+        let args = ffmpeg::build_recording_ffmpeg_args(
+            &plan,
+            &PathBuf::from("/tmp/out-%Y%m%dT%H%M%S.mp4"),
+        );
         assert!(args.windows(2).any(|pair| pair == ["-map", "0:v:0"]));
         assert!(args.windows(2).any(|pair| pair == ["-c:v", "copy"]));
         assert!(!args.windows(2).any(|pair| pair == ["-c", "copy"]));

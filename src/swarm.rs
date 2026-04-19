@@ -219,8 +219,8 @@ async fn announce_loop(
             _ = announce_tick.tick() => {
                 let peers_known = peers.lock().await.len() as u64;
                 let peers_confirmed = table.lock().await.values().filter(|p| p.confirmed).count() as u64;
-                let cameras_total = cfg.cameras.len() as u64;
-                let cameras_enabled = cfg.cameras.iter().filter(|c| c.enabled).count() as u64;
+                let cameras_total = cfg.camera_devices.len() as u64;
+                let cameras_enabled = cfg.camera_devices.iter().filter(|c| c.enabled).count() as u64;
                 let metrics = DeviceMetricsPayload {
                     uptime_sec: started_at.elapsed().as_secs(),
                     peers_known,

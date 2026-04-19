@@ -1,13 +1,23 @@
-use crate::camera;
+pub mod apply;
+pub mod control;
+pub mod discovery;
+pub mod drivers;
+pub mod identification;
+pub mod inventory;
+pub mod mount;
+pub mod protocol;
+pub mod registry;
+pub mod types;
+
 use crate::config::{
-    CameraConfig, CameraDesiredConfig, Config, adopt_camera_active_password,
-    camera_credential_candidates, finalize_camera_password_rotation, mark_camera_rotation_failed,
+    CameraDeviceConfig as CameraConfig, CameraDeviceDesiredConfig as CameraDesiredConfig, Config,
+    adopt_camera_active_password,
+    camera_device_credential_candidates as camera_credential_candidates,
+    finalize_camera_password_rotation,
+    mark_camera_device_rotation_failed as mark_camera_rotation_failed,
     mark_camera_rotation_pending,
 };
-use crate::onvif;
-use crate::reolink;
-use crate::reolink_cgi;
-use crate::xm;
+use crate::recording;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, LocalResult, NaiveDateTime, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -24,10 +34,12 @@ use tokio::net::TcpStream;
 use tokio::process::Command as TokioCommand;
 use tokio::time::{Duration, Instant, sleep, timeout};
 
-pub const DRIVER_ID_REOLINK: &str = "reolink";
-pub const DRIVER_ID_XM_40E: &str = "xm_40e";
-pub const DRIVER_ID_XM_RTSP: &str = "xm_rtsp";
-pub const DRIVER_ID_GENERIC_ONVIF_RTSP: &str = "generic_onvif_rtsp";
+use self::drivers::reolink::{cgi as reolink_cgi, driver as reolink};
+use self::drivers::xm_40e::driver as xm;
+use self::protocol::onvif;
+use self::registry::{
+    DRIVER_ID_GENERIC_ONVIF_RTSP, DRIVER_ID_REOLINK, DRIVER_ID_XM_40E, driver_is_xm,
+};
 const REOLINK_NATIVE_PTZ_SETTLE_TIMEOUT_MS: u64 = 5_000;
 const REOLINK_NATIVE_PTZ_POLL_INTERVAL_MS: u64 = 250;
 const REOLINK_CGI_FALLBACK_MIN_PULSE_MS: u64 = 180;
@@ -213,10 +225,15 @@ pub struct CameraPtzControlResult {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CameraInventory {
-    pub mounted: Vec<MountedCamera>,
-    pub candidates: Vec<DiscoveredCameraCandidate>,
+    pub mounted_devices: Vec<MountedCamera>,
+    pub candidate_devices: Vec<DiscoveredCameraCandidate>,
     pub camera_network: CameraNetworkSummary,
 }
+
+pub use apply::apply_camera_device_config;
+pub use control::control_camera_device;
+pub use inventory::{list_camera_device_inventory, read_camera_device};
+pub use mount::mount_camera_device;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -238,7 +255,7 @@ pub struct MountCameraRequest {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CameraMountResult {
+pub struct CameraDeviceMountResult {
     #[serde(skip_serializing, skip_deserializing)]
     pub configured: CameraConfig,
     pub mounted: MountedCamera,
@@ -253,7 +270,7 @@ pub struct ApplyMountedCameraRequest {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CameraApplyResult {
+pub struct CameraDeviceApplyResult {
     #[serde(skip_serializing, skip_deserializing)]
     pub configured: CameraConfig,
     pub mounted: MountedCamera,
@@ -411,13 +428,6 @@ fn site_time_policy(cfg: &Config) -> SiteTimePolicy {
     }
 }
 
-pub fn driver_is_xm(driver_id: &str) -> bool {
-    matches!(
-        driver_id.trim(),
-        DRIVER_ID_XM_40E | DRIVER_ID_XM_RTSP
-    )
-}
-
 fn same_ipv4_subnet(left: Ipv4Addr, right: Ipv4Addr, prefix: u8) -> bool {
     if prefix > 32 {
         return false;
@@ -521,7 +531,7 @@ fn reolink_observed_time_mode(
 ) -> String {
     onvif_state
         .map(|state| state.time_mode.clone())
-        .filter(|value| !value.trim().is_empty())
+        .filter(|value: &String| !value.trim().is_empty())
         .unwrap_or_else(|| presentation.time_mode.clone())
 }
 
@@ -531,7 +541,7 @@ fn reolink_observed_ntp_server(
 ) -> String {
     onvif_state
         .map(|state| state.ntp_server.clone())
-        .filter(|value| !value.trim().is_empty())
+        .filter(|value: &String| !value.trim().is_empty())
         .unwrap_or_else(|| presentation.ntp_server.clone())
 }
 
@@ -544,7 +554,7 @@ fn reolink_observed_manual_time(
     }
     onvif_state
         .map(|state| state.manual_time.clone())
-        .filter(|value| !value.trim().is_empty())
+        .filter(|value: &String| !value.trim().is_empty())
         .unwrap_or_default()
 }
 
@@ -557,20 +567,8 @@ fn reolink_observed_timezone(
     }
     onvif_state
         .map(|state| state.timezone.clone())
-        .filter(|value| !value.trim().is_empty())
+        .filter(|value: &String| !value.trim().is_empty())
         .unwrap_or_default()
-}
-
-pub async fn list_inventory(cfg: &Config) -> Result<CameraInventory> {
-    let mut mounted = Vec::with_capacity(cfg.cameras.len());
-    for camera in &cfg.cameras {
-        mounted.push(read_mounted_camera(cfg, camera).await);
-    }
-    Ok(CameraInventory {
-        mounted,
-        candidates: discover_candidates(cfg).await?,
-        camera_network: camera_network_summary(cfg),
-    })
 }
 
 pub async fn discover_candidates(cfg: &Config) -> Result<Vec<DiscoveredCameraCandidate>> {
@@ -587,7 +585,7 @@ pub async fn discover_candidates(cfg: &Config) -> Result<Vec<DiscoveredCameraCan
         push_unique_string(&mut candidate.discovered_via, "dhcp_lease");
     }
 
-    for discovered in camera::discover_onvif(2).await.unwrap_or_default() {
+    for discovered in recording::discover_onvif(2).await.unwrap_or_default() {
         let Some((ip, _)) = host_and_port_from_xaddr(&discovered.endpoint) else {
             continue;
         };
@@ -656,123 +654,6 @@ pub async fn discover_candidates(cfg: &Config) -> Result<Vec<DiscoveredCameraCan
     Ok(out)
 }
 
-pub async fn mount_candidate(
-    cfg: &Config,
-    request: MountCameraRequest,
-) -> Result<CameraMountResult> {
-    let candidate = request.candidate.clone();
-    let driver_match = if request.candidate.driver_match.mountable {
-        request.candidate.driver_match.clone()
-    } else {
-        match_candidate(&candidate)
-    };
-    if !driver_match.mountable {
-        return Err(anyhow!("camera candidate is not mountable yet"));
-    }
-
-    let display_name = if request.display_name.trim().is_empty() {
-        candidate_display_name(&candidate)
-    } else {
-        request.display_name.trim().to_string()
-    };
-    let username = if request.username.trim().is_empty() {
-        "admin".to_string()
-    } else {
-        request.username.trim().to_string()
-    };
-    let mut camera = CameraConfig {
-        source_id: build_source_id(&candidate, &driver_match.driver_id),
-        name: display_name.clone(),
-        onvif_host: candidate.ip.trim().to_string(),
-        onvif_port: derive_onvif_port(&candidate),
-        rtsp_url: derive_rtsp_url(
-            &candidate,
-            &driver_match.driver_id,
-            &username,
-            &request.password,
-            &request.rtsp_url,
-        ),
-        username,
-        password: request.password.trim().to_string(),
-        driver_id: driver_match.driver_id.clone(),
-        vendor: derive_vendor(&candidate, &driver_match.driver_id),
-        model: candidate.signatures.model.clone(),
-        mac_address: candidate.mac.clone(),
-        rtsp_port: derive_rtsp_port(&candidate, &request.rtsp_url),
-        ptz_capable: candidate_ptz_capable(&candidate),
-        enabled: true,
-        segment_secs: 10,
-        desired: CameraDesiredConfig {
-            display_name: display_name.clone(),
-            overlay_text: if driver_is_xm(&driver_match.driver_id) {
-                String::new()
-            } else {
-                display_name.clone()
-            },
-            overlay_timestamp: !driver_is_xm(&driver_match.driver_id),
-            desired_password: request.desired_password.trim().to_string(),
-            generate_password: request.generate_password,
-            ..Default::default()
-        },
-        credentials: Default::default(),
-    };
-    normalize_camera_defaults(cfg, &mut camera);
-    camera = apply_driver_mount(cfg, &camera).await?;
-    Ok(CameraMountResult {
-        configured: camera.clone(),
-        mounted: read_mounted_camera(cfg, &camera).await,
-    })
-}
-
-pub async fn apply_mounted_camera(
-    cfg: &Config,
-    request: ApplyMountedCameraRequest,
-) -> Result<CameraApplyResult> {
-    let existing = cfg
-        .cameras
-        .iter()
-        .find(|camera| camera.source_id.trim() == request.source_id.trim())
-        .cloned()
-        .ok_or_else(|| anyhow!("camera source is not configured"))?;
-    let mut next = existing.clone();
-    next.desired = request.desired.clone();
-    sync_display_name_and_linked_overlay(&existing, &mut next);
-    normalize_camera_defaults(cfg, &mut next);
-    let requested_fields = requested_apply_fields(&existing, &next);
-    next = apply_driver_desired(cfg, &existing, &next).await?;
-    let mounted = read_mounted_camera(cfg, &next).await;
-    let verification_failures =
-        requested_verification_failures(&mounted.verification, &requested_fields);
-    if !verification_failures.is_empty() {
-        let requested_name = next.desired.display_name.trim();
-        let observed_name = mounted.observed.display_name.trim();
-        let detail = if verification_failures.iter().any(|field| field == "display_name")
-            && !requested_name.is_empty()
-        {
-            format!(
-                "requested camera name {:?}, observed {:?}",
-                requested_name,
-                if observed_name.is_empty() {
-                    "<empty>"
-                } else {
-                    observed_name
-                }
-            )
-        } else {
-            mounted.verification.message.clone()
-        };
-        return Err(anyhow!(
-            "camera apply did not verify requested field(s): {} ({})",
-            verification_failures.join(", "),
-            detail
-        ));
-    }
-    Ok(CameraApplyResult {
-        configured: next.clone(),
-        mounted,
-    })
-}
-
 fn sync_display_name_and_linked_overlay(existing: &CameraConfig, next: &mut CameraConfig) {
     let requested_display_name = next.desired.display_name.trim();
     if requested_display_name.is_empty() {
@@ -795,16 +676,6 @@ fn sync_display_name_and_linked_overlay(existing: &CameraConfig, next: &mut Came
     }
 }
 
-pub async fn read_camera(cfg: &Config, source_id: &str) -> Result<MountedCamera> {
-    let camera = cfg
-        .cameras
-        .iter()
-        .find(|camera| camera.source_id.trim() == source_id.trim())
-        .cloned()
-        .ok_or_else(|| anyhow!("camera source is not configured"))?;
-    Ok(read_mounted_camera(cfg, &camera).await)
-}
-
 pub async fn control_mounted_camera(
     camera: &CameraConfig,
     ptz_payload: &Value,
@@ -818,9 +689,9 @@ pub async fn control_mounted_camera(
     }
 }
 
-pub async fn probe_camera(cfg: &Config, request: ProbeCameraRequest) -> Result<Value> {
+pub async fn probe_camera_device(cfg: &Config, request: ProbeCameraRequest) -> Result<Value> {
     if !request.source_id.trim().is_empty() {
-        let camera = read_camera(cfg, &request.source_id).await?;
+        let camera = read_camera_device(cfg, &request.source_id).await?;
         return Ok(json!({
             "mode": "mounted",
             "camera": camera,
@@ -828,7 +699,7 @@ pub async fn probe_camera(cfg: &Config, request: ProbeCameraRequest) -> Result<V
         }));
     }
     if request.ip.trim().is_empty() {
-        return Err(anyhow!("probe_camera requires source_id or ip"));
+        return Err(anyhow!("probe_camera_device requires source_id or ip"));
     }
     let mut candidate = blank_candidate(&request.ip);
     hydrate_candidate(&mut candidate, &http_client()?).await?;
@@ -1676,77 +1547,6 @@ async fn control_reolink_cgi_fallback(
         }),
         ..Default::default()
     })
-}
-
-pub async fn read_mounted_camera(cfg: &Config, camera: &CameraConfig) -> MountedCamera {
-    let base_capabilities = driver_capabilities(camera);
-    match read_observed_state(camera).await {
-        Ok(observed) => {
-            let capabilities =
-                capabilities_for_observed(camera, base_capabilities.clone(), &observed);
-            let display_name = first_nonempty(&observed.display_name, &camera_display_name(camera));
-            let vendor = first_nonempty(&observed.vendor, &camera.vendor);
-            let model = first_nonempty(&observed.model, &camera.model);
-            MountedCamera {
-                source_id: camera.source_id.clone(),
-                driver_id: first_nonempty(&observed.driver_id, &camera.driver_id),
-                display_name,
-                vendor,
-                model,
-                ip: camera.onvif_host.clone(),
-                mac_address: camera.mac_address.clone(),
-                enabled: camera.enabled,
-                rtsp_url: camera.rtsp_url.clone(),
-                capabilities: capabilities.clone(),
-                credential_safety: credential_safety(camera),
-                desired: camera.desired.clone(),
-                current_pose: observed.current_pose.clone(),
-                desired_pose: observed.current_pose.clone(),
-                pose_status: observed.pose_status.clone(),
-                verification: verification_for_observed(
-                    cfg,
-                    camera,
-                    &observed,
-                    &capabilities,
-                    Vec::new(),
-                ),
-                observed,
-            }
-        }
-        Err(error) => {
-            let observed = fallback_observed_state(camera).await;
-            let capabilities =
-                capabilities_for_observed(camera, base_capabilities.clone(), &observed);
-            let display_name = first_nonempty(&observed.display_name, &camera_display_name(camera));
-            let vendor = first_nonempty(&observed.vendor, &camera.vendor);
-            let model = first_nonempty(&observed.model, &camera.model);
-            MountedCamera {
-                source_id: camera.source_id.clone(),
-                driver_id: camera.driver_id.clone(),
-                display_name,
-                vendor,
-                model,
-                ip: camera.onvif_host.clone(),
-                mac_address: camera.mac_address.clone(),
-                enabled: camera.enabled,
-                rtsp_url: camera.rtsp_url.clone(),
-                capabilities: capabilities.clone(),
-                credential_safety: credential_safety(camera),
-                desired: camera.desired.clone(),
-                current_pose: observed.current_pose.clone(),
-                desired_pose: observed.current_pose.clone(),
-                pose_status: observed.pose_status.clone(),
-                observed,
-                verification: CameraReconcileResult {
-                    status: "failed".to_string(),
-                    message: error.to_string(),
-                    failed_fields: vec!["read_state".to_string()],
-                    unsupported_fields: unsupported_fields(cfg, camera, &capabilities),
-                    ..Default::default()
-                },
-            }
-        }
-    }
 }
 
 fn match_candidate(candidate: &DiscoveredCameraCandidate) -> DriverMatch {
@@ -3447,9 +3247,9 @@ fn xm_preview_rtsp_url(url: &str) -> String {
 
 fn normalize_camera_defaults(cfg: &Config, camera: &mut CameraConfig) {
     let mut snapshot = cfg.clone();
-    snapshot.cameras.push(camera.clone());
+    snapshot.camera_devices.push(camera.clone());
     snapshot.apply_defaults();
-    if let Some(last) = snapshot.cameras.into_iter().last() {
+    if let Some(last) = snapshot.camera_devices.into_iter().last() {
         *camera = last;
     }
 }

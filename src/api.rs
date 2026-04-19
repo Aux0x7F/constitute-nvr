@@ -1,14 +1,15 @@
-use crate::camera;
-use crate::camera::RecorderManager;
-use crate::config::{CameraConfig, CameraDesiredConfig, Config};
+use crate::camera_device;
+use crate::config::{
+    CameraDeviceConfig as CameraConfig, CameraDeviceDesiredConfig as CameraDesiredConfig, Config,
+};
 use crate::crypto;
-use crate::drivers;
 use crate::hosted_registry;
 use crate::live::{
     ManagedAdminRequest, ManagedCloseRequest, ManagedControlRequest, ManagedOfferRequest,
     PreviewManager, resolve_admin_token, resolve_control_camera,
 };
-use crate::reolink;
+use crate::camera_device::drivers::reolink::driver as reolink;
+use crate::recording::RecorderManager;
 use crate::storage::StorageManager;
 use crate::util;
 use anyhow::{Result, anyhow};
@@ -107,12 +108,12 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
     let runtime = state.recorder.list_states().await;
     let cfg = state.cfg.lock().await.clone();
     let sources = cfg
-        .cameras
+        .camera_devices
         .iter()
         .map(|cam| cam.source_id.clone())
         .collect::<Vec<_>>();
     let cameras = cfg
-        .cameras
+        .camera_devices
         .iter()
         .map(|cam| HealthCameraView {
             source_id: cam.source_id.clone(),
@@ -152,10 +153,10 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
         "hostGatewayPk": cfg.gateway.host_gateway_pk,
         "sources": sources,
         "retainedSources": retained_sources,
-        "cameras": cameras,
+        "cameraDevices": cameras,
         "cameraNetwork": camera_network,
         "sourceRuntime": runtime,
-        "configuredSources": cfg.cameras.len(),
+        "configuredSources": cfg.camera_devices.len(),
     }))
 }
 
@@ -169,7 +170,7 @@ async fn managed_offer(
 ) -> impl IntoResponse {
     let cfg = state.cfg.lock().await.clone();
     match state.preview.handle_offer(&cfg, request).await {
-        Ok(response) => Json(json!({
+        Ok(response) => Json::<Value>(json!({
             "signalType": response.signal_type,
             "payload": response.answer,
             "answer": response.answer,
@@ -179,7 +180,7 @@ async fn managed_offer(
         .into_response(),
         Err(err) => (
             StatusCode::BAD_REQUEST,
-            Json(json!({
+            Json::<Value>(json!({
                 "error": err.to_string(),
             })),
         )
@@ -193,10 +194,10 @@ async fn managed_close(
 ) -> impl IntoResponse {
     let cfg = state.cfg.lock().await.clone();
     match state.preview.handle_close(&cfg, request).await {
-        Ok(response) => Json(response).into_response(),
+        Ok(response) => Json::<Value>(response).into_response(),
         Err(err) => (
             StatusCode::BAD_REQUEST,
-            Json(json!({
+            Json::<Value>(json!({
                 "error": err.to_string(),
             })),
         )
@@ -214,7 +215,7 @@ async fn managed_control(
         Err(err) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({
+                Json::<Value>(json!({
                     "error": err.to_string(),
                 })),
             )
@@ -231,15 +232,15 @@ async fn managed_control(
     if !ptz_capable {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({
+            Json::<Value>(json!({
                 "error": "camera does not advertise PTZ control",
             })),
         )
             .into_response();
     }
 
-    match drivers::control_mounted_camera(&camera, &ptz_payload).await {
-        Ok(result) => Json(json!({
+    match camera_device::control_camera_device(&camera, &ptz_payload).await {
+        Ok(result) => Json::<Value>(json!({
             "signalType": "control_ack",
             "sourceId": camera.source_id,
             "preempted": request.preempted,
@@ -255,7 +256,7 @@ async fn managed_control(
         .into_response(),
         Err(err) => (
             StatusCode::BAD_REQUEST,
-            Json(json!({
+            Json::<Value>(json!({
                 "error": err.to_string(),
             })),
         )
@@ -271,44 +272,44 @@ async fn managed_admin(
     if let Err(err) = resolve_admin_token(&cfg, &request.launch_token) {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({ "error": err.to_string() })),
+            Json::<Value>(json!({ "error": err.to_string() })),
         )
             .into_response();
     }
 
     let action = request.action.trim().to_ascii_lowercase();
     let response = match action.as_str() {
-        "list_inventory" => {
-            let inventory = match drivers::list_inventory(&cfg).await {
+        "list_camera_device_inventory" => {
+            let inventory = match camera_device::inventory::list_camera_device_inventory(&cfg).await {
                 Ok(inventory) => inventory,
                 Err(err) => {
                     return (
                         StatusCode::BAD_REQUEST,
-                        Json(json!({ "error": err.to_string() })),
+                        Json::<Value>(json!({ "error": err.to_string() })),
                     )
                         .into_response();
                 }
             };
             json!({ "action": action, "inventory": inventory })
         }
-        "mount_candidate" => {
-            let mount_request: drivers::MountCameraRequest =
+        "mount_camera_device" => {
+            let mount_request: camera_device::MountCameraRequest =
                 match serde_json::from_value(request.payload.clone()) {
                     Ok(value) => value,
                     Err(err) => {
                         return (
                             StatusCode::BAD_REQUEST,
-                            Json(json!({ "error": format!("invalid mount request: {err}") })),
+                            Json::<Value>(json!({ "error": format!("invalid mount request: {err}") })),
                         )
                             .into_response();
                     }
                 };
-            let mounted = match drivers::mount_candidate(&cfg, mount_request).await {
+            let mounted = match camera_device::mount_camera_device(&cfg, mount_request).await {
                 Ok(result) => result,
                 Err(err) => {
                     return (
                         StatusCode::BAD_REQUEST,
-                        Json(json!({ "error": err.to_string() })),
+                        Json::<Value>(json!({ "error": err.to_string() })),
                     )
                         .into_response();
                 }
@@ -318,30 +319,30 @@ async fn managed_admin(
             {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": err.to_string() })),
+                    Json::<Value>(json!({ "error": err.to_string() })),
                 )
                     .into_response();
             }
             json!({ "action": action, "mounted": mounted.mounted })
         }
-        "apply_camera_config" => {
-            let apply_request: drivers::ApplyMountedCameraRequest =
+        "apply_camera_device_config" => {
+            let apply_request: camera_device::ApplyMountedCameraRequest =
                 match serde_json::from_value(request.payload.clone()) {
                     Ok(value) => value,
                     Err(err) => {
                         return (
                             StatusCode::BAD_REQUEST,
-                            Json(json!({ "error": format!("invalid apply request: {err}") })),
+                            Json::<Value>(json!({ "error": format!("invalid apply request: {err}") })),
                         )
                             .into_response();
                     }
                 };
-            let applied = match drivers::apply_mounted_camera(&cfg, apply_request).await {
+            let applied = match camera_device::apply::apply_camera_device_config(&cfg, apply_request).await {
                 Ok(result) => result,
                 Err(err) => {
                     return (
                         StatusCode::BAD_REQUEST,
-                        Json(json!({ "error": err.to_string() })),
+                        Json::<Value>(json!({ "error": err.to_string() })),
                     )
                         .into_response();
                 }
@@ -351,13 +352,13 @@ async fn managed_admin(
             {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": err.to_string() })),
+                    Json::<Value>(json!({ "error": err.to_string() })),
                 )
                     .into_response();
             }
             json!({ "action": action, "mounted": applied.mounted })
         }
-        "read_camera" => {
+        "read_camera_device" => {
             let source_id = request
                 .payload
                 .get("sourceId")
@@ -365,36 +366,36 @@ async fn managed_admin(
                 .unwrap_or_default()
                 .trim()
                 .to_string();
-            let mounted = match drivers::read_camera(&cfg, &source_id).await {
+            let mounted = match camera_device::inventory::read_camera_device(&cfg, &source_id).await {
                 Ok(result) => result,
                 Err(err) => {
                     return (
                         StatusCode::BAD_REQUEST,
-                        Json(json!({ "error": err.to_string() })),
+                        Json::<Value>(json!({ "error": err.to_string() })),
                     )
                         .into_response();
                 }
             };
             json!({ "action": action, "mounted": mounted })
         }
-        "probe_camera" => {
-            let probe_request: drivers::ProbeCameraRequest =
+        "probe_camera_device" => {
+            let probe_request: camera_device::ProbeCameraRequest =
                 match serde_json::from_value(request.payload.clone()) {
                     Ok(value) => value,
                     Err(err) => {
                         return (
                             StatusCode::BAD_REQUEST,
-                            Json(json!({ "error": format!("invalid probe request: {err}") })),
+                            Json::<Value>(json!({ "error": format!("invalid probe request: {err}") })),
                         )
                             .into_response();
                     }
                 };
-            let result = match drivers::probe_camera(&cfg, probe_request).await {
+            let result = match camera_device::probe_camera_device(&cfg, probe_request).await {
                 Ok(result) => result,
                 Err(err) => {
                     return (
                         StatusCode::BAD_REQUEST,
-                        Json(json!({ "error": err.to_string() })),
+                        Json::<Value>(json!({ "error": err.to_string() })),
                     )
                         .into_response();
                 }
@@ -404,12 +405,12 @@ async fn managed_admin(
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "unsupported admin action" })),
+                Json::<Value>(json!({ "error": "unsupported admin action" })),
             )
                 .into_response();
         }
     };
-    Json(response).into_response()
+    Json::<Value>(response).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -529,9 +530,9 @@ impl SourceUpsert {
             username: self.username,
             password: self.password,
             driver_id: if self.source_id.trim().starts_with("reolink-") {
-                drivers::DRIVER_ID_REOLINK.to_string()
+                camera_device::registry::DRIVER_ID_REOLINK.to_string()
             } else {
-                drivers::DRIVER_ID_GENERIC_ONVIF_RTSP.to_string()
+                camera_device::registry::DRIVER_ID_GENERIC_ONVIF_RTSP.to_string()
             },
             vendor: String::new(),
             model: String::new(),
@@ -786,14 +787,14 @@ async fn handle_command(
             .await?;
         }
         ClientCommand::DiscoverOnvif => {
-            let found = camera::discover_onvif(3).await?;
+            let found = crate::recording::discover_onvif(3).await?;
             send_cipher_json(
                 socket,
                 key,
                 &json!({
                     "ok": true,
                     "cmd": "discover_onvif",
-                    "cameras": found,
+                    "cameraDevices": found,
                 }),
             )
             .await?;
@@ -910,7 +911,7 @@ async fn handle_command(
                 ),
                 username: request.username.clone(),
                 password: effective_password,
-                driver_id: drivers::DRIVER_ID_REOLINK.to_string(),
+                driver_id: camera_device::registry::DRIVER_ID_REOLINK.to_string(),
                 vendor: "Reolink".to_string(),
                 model: discovered_entry
                     .as_ref()
@@ -978,9 +979,9 @@ async fn handle_command(
         ClientCommand::RemoveSource { source_id } => {
             let removed = {
                 let mut guard = state.cfg.lock().await;
-                let before = guard.cameras.len();
-                guard.cameras.retain(|c| c.source_id != source_id);
-                let changed = guard.cameras.len() != before;
+                let before = guard.camera_devices.len();
+                guard.camera_devices.retain(|c| c.source_id != source_id);
+                let changed = guard.camera_devices.len() != before;
                 if changed {
                     let snapshot = guard.clone();
                     snapshot.persist(&state.cfg_path)?;
@@ -1067,12 +1068,12 @@ async fn persist_camera_source(state: &ApiState, camera_cfg: CameraConfig) -> Re
     let storage_root =
         {
             let mut guard = state.cfg.lock().await;
-            if let Some(existing) = guard.cameras.iter_mut().find(|c| {
+            if let Some(existing) = guard.camera_devices.iter_mut().find(|c| {
                 c.source_id == camera_cfg.source_id || c.onvif_host == camera_cfg.onvif_host
             }) {
                 *existing = camera_cfg.clone();
             } else {
-                guard.cameras.push(camera_cfg.clone());
+                guard.camera_devices.push(camera_cfg.clone());
             }
             guard.apply_defaults();
             let snapshot = guard.clone();

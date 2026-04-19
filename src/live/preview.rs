@@ -1,5 +1,6 @@
-use crate::config::{CameraConfig, Config, LivePreviewConfig};
-use crate::drivers::driver_is_xm;
+use crate::camera_device::registry::driver_is_xm;
+use crate::config::{CameraDeviceConfig as CameraConfig, Config, LivePreviewConfig};
+use crate::media::{ffmpeg, planner, types::OutputCodec};
 use crate::nostr::{self, NostrEvent};
 use anyhow::{Context, Result, anyhow};
 use rtp::packet::Packet as RtpPacket;
@@ -12,7 +13,6 @@ use tokio::net::UdpSocket;
 use tokio::process::Command;
 use tokio::sync::{Mutex, watch};
 use tracing::{info, warn};
-use util::Unmarshal;
 use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_VP8, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
@@ -32,6 +32,7 @@ use webrtc::rtp_transceiver::{RTCRtpTransceiver, RTCRtpTransceiverInit};
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::TrackLocalWriter;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
+use util::marshal::Unmarshal;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ManagedIceServerHints {
@@ -329,7 +330,7 @@ impl PreviewManager {
             response_sources.push(ManagedSourceInfo {
                 source_id: camera.source_id.clone(),
                 name: camera.name.clone(),
-                rtsp_preview_url: preview_rtsp_url(camera),
+                rtsp_preview_url: planner::preview_rtsp_url(camera),
             });
         }
 
@@ -403,7 +404,7 @@ pub fn resolve_control_camera(
     {
         return Err(anyhow!("control is not granted for this camera"));
     }
-    cfg.cameras
+    cfg.camera_devices
         .iter()
         .find(|camera| camera.enabled && camera.source_id.trim() == source_id.trim())
         .cloned()
@@ -626,7 +627,7 @@ fn select_sources(
     token: &ManagedLaunchTokenPayload,
 ) -> Result<Vec<CameraConfig>> {
     let enabled = cfg
-        .cameras
+        .camera_devices
         .iter()
         .filter(|camera| camera.enabled)
         .cloned()
@@ -755,84 +756,20 @@ fn with_firefox_compatible_answer_msid(
     normalized
 }
 
-fn preview_rtsp_url(camera: &CameraConfig) -> String {
-    let mut url = camera.rtsp_url.clone();
-    if url.contains("h264Preview_01_main") {
-        url = url.replace("h264Preview_01_main", "h264Preview_01_sub");
-    } else if url.contains("h265Preview_01_main") {
-        url = url.replace("h265Preview_01_main", "h265Preview_01_sub");
-    } else if driver_is_xm(&camera.driver_id) {
-        url = url
-            .replace("_stream=0.sdp?real_stream", "_stream=1.sdp?real_stream")
-            .replace("_stream=0.sdp", "_stream=1.sdp");
-    }
-    url
-}
-
-fn build_live_preview_ffmpeg_args(preview_url: &str, codec: PreviewCodec, udp_port: u16) -> Vec<String> {
-    let mut args = vec![
-        "-nostdin".to_string(),
-        "-loglevel".to_string(),
-        "error".to_string(),
-        "-rtsp_transport".to_string(),
-        "tcp".to_string(),
-    ];
-    if codec == PreviewCodec::Vp8 {
-        // Some RTSP sources do not supply usable PTS for live VP8 preview.
-        // Generate timestamps up front so mixed-camera preview sessions do not stall.
-        args.push("-fflags".to_string());
-        args.push("+genpts".to_string());
-    }
-    args.push("-i".to_string());
-    args.push(preview_url.to_string());
-    args.push("-an".to_string());
-
-    match codec {
-        PreviewCodec::H264 => {
-            args.push("-c:v".to_string());
-            args.push("copy".to_string());
-        }
-        PreviewCodec::Vp8 => {
-            args.extend([
-                "-c:v".to_string(),
-                "libvpx".to_string(),
-                "-deadline".to_string(),
-                "realtime".to_string(),
-                "-cpu-used".to_string(),
-                "8".to_string(),
-                "-pix_fmt".to_string(),
-                "yuv420p".to_string(),
-                "-g".to_string(),
-                "30".to_string(),
-                "-keyint_min".to_string(),
-                "30".to_string(),
-                "-b:v".to_string(),
-                "1M".to_string(),
-                "-maxrate".to_string(),
-                "1M".to_string(),
-                "-bufsize".to_string(),
-                "2M".to_string(),
-            ]);
-        }
-    }
-
-    args.extend([
-        "-f".to_string(),
-        "rtp".to_string(),
-        "-payload_type".to_string(),
-        "96".to_string(),
-        format!("rtp://127.0.0.1:{udp_port}?pkt_size=1200"),
-    ]);
-    args
-}
-
 async fn run_camera_forwarder(
     camera: CameraConfig,
     track: Arc<TrackLocalStaticRTP>,
     mut stop_rx: watch::Receiver<bool>,
     codec: PreviewCodec,
 ) {
-    let preview_url = preview_rtsp_url(&camera);
+    let plan = planner::preview_pipeline_plan_for_codec(
+        &camera,
+        match codec {
+            PreviewCodec::H264 => OutputCodec::H264,
+            PreviewCodec::Vp8 => OutputCodec::Vp8,
+        },
+    );
+    let preview_url = plan.input_url.clone();
     let std_socket = match std::net::UdpSocket::bind("127.0.0.1:0") {
         Ok(socket) => socket,
         Err(err) => {
@@ -860,9 +797,8 @@ async fn run_camera_forwarder(
     };
 
     let mut ffmpeg = Command::new("ffmpeg");
-    ffmpeg.args(build_live_preview_ffmpeg_args(
-        &preview_url,
-        codec,
+    ffmpeg.args(ffmpeg::build_live_preview_ffmpeg_args(
+        &plan,
         local_addr.port(),
     ));
 
@@ -932,7 +868,7 @@ mod tests {
         let (mut cfg, _) = Config::load_or_create(&path).expect("config");
         cfg.api.identity_id = "identity-1".to_string();
         cfg.nostr_pubkey = "service-pk".to_string();
-        cfg.cameras.push(CameraConfig {
+        cfg.camera_devices.push(CameraConfig {
             source_id: "cam-1".to_string(),
             name: "Front".to_string(),
             onvif_host: "10.0.0.10".to_string(),
@@ -948,7 +884,7 @@ mod tests {
             ptz_capable: true,
             enabled: true,
             segment_secs: 10,
-            desired: crate::config::CameraDesiredConfig {
+            desired: crate::config::CameraDeviceDesiredConfig {
                 display_name: "Front".to_string(),
                 overlay_text: "Front".to_string(),
                 overlay_timestamp: true,
@@ -995,7 +931,7 @@ mod tests {
     fn preview_url_prefers_reolink_substream() {
         let cfg = sample_config();
         assert_eq!(
-            preview_rtsp_url(&cfg.cameras[0]),
+            planner::preview_rtsp_url(&cfg.camera_devices[0]),
             "rtsp://admin:pw@10.0.0.10:554/h264Preview_01_sub"
         );
     }
@@ -1085,7 +1021,7 @@ mod tests {
         });
         let cfg = sample_config();
         assert_eq!(
-            select_preview_codec_for_camera(&offer, &cfg.cameras[0]).expect("codec"),
+            select_preview_codec_for_camera(&offer, &cfg.camera_devices[0]).expect("codec"),
             PreviewCodec::H264
         );
     }
@@ -1100,7 +1036,7 @@ mod tests {
         });
         let cfg = sample_config();
         assert_eq!(
-            select_preview_codec_for_camera(&offer, &cfg.cameras[0]).expect("codec"),
+            select_preview_codec_for_camera(&offer, &cfg.camera_devices[0]).expect("codec"),
             PreviewCodec::Vp8
         );
     }
@@ -1114,7 +1050,7 @@ mod tests {
             }
         });
         let mut cfg = sample_config();
-        let mut camera = cfg.cameras.remove(0);
+        let mut camera = cfg.camera_devices.remove(0);
         camera.driver_id = "xm_40e".to_string();
         assert_eq!(
             select_preview_codec_for_camera(&offer, &camera).expect("codec"),
@@ -1131,7 +1067,7 @@ mod tests {
             }
         });
         let mut cfg = sample_config();
-        let mut camera = cfg.cameras.remove(0);
+        let mut camera = cfg.camera_devices.remove(0);
         camera.driver_id = "xm_40e".to_string();
         let err = select_preview_codec_for_camera(&offer, &camera).expect_err("xm should require vp8");
         assert!(err.to_string().contains("required for XM live preview"));
@@ -1140,22 +1076,22 @@ mod tests {
     #[test]
     fn preview_rtsp_url_uses_xm_substream() {
         let mut cfg = sample_config();
-        let mut camera = cfg.cameras.remove(0);
+        let mut camera = cfg.camera_devices.remove(0);
         camera.driver_id = "xm_40e".to_string();
         camera.rtsp_url =
             "rtsp://admin:123456@192.168.0.201:554/user=admin_password=123456_channel=1_stream=0.sdp?real_stream"
                 .to_string();
         assert_eq!(
-            preview_rtsp_url(&camera),
+            planner::preview_rtsp_url(&camera),
             "rtsp://admin:123456@192.168.0.201:554/user=admin_password=123456_channel=1_stream=1.sdp?real_stream"
         );
     }
 
     #[test]
     fn live_preview_ffmpeg_args_add_genpts_for_vp8() {
-        let args = build_live_preview_ffmpeg_args(
-            "rtsp://camera.example/sub",
-            PreviewCodec::Vp8,
+        let camera = sample_config().camera_devices.remove(0);
+        let args = ffmpeg::build_live_preview_ffmpeg_args(
+            &planner::preview_pipeline_plan_for_codec(&camera, OutputCodec::Vp8),
             41000,
         );
         let ff_idx = args.iter().position(|arg| arg == "-fflags").expect("fflags");
@@ -1167,9 +1103,9 @@ mod tests {
 
     #[test]
     fn live_preview_ffmpeg_args_omit_genpts_for_h264_copy() {
-        let args = build_live_preview_ffmpeg_args(
-            "rtsp://camera.example/sub",
-            PreviewCodec::H264,
+        let camera = sample_config().camera_devices.remove(0);
+        let args = ffmpeg::build_live_preview_ffmpeg_args(
+            &planner::preview_pipeline_plan_for_codec(&camera, OutputCodec::H264),
             41000,
         );
         assert!(!args.iter().any(|arg| arg == "+genpts"));
