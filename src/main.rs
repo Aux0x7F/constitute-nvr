@@ -4,8 +4,8 @@ mod config;
 mod crypto;
 mod hosted_registry;
 mod live;
-mod nostr;
 mod media;
+mod nostr;
 mod recording;
 mod storage;
 mod swarm;
@@ -13,9 +13,9 @@ mod update;
 mod util;
 
 use anyhow::Result;
-use clap::Parser;
 use camera_device::drivers::reolink::driver as reolink;
-use config::{CameraDeviceConfig as CameraConfig, CameraDeviceDesiredConfig, Config};
+use clap::Parser;
+use config::{CameraDeviceConfig, CameraDeviceDesiredConfig, Config};
 use recording::RecorderManager;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -231,7 +231,10 @@ async fn main() -> Result<()> {
             camera_device::ProbeCameraRequest {
                 ip: ip.trim().to_string(),
                 username: args.probe_camera_device_username.clone(),
-                password: args.probe_camera_device_password.clone().unwrap_or_default(),
+                password: args
+                    .probe_camera_device_password
+                    .clone()
+                    .unwrap_or_default(),
                 driver_id: args
                     .probe_camera_device_driver_id
                     .clone()
@@ -382,7 +385,7 @@ fn warn_if_template_cameras(cfg: &Config) {
     }
 }
 
-fn looks_like_template_camera(cam: &CameraConfig) -> bool {
+fn looks_like_template_camera(cam: &CameraDeviceConfig) -> bool {
     cam.onvif_host.trim() == "10.60.0.11"
         || cam.rtsp_url.contains("@10.60.0.11:")
         || (cam.source_id.trim() == "cam-reolink-e1"
@@ -458,15 +461,11 @@ async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<
 
         let onvif_port = if setup.bridge.after_advanced.i_onvif_port_enable != 0 {
             setup.bridge.after_advanced.i_onvif_port.max(1)
-        } else if setup.probe.onvif_port_open {
-            8000
         } else {
             8000
         };
         let rtsp_port = if setup.bridge.after_advanced.i_rtsp_port_enable != 0 {
             setup.bridge.after_advanced.i_rtsp_port.max(1)
-        } else if setup.probe.rtsp_port_open {
-            554
         } else {
             554
         };
@@ -500,7 +499,7 @@ async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<
         }
 
         if !found {
-            cfg.camera_devices.push(CameraConfig {
+            cfg.camera_devices.push(CameraDeviceConfig {
                 source_id: source_id.clone(),
                 name: source_name.clone(),
                 onvif_host: ip.clone(),

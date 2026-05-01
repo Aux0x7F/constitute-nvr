@@ -1,4 +1,4 @@
-use crate::config::{CameraDeviceConfig as CameraConfig, Config};
+use crate::config::{CameraDeviceConfig, Config};
 use anyhow::Result;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -50,7 +50,7 @@ impl RecorderManager {
         }
     }
 
-    pub async fn upsert_camera(&self, storage_root: PathBuf, cam: CameraConfig) {
+    pub async fn upsert_camera(&self, storage_root: PathBuf, cam: CameraDeviceConfig) {
         self.remove_camera(&cam.source_id).await;
 
         let state = Arc::new(Mutex::new(SourceRuntimeState {
@@ -71,12 +71,8 @@ impl RecorderManager {
             let camera = cam.clone();
             let state_ref = Arc::clone(&state);
             Some(tokio::spawn(async move {
-                if let Err(err) = super::worker::record_loop(
-                    storage_root,
-                    camera,
-                    Arc::clone(&state_ref),
-                )
-                .await
+                if let Err(err) =
+                    super::worker::record_loop(storage_root, camera, Arc::clone(&state_ref)).await
                 {
                     tracing::warn!(error = %err, source = %source_id, "camera recorder exited");
                     update_state(&state_ref, "failed", 0, err.to_string(), None).await;
@@ -110,7 +106,10 @@ impl RecorderManager {
     pub async fn list_states(&self) -> Vec<SourceRuntimeState> {
         let entries: Vec<Arc<Mutex<SourceRuntimeState>>> = {
             let guard = self.inner.lock().await;
-            guard.values().map(|entry| Arc::clone(&entry.state)).collect()
+            guard
+                .values()
+                .map(|entry| Arc::clone(&entry.state))
+                .collect()
         };
 
         let mut out = Vec::with_capacity(entries.len());
@@ -253,7 +252,7 @@ mod tests {
 
     #[test]
     fn xm_record_args_use_video_only_copy() {
-        let camera = CameraConfig {
+        let camera = CameraDeviceConfig {
             source_id: "xm-1".to_string(),
             name: "XM".to_string(),
             onvif_host: "192.168.0.201".to_string(),

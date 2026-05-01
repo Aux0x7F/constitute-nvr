@@ -1,15 +1,15 @@
 //! Reolink driver lane.
 //!
 //! Driver-specific operational truth belongs here first, with shared docs kept to
-//! compatibility and operator-facing summaries.
+//! operator-facing summaries.
 //!
 //! Active product boundary:
 //! - proprietary discovery/bootstrap and native transport live here
 //! - CGI/ONVIF presentation and site-time behavior are split by concern
 //! - PTZ remains model-sensitive and partially hidden pending full native actuation
 
-use crate::recording;
 use super::{cgi as reolink_cgi, proto as reolink_proto};
+use crate::recording;
 use anyhow::{Context, Result, anyhow};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -1404,10 +1404,10 @@ async fn run_dhcp_bootstrap(request: &ReolinkBootstrapRequest) -> Result<DhcpLea
         }
 
         let client_mac = buf[28..34].to_vec();
-        if let Some(expected) = &target_mac {
-            if &client_mac != expected {
-                continue;
-            }
+        if let Some(expected) = &target_mac
+            && &client_mac != expected
+        {
+            continue;
         }
 
         match dhcp_message_type(&buf[..len]) {
@@ -1452,6 +1452,7 @@ async fn run_dhcp_bootstrap(request: &ReolinkBootstrapRequest) -> Result<DhcpLea
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_dhcp_reply(
     request: &[u8],
     message_type: u8,
@@ -1539,8 +1540,10 @@ fn parse_discovery_payload(payload: &[u8], from: String) -> ReolinkDiscovery {
         .filter_map(parse_printable_token)
         .collect::<Vec<_>>();
 
-    let mut out = ReolinkDiscovery::default();
-    out.from = from;
+    let mut out = ReolinkDiscovery {
+        from,
+        ..Default::default()
+    };
 
     let mut extras = Vec::new();
     for value in parts {
@@ -1561,13 +1564,12 @@ fn parse_discovery_payload(payload: &[u8], from: String) -> ReolinkDiscovery {
     {
         out.model = model.clone();
     }
-    if out.model.is_empty() {
-        if let Some(model) = extras
+    if out.model.is_empty()
+        && let Some(model) = extras
             .iter()
             .find(|value| value.chars().any(|ch| ch.is_ascii_alphabetic()))
-        {
-            out.model = model.clone();
-        }
+    {
+        out.model = model.clone();
     }
     if let Some(uid) = extras
         .iter()
@@ -1575,10 +1577,10 @@ fn parse_discovery_payload(payload: &[u8], from: String) -> ReolinkDiscovery {
     {
         out.uid = uid.clone();
     }
-    if out.uid.is_empty() {
-        if let Some(uid) = extras.iter().find(|value| value != &&out.model) {
-            out.uid = uid.clone();
-        }
+    if out.uid.is_empty()
+        && let Some(uid) = extras.iter().find(|value| value != &&out.model)
+    {
+        out.uid = uid.clone();
     }
 
     out

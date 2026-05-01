@@ -72,7 +72,7 @@ struct DeviceRecordPayload {
     #[serde(skip_serializing_if = "String::is_empty")]
     session_ws_url: String,
     #[serde(default)]
-    allow_unsigned_hello_mvp: bool,
+    allow_unsigned_debug_hello: bool,
     metrics: DeviceMetricsPayload,
 }
 
@@ -271,9 +271,7 @@ async fn announce_loop(
                     }
                 }
 
-                if pair_attempts_remaining > 0 {
-                    pair_attempts_remaining -= 1;
-                }
+                pair_attempts_remaining = pair_attempts_remaining.saturating_sub(1);
                 info!(remaining = pair_attempts_remaining, identity = %pair_identity_label, "published nvr pair_request enrollment");
             }
         }
@@ -425,7 +423,7 @@ fn build_device_record(cfg: &Config, metrics: &DeviceMetricsPayload) -> Result<N
         ui_manifest_url: cfg.ui.manifest_url.clone(),
         ui_entry: cfg.ui.entry.clone(),
         session_ws_url: cfg.api.public_ws_url.clone(),
-        allow_unsigned_hello_mvp: cfg.api.allow_unsigned_hello_mvp,
+        allow_unsigned_debug_hello: cfg.api.allow_unsigned_debug_hello,
         metrics: metrics.clone(),
     };
     let content = serde_json::to_string(&payload)?;
@@ -437,8 +435,8 @@ fn build_device_record(cfg: &Config, metrics: &DeviceMetricsPayload) -> Result<N
         vec!["cap".to_string(), "camera".to_string()],
         vec![
             "hello".to_string(),
-            if cfg.api.allow_unsigned_hello_mvp {
-                "unsigned-mvp".to_string()
+            if cfg.api.allow_unsigned_debug_hello {
+                "unsigned-debug".to_string()
             } else {
                 "signed".to_string()
             },
@@ -544,13 +542,13 @@ mod tests {
         assert!(
             ev.tags
                 .iter()
-                .any(|t| t.get(0).map(String::as_str) == Some("t")
+                .any(|t| t.first().map(String::as_str) == Some("t")
                     && t.get(1).map(String::as_str) == Some("constitute"))
         );
         assert!(
             ev.tags
                 .iter()
-                .any(|t| t.get(0).map(String::as_str) == Some("z")
+                .any(|t| t.first().map(String::as_str) == Some("z")
                     && t.get(1).map(String::as_str) == Some("zone-test"))
         );
 

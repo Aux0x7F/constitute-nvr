@@ -37,7 +37,7 @@ pub struct ApiConfig {
     #[serde(default)]
     pub authorized_device_pks: Vec<String>,
     #[serde(default)]
-    pub allow_unsigned_hello_mvp: bool,
+    pub allow_unsigned_debug_hello: bool,
     pub identity_secret_hex: String,
     pub server_secret_hex: String,
 }
@@ -118,15 +118,24 @@ pub enum CameraTimeMode {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CameraHardeningConfig {
-    #[serde(default = "default_camera_hardening_enable_onvif", alias = "enableOnvif")]
+    #[serde(
+        default = "default_camera_hardening_enable_onvif",
+        alias = "enableOnvif"
+    )]
     pub enable_onvif: bool,
     #[serde(default = "default_camera_hardening_enable_rtsp", alias = "enableRtsp")]
     pub enable_rtsp: bool,
     #[serde(default = "default_camera_hardening_disable_p2p", alias = "disableP2p")]
     pub disable_p2p: bool,
-    #[serde(default = "default_camera_hardening_disable_http", alias = "disableHttp")]
+    #[serde(
+        default = "default_camera_hardening_disable_http",
+        alias = "disableHttp"
+    )]
     pub disable_http: bool,
-    #[serde(default = "default_camera_hardening_disable_https", alias = "disableHttps")]
+    #[serde(
+        default = "default_camera_hardening_disable_https",
+        alias = "disableHttps"
+    )]
     pub disable_https: bool,
     #[serde(
         default = "default_camera_hardening_preserve_proprietary_9000",
@@ -162,7 +171,10 @@ pub struct CameraDeviceDesiredConfig {
     pub timezone: String,
     #[serde(default, alias = "overlayText")]
     pub overlay_text: String,
-    #[serde(default = "default_camera_overlay_timestamp", alias = "overlayTimestamp")]
+    #[serde(
+        default = "default_camera_overlay_timestamp",
+        alias = "overlayTimestamp"
+    )]
     pub overlay_timestamp: bool,
     #[serde(default, alias = "desiredPassword")]
     pub desired_password: String,
@@ -399,11 +411,11 @@ impl Config {
             self.nostr_pubkey = pk;
             self.nostr_sk_hex = sk;
             changed = true;
-        } else if self.nostr_pubkey.trim().is_empty() {
-            if let Ok(pk) = nostr::pubkey_from_sk_hex(&self.nostr_sk_hex) {
-                self.nostr_pubkey = pk;
-                changed = true;
-            }
+        } else if self.nostr_pubkey.trim().is_empty()
+            && let Ok(pk) = nostr::pubkey_from_sk_hex(&self.nostr_sk_hex)
+        {
+            self.nostr_pubkey = pk;
+            changed = true;
         }
 
         if self.storage.encryption_key_hex.trim().is_empty() {
@@ -444,11 +456,11 @@ impl Config {
             changed = true;
         }
 
-        if self.ui.manifest_url.trim().is_empty() {
-            if let Some(url) = derive_manifest_url(&self.ui.repo, &self.ui.repo_ref) {
-                self.ui.manifest_url = url;
-                changed = true;
-            }
+        if self.ui.manifest_url.trim().is_empty()
+            && let Some(url) = derive_manifest_url(&self.ui.repo, &self.ui.repo_ref)
+        {
+            self.ui.manifest_url = url;
+            changed = true;
         }
 
         if self.autoprovision.reolink_username.trim().is_empty() {
@@ -517,7 +529,7 @@ impl Config {
                 public_ws_url: String::new(),
                 identity_id: "REPLACE_WITH_IDENTITY_ID".to_string(),
                 authorized_device_pks: Vec::new(),
-                allow_unsigned_hello_mvp: false,
+                allow_unsigned_debug_hello: false,
                 identity_secret_hex: random_hex(32),
                 server_secret_hex: random_hex(32),
             },
@@ -735,17 +747,7 @@ fn apply_camera_device_defaults(
 ) -> bool {
     let mut changed = false;
     if camera.driver_id.trim().is_empty() {
-        camera.driver_id = if camera.source_id.trim().starts_with("reolink-") {
-            "reolink".to_string()
-        } else if camera.source_id.trim().starts_with("xm-") {
-            "xm_40e".to_string()
-        } else {
-            "generic_onvif_rtsp".to_string()
-        };
-        changed = true;
-    }
-    if camera.driver_id.trim() == "xm_rtsp" {
-        camera.driver_id = "xm_40e".to_string();
+        camera.driver_id = "generic_onvif_rtsp".to_string();
         changed = true;
     }
     if camera.vendor.trim().is_empty() && camera.driver_id == "reolink" {
@@ -1280,19 +1282,11 @@ mod tests {
     #[test]
     fn apply_defaults_derives_camera_network_timezone_from_host_sources() {
         assert_eq!(
-            detect_system_timezone_from_sources(
-                Some("America/Phoenix".to_string()),
-                None,
-                None,
-            ),
+            detect_system_timezone_from_sources(Some("America/Phoenix".to_string()), None, None,),
             Some("America/Phoenix".to_string())
         );
         assert_eq!(
-            detect_system_timezone_from_sources(
-                None,
-                Some("America/Phoenix\n".to_string()),
-                None,
-            ),
+            detect_system_timezone_from_sources(None, Some("America/Phoenix\n".to_string()), None,),
             Some("America/Phoenix".to_string())
         );
         assert_eq!(
@@ -1307,10 +1301,7 @@ mod tests {
 
     #[test]
     fn apply_defaults_falls_back_to_utc_when_timezone_cannot_be_detected() {
-        assert_eq!(
-            detect_system_timezone_from_sources(None, None, None),
-            None
-        );
+        assert_eq!(detect_system_timezone_from_sources(None, None, None), None);
     }
 
     #[test]
@@ -1485,15 +1476,14 @@ mod tests {
     }
 
     #[test]
-    fn apply_defaults_normalizes_legacy_reolink_camera_metadata() {
+    fn apply_defaults_uses_generic_driver_when_driver_id_is_missing() {
         let mut cfg = Config::default_generated();
-        cfg.camera_network.subnet_cidr = "192.168.250.0/24".to_string();
         cfg.camera_devices.push(CameraDeviceConfig {
-            source_id: "reolink-192-168-250-97".to_string(),
-            name: "Reolink E1 Outdoor SE".to_string(),
+            source_id: "manual-source".to_string(),
+            name: "Manual Camera".to_string(),
             onvif_host: "192.168.250.97".to_string(),
             onvif_port: 8000,
-            rtsp_url: "rtsp://admin:pw@192.168.250.97:554/h264Preview_01_main".to_string(),
+            rtsp_url: "rtsp://admin:pw@192.168.250.97:554/stream".to_string(),
             username: "admin".to_string(),
             password: "pw".to_string(),
             driver_id: String::new(),
@@ -1510,42 +1500,7 @@ mod tests {
 
         cfg.apply_defaults();
         let camera = &cfg.camera_devices[0];
-        assert_eq!(camera.driver_id, "reolink");
-        assert_eq!(camera.vendor, "Reolink");
-        assert_eq!(camera.model, "E1 Outdoor SE");
-        assert!(camera.ptz_capable);
-        assert_eq!(camera.desired.overlay_text, "Reolink E1 Outdoor SE");
-        assert_eq!(camera.desired.display_name, "Reolink E1 Outdoor SE");
-    }
-
-    #[test]
-    fn apply_defaults_migrates_legacy_xm_driver_to_xm_40e() {
-        let mut cfg = Config::default_generated();
-        cfg.camera_devices.push(CameraDeviceConfig {
-            source_id: "xm-192-168-0-201".to_string(),
-            name: "XM Camera".to_string(),
-            onvif_host: "192.168.0.201".to_string(),
-            onvif_port: 8000,
-            rtsp_url: "rtsp://admin:123456@192.168.0.201:554/user=admin_password=123456_channel=1_stream=0.sdp?real_stream".to_string(),
-            username: "admin".to_string(),
-            password: "123456".to_string(),
-            driver_id: "xm_rtsp".to_string(),
-            vendor: String::new(),
-            model: String::new(),
-            mac_address: String::new(),
-            rtsp_port: 0,
-            ptz_capable: false,
-            enabled: true,
-            segment_secs: 10,
-            desired: CameraDeviceDesiredConfig::default(),
-            credentials: CameraCredentialState::default(),
-        });
-
-        cfg.apply_defaults();
-        let camera = &cfg.camera_devices[0];
-        assert_eq!(camera.driver_id, "xm_40e");
-        assert_eq!(camera.vendor, "XM/NetSurveillance");
-        assert_eq!(camera.desired.display_name, "XM Camera");
-        assert_eq!(camera.desired.overlay_text, "");
+        assert_eq!(camera.driver_id, "generic_onvif_rtsp");
+        assert_eq!(camera.desired.display_name, "Manual Camera");
     }
 }

@@ -12,7 +12,7 @@ It runs as a Fedora/Linux service, joins swarm as a service-backed device with `
 - gateway-authorized WebRTC H.264 live preview
 - recorded retrieval path preserved for archive access
 - systemd self-update timer flow
-- Reolink onboarding for MVP using LAN discovery + HTTP CGI setup/read/apply (RTSP/ONVIF enable, P2P disable) while native `9000` replacement remains under R&D
+- Reolink managed-driver onboarding using LAN discovery + HTTP CGI setup/read/apply (RTSP/ONVIF enable, P2P disable) while native `9000` replacement remains under R&D
 
 ## Quick Install (Opinionated Wizard)
 
@@ -29,7 +29,7 @@ Installer behavior:
 - provisions an isolated camera NIC with a collision-checked `/24` and `dnsmasq` DHCP
 - optionally applies camera-interface hardening (DHCP + RTSP/ONVIF + optional NTP lane)
 
-When copied from `constitute` Appliances panel, the command includes install-time context:
+When copied from `constitute-gateway-ui`, the command includes install-time context:
 - identity binding (`--identity-id`, authorized device PKs)
 - gateway swarm peer (`--swarm-peer`) + zone keys (`--zone-key`)
 - auto-associate enrollment (`--pair-identity`, `--pair-code`, `--pair-code-hash`)
@@ -57,7 +57,7 @@ Optional auto-provision flags:
 ## Config Highlights
 `config.example.json` includes:
 - `swarm.bind`, `swarm.peers`, `swarm.zones`
-- `api.identity_id`, `api.authorized_device_pks`, `api.public_ws_url`, `api.allow_unsigned_hello_mvp` (direct/manual debug mode only)
+- `api.identity_id`, `api.authorized_device_pks`, `api.public_ws_url`, `api.allow_unsigned_debug_hello` (direct/manual debug mode only)
 - `storage.root`, `storage.encryption_key_hex`
 - `update.interval_secs`, `update.mode`, `update.build_user`
 - `gateway.host_gateway_pk`
@@ -68,8 +68,8 @@ Optional auto-provision flags:
 - Segment-at-rest encryption uses service storage key.
 - Managed live preview requires short-lived gateway-issued authorization.
 - Direct debug session channel uses X25519 ECDH + HKDF-derived symmetric key.
-- Direct debug admission still supports the legacy HMAC proof flow for lab work.
-- Unsigned MVP mode is for local integration bring-up only and is not the canonical managed path.
+- Direct debug admission supports the signed HMAC proof flow for lab work.
+- Unsigned local debug mode is for local integration bring-up only and is not the canonical managed path.
 - Camera-network bootstrap is installer-managed; health output is redacted and never exposes camera credentials.
 - TURN remains intentionally incomplete in this iteration; direct ICE is the active path and decentralized gateway-hosted TURN stays on the roadmap for later work.
 
@@ -94,4 +94,4 @@ sudo cargo run -- --bootstrap-reolink-server-ip 192.168.1.10 --bootstrap-reolink
 - `docs/CAMERA_COMPAT.md`
 
 ## Status
-POC-grade for manual lab validation. Not production-ready.
+Active pre-prod native workload. Release readiness is gated by the project-level browser/runtime and lab acceptance checks.

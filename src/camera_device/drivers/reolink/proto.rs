@@ -831,12 +831,12 @@ pub fn split_segments(mut buf: &[u8]) -> Vec<ReolinkSegment<'_>> {
             break;
         }
         if buf[..4] != MAGIC {
-            if let Some(next) = buf.windows(4).position(|window| window == MAGIC) {
-                if next > 0 {
-                    out.push(ReolinkSegment::Opaque(&buf[..next]));
-                    buf = &buf[next..];
-                    continue;
-                }
+            if let Some(next) = buf.windows(4).position(|window| window == MAGIC)
+                && next > 0
+            {
+                out.push(ReolinkSegment::Opaque(&buf[..next]));
+                buf = &buf[next..];
+                continue;
             }
             out.push(ReolinkSegment::Opaque(buf));
             break;
@@ -2114,8 +2114,10 @@ pub fn handshake_observed_credential_salt(frame: &[u8]) -> Option<[u8; 21]> {
 }
 
 pub fn login_has_expected_zero_lead(frame: &[u8]) -> bool {
-    matches!(login_credential_window(frame), Some(_)
-        if frame[20..(20 + LOGIN_LEADING_ZERO_LEN)].iter().all(|byte| *byte == 0))
+    login_credential_window(frame).is_some()
+        && frame[20..(20 + LOGIN_LEADING_ZERO_LEN)]
+            .iter()
+            .all(|byte| *byte == 0)
 }
 
 pub fn login_matches_server_prefix(login_frame: &[u8], server_handshake_frame: &[u8]) -> bool {

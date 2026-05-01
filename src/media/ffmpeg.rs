@@ -4,10 +4,7 @@ use super::types::{
     AudioPlanMode, OutputCodec, PreviewPipelinePlan, RecordingPipelinePlan, VideoPlanMode,
 };
 
-pub fn build_live_preview_ffmpeg_args(
-    plan: &PreviewPipelinePlan,
-    udp_port: u16,
-) -> Vec<String> {
+pub fn build_live_preview_ffmpeg_args(plan: &PreviewPipelinePlan, udp_port: u16) -> Vec<String> {
     let mut args = vec![
         "-nostdin".to_string(),
         "-loglevel".to_string(),

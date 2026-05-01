@@ -1,4 +1,4 @@
-# Operations (POC)
+# Operations
 
 ## 1) Install
 
@@ -6,7 +6,7 @@
 curl -fsSL https://raw.githubusercontent.com/Aux0x7F/constitute-nvr/main/scripts/linux/install-latest.sh | bash
 ```
 
-Web-driven install (from `constitute` Appliances panel) passes context flags similar to:
+Web-driven install from `constitute-gateway-ui` passes context flags similar to:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Aux0x7F/constitute-nvr/main/scripts/linux/install-latest.sh | bash -s -- \
@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/Aux0x7F/constitute-nvr/main/scripts
   --pair-identity '<identity-label>' \
   --pair-code '<code>' \
   --pair-code-hash '<code-hash>' \
-  --allow-unsigned-hello-mvp
+  --allow-unsigned-debug-hello
 ```
 
 Install flow notes:
@@ -99,7 +99,7 @@ Notes:
 - CGI setup path covers RTSP/ONVIF/P2P toggles when HTTP API is available; proprietary `9000` path remains fallback/R&D for HTTP-disabled devices.
 - For cheap generic/XM cameras that ship static on another `/24`, use onboarding aliases instead of this Reolink-only bootstrap path.
 - XM / NetSurveillance `40E` note:
-  - active driver is `xm_40e`, not the old generic `xm_rtsp` placeholder
+  - active driver is `xm_40e`
   - current recording uses video-only MP4 segmentation because the validated lab camera exposes `pcm_mulaw` audio that cannot be copied directly into MP4
   - live preview for this camera requires HEVC decode on the host because the validated RTSP profiles are HEVC, not H.264
   - site time for the lab XM camera is served from the host-side onboarding alias `192.168.0.2`
@@ -159,7 +159,7 @@ Manual run:
 sudo /usr/local/bin/constitute-nvr-self-update --service-name constitute-nvr --try-restart
 ```
 
-## Known POC Limits
+## Current Limits
 - depends on installer-managed host `ffmpeg`; install now fails if HEVC decode support cannot be provisioned
 - release checksums are hash-verified but not signature-verified yet
 - TURN remains a documented stub; same-LAN and NAT-friendly direct ICE paths are the active target for this iteration

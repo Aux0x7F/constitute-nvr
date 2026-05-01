@@ -22,7 +22,9 @@ pub async fn apply_camera_device_config(
     if !verification_failures.is_empty() {
         let requested_name = next.desired.display_name.trim();
         let observed_name = mounted.observed.display_name.trim();
-        let detail = if verification_failures.iter().any(|field| field == "display_name")
+        let detail = if verification_failures
+            .iter()
+            .any(|field| field == "display_name")
             && !requested_name.is_empty()
         {
             format!(
