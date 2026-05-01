@@ -18,7 +18,9 @@ pub async fn record_loop(
     cam: CameraDeviceConfig,
     state: Arc<Mutex<SourceRuntimeState>>,
 ) -> Result<()> {
-    let out_dir = storage_root.join("segments").join(super::runtime::sanitize(&cam.source_id));
+    let out_dir = storage_root
+        .join("segments")
+        .join(super::runtime::sanitize(&cam.source_id));
     tokio::fs::create_dir_all(&out_dir).await?;
 
     let output_pattern = out_dir.join("%Y%m%dT%H%M%S.mp4");
@@ -41,7 +43,14 @@ pub async fn record_loop(
             segment_secs = cam.segment_secs,
             "starting ffmpeg recorder"
         );
-        update_state(&state, "connecting", restart_attempt, String::new(), Some(0)).await;
+        update_state(
+            &state,
+            "connecting",
+            restart_attempt,
+            String::new(),
+            Some(0),
+        )
+        .await;
 
         let mut child = match cmd.spawn() {
             Ok(child) => child,
@@ -78,7 +87,14 @@ pub async fn record_loop(
                             .unwrap_or(baseline_segments);
                         if current_segments > baseline_segments {
                             marked_running = true;
-                            update_state(&state, "running", restart_attempt, String::new(), Some(0)).await;
+                            update_state(
+                                &state,
+                                "running",
+                                restart_attempt,
+                                String::new(),
+                                Some(0),
+                            )
+                            .await;
                         }
                     }
                     sleep(Duration::from_secs(1)).await;

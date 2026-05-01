@@ -10,7 +10,10 @@ use super::types::{
     RecordingPipelinePlan, VideoPlan, VideoPlanMode,
 };
 
-pub fn preview_pipeline_plan(camera: &CameraDeviceConfig, offer_sdp: &str) -> Result<PreviewPipelinePlan> {
+pub fn preview_pipeline_plan(
+    camera: &CameraDeviceConfig,
+    offer_sdp: &str,
+) -> Result<PreviewPipelinePlan> {
     let video_mode = preview_video_mode(&camera.driver_id);
     let input_url = preview_rtsp_url(camera);
     let output_codec = match video_mode {
@@ -37,10 +40,13 @@ pub fn preview_pipeline_plan(camera: &CameraDeviceConfig, offer_sdp: &str) -> Re
                 },
                 container: OutputContainer::Rtp,
                 generate_pts: true,
-                reason: "browser offer omitted H.264; fallback to VP8 preview transcode".to_string(),
+                reason: "browser offer omitted H.264; fallback to VP8 preview transcode"
+                    .to_string(),
             });
         }
-        return Err(anyhow!("browser offer does not advertise a supported preview codec"));
+        return Err(anyhow!(
+            "browser offer does not advertise a supported preview codec"
+        ));
     }
     Ok(preview_pipeline_plan_for_codec(camera, output_codec))
 }

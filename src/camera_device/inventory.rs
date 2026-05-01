@@ -22,7 +22,10 @@ pub async fn read_camera_device(cfg: &Config, source_id: &str) -> Result<Mounted
     Ok(read_mounted_camera_device(cfg, &camera).await)
 }
 
-pub async fn read_mounted_camera_device(cfg: &Config, camera: &CameraConfig) -> MountedCamera {
+pub async fn read_mounted_camera_device(
+    cfg: &Config,
+    camera: &CameraDeviceConfig,
+) -> MountedCamera {
     let base_capabilities = driver_capabilities(camera);
     match read_observed_state(camera).await {
         Ok(observed) => {

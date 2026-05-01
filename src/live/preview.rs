@@ -1,5 +1,5 @@
 use crate::camera_device::registry::driver_is_xm;
-use crate::config::{CameraDeviceConfig as CameraConfig, Config, LivePreviewConfig};
+use crate::config::{CameraDeviceConfig, Config, LivePreviewConfig};
 use crate::media::{ffmpeg, planner, types::OutputCodec};
 use crate::nostr::{self, NostrEvent};
 use crate::recording::runtime::backoff_secs;
@@ -15,6 +15,7 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, watch};
 use tokio::time::{Duration, Instant, sleep, timeout};
 use tracing::{info, warn};
+use util::marshal::Unmarshal;
 use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_VP8, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
@@ -34,7 +35,6 @@ use webrtc::rtp_transceiver::{RTCRtpTransceiver, RTCRtpTransceiverInit};
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::TrackLocalWriter;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
-use util::marshal::Unmarshal;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ManagedIceServerHints {
@@ -385,7 +385,7 @@ impl PreviewManager {
 pub fn resolve_control_camera(
     cfg: &Config,
     request: &ManagedControlRequest,
-) -> Result<CameraConfig> {
+) -> Result<CameraDeviceConfig> {
     let token = validate_launch_token(cfg, &request.launch_token)?;
     let source_id = request
         .payload
@@ -602,7 +602,10 @@ fn offer_description_sdp(value: &Value) -> Option<&str> {
     })
 }
 
-fn select_preview_codec_for_camera(value: &Value, camera: &CameraConfig) -> Result<PreviewCodec> {
+fn select_preview_codec_for_camera(
+    value: &Value,
+    camera: &CameraDeviceConfig,
+) -> Result<PreviewCodec> {
     let sdp = offer_description_sdp(value).unwrap_or_default();
     if driver_is_xm(&camera.driver_id) {
         if sdp.contains("VP8/90000") {
@@ -627,7 +630,7 @@ fn select_sources(
     cfg: &Config,
     requested: Vec<String>,
     token: &ManagedLaunchTokenPayload,
-) -> Result<Vec<CameraConfig>> {
+) -> Result<Vec<CameraDeviceConfig>> {
     let enabled = cfg
         .camera_devices
         .iter()
@@ -713,7 +716,9 @@ fn with_firefox_compatible_answer_msid(
     sdp: &str,
     media_stream_tracks: &[(String, String)],
 ) -> String {
-    let has_msid_semantic = sdp.lines().any(|line| line.trim() == "a=msid-semantic:WMS *");
+    let has_msid_semantic = sdp
+        .lines()
+        .any(|line| line.trim() == "a=msid-semantic:WMS *");
     let mut out = Vec::new();
     let mut in_video_section = false;
     let mut video_index = 0usize;
@@ -742,12 +747,14 @@ fn with_firefox_compatible_answer_msid(
             continue;
         }
 
-        if in_video_section && !saw_msid_in_section && line.starts_with("a=mid:") {
-            if let Some((stream_id, track_id)) = media_stream_tracks.get(video_index.saturating_sub(1))
-            {
-                out.push(format!("a=msid:{stream_id} {track_id}"));
-                saw_msid_in_section = true;
-            }
+        if in_video_section
+            && !saw_msid_in_section
+            && line.starts_with("a=mid:")
+            && let Some((stream_id, track_id)) =
+                media_stream_tracks.get(video_index.saturating_sub(1))
+        {
+            out.push(format!("a=msid:{stream_id} {track_id}"));
+            saw_msid_in_section = true;
         }
     }
 
@@ -759,7 +766,7 @@ fn with_firefox_compatible_answer_msid(
 }
 
 async fn run_camera_forwarder(
-    camera: CameraConfig,
+    camera: CameraDeviceConfig,
     track: Arc<TrackLocalStaticRTP>,
     mut stop_rx: watch::Receiver<bool>,
     codec: PreviewCodec,
@@ -823,11 +830,7 @@ async fn run_camera_forwarder(
             local_addr.port(),
         ));
 
-        let mut child = match ffmpeg
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+        let mut child = match ffmpeg.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
             Ok(child) => child,
             Err(err) => {
                 restart_attempt += 1;
@@ -985,11 +988,7 @@ impl PreviewRtpContinuity {
 
 fn continuity_sequence_step(previous: u16, current: u16) -> u16 {
     let delta = current.wrapping_sub(previous);
-    if delta == 0 || delta > 4096 {
-        1
-    } else {
-        delta
-    }
+    if delta == 0 || delta > 4096 { 1 } else { delta }
 }
 
 fn continuity_timestamp_step(previous: u32, current: u32, last_step: u32) -> u32 {
@@ -1029,7 +1028,7 @@ mod tests {
         let (mut cfg, _) = Config::load_or_create(&path).expect("config");
         cfg.api.identity_id = "identity-1".to_string();
         cfg.nostr_pubkey = "service-pk".to_string();
-        cfg.camera_devices.push(CameraConfig {
+        cfg.camera_devices.push(CameraDeviceConfig {
             source_id: "cam-1".to_string(),
             name: "Front".to_string(),
             onvif_host: "10.0.0.10".to_string(),
@@ -1230,7 +1229,8 @@ mod tests {
         let mut cfg = sample_config();
         let mut camera = cfg.camera_devices.remove(0);
         camera.driver_id = "xm_40e".to_string();
-        let err = select_preview_codec_for_camera(&offer, &camera).expect_err("xm should require vp8");
+        let err =
+            select_preview_codec_for_camera(&offer, &camera).expect_err("xm should require vp8");
         assert!(err.to_string().contains("required for XM live preview"));
     }
 
@@ -1255,7 +1255,10 @@ mod tests {
             &planner::preview_pipeline_plan_for_codec(&camera, OutputCodec::Vp8),
             41000,
         );
-        let ff_idx = args.iter().position(|arg| arg == "-fflags").expect("fflags");
+        let ff_idx = args
+            .iter()
+            .position(|arg| arg == "-fflags")
+            .expect("fflags");
         assert_eq!(args.get(ff_idx + 1).map(String::as_str), Some("+genpts"));
         let input_idx = args.iter().position(|arg| arg == "-i").expect("input");
         assert!(ff_idx < input_idx);
@@ -1345,7 +1348,11 @@ mod tests {
             .set_local_description(answer)
             .await
             .expect("set local answer");
-        let sdp = answerer.local_description().await.expect("local answer").sdp;
+        let sdp = answerer
+            .local_description()
+            .await
+            .expect("local answer")
+            .sdp;
 
         let mut saw_video = 0usize;
         let mut pending_video = false;

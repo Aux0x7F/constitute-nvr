@@ -5,7 +5,7 @@
 - [x] project architecture baseline
 - [x] initial project tracking issues
 
-## Iteration 1: Contract + Service POC
+## Iteration 1: Contract + Native Service Baseline
 - [x] capability + control contract draft (`docs/PROTOCOL.md`)
 - [x] Fedora systemd service baseline wizard
 - [x] camera-interface hardening script (RTSP/ONVIF + optional NTP lane)
@@ -38,3 +38,31 @@
 - [ ] vendor-specific P2P disable automation hooks (where camera APIs allow)
 - [ ] Reolink `9000` control-plane reversal for zero-manual RTSP/ONVIF/P2P toggles
 - [ ] full operator runbooks for fedora lab + vps deployment profiles
+
+## Current / Planned Later Architecture Direction
+
+The product-surface split is current local convergence work. Host capability adoption remains planned later.
+
+The next NVR/security architecture slice after current convergence is cryptographic media projection:
+- keep a warm low-resolution/browser-safe preview projection where host policy allows
+- let live preview attach to an existing projection instead of always waking a cold RTSP/ffmpeg path
+- let recording/history consume the same projection boundary instead of duplicating ingest assumptions
+- keep `camera_device` as device truth and `media` as planning/ffmpeg strategy
+- audit launch/signaling/session material for signed-versus-encrypted boundaries
+- treat camera-to-NVR ingest as hostile camera-network traffic unless proven otherwise
+
+## Backlog Product Surface Follow-Ups
+- [ ] assign mounted camera devices to operator-facing locations and use the location name instead of the generic `Cameras` heading where appropriate (`#21`)
+- [ ] group live preview into location sections when multiple assigned locations are present (`#21`)
+
+### Iteration 5: Host Capability Adoption
+- [ ] introduce media projection as a first-class NVR runtime boundary before burying stream warmth in live or recording
+- [ ] measure cold/warm direct-entry path from account/runtime attach through first browser track
+- [ ] define cryptographic service capability shape beyond transitional short-lived launch token semantics
+- [ ] consume `constitute-security` capability leases for hostile camera-network policy and anomaly/reporting integration instead of treating camera-interface hardening as only local script posture
+- [ ] consume `constitute-storage` capability leases for durable encrypted object/archive semantics where shared storage behavior matters
+- [ ] keep service-local config/control state and ephemeral working/runtime state local even after storage capability adoption
+
+### Iteration 6: Platform Product-Surface Convergence
+- [ ] keep NVR launch/auth assumptions aligned with direct app entry through account/session/grant flows
+- [ ] keep hosted-service UX aligned with the current split between `constitute-account` and `constitute-gateway-ui`

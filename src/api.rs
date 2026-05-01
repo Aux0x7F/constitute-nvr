@@ -1,14 +1,12 @@
 use crate::camera_device;
-use crate::config::{
-    CameraDeviceConfig as CameraConfig, CameraDeviceDesiredConfig as CameraDesiredConfig, Config,
-};
+use crate::camera_device::drivers::reolink::driver as reolink;
+use crate::config::{CameraDeviceConfig, CameraDeviceDesiredConfig, Config};
 use crate::crypto;
 use crate::hosted_registry;
 use crate::live::{
     ManagedAdminRequest, ManagedCloseRequest, ManagedControlRequest, ManagedOfferRequest,
     PreviewManager, resolve_admin_token, resolve_control_camera,
 };
-use crate::camera_device::drivers::reolink::driver as reolink;
 use crate::recording::RecorderManager;
 use crate::storage::StorageManager;
 use crate::util;
@@ -123,13 +121,16 @@ fn spawn_camera_reconcile_loop(state: Arc<ApiState>) {
 
 async fn run_camera_reconcile_cycle(state: &ApiState) -> Result<()> {
     let cfg = state.cfg.lock().await.clone();
-    for camera in cfg.camera_devices.iter().filter(|camera| camera.enabled).cloned() {
+    for camera in cfg
+        .camera_devices
+        .iter()
+        .filter(|camera| camera.enabled)
+        .cloned()
+    {
         match camera_device::reconcile_camera_device(&cfg, &camera).await {
             Ok(Some(outcome)) => {
-                let changed = camera_device::reconcile::camera_config_changed(
-                    &camera,
-                    &outcome.configured,
-                );
+                let changed =
+                    camera_device::reconcile::camera_config_changed(&camera, &outcome.configured);
                 if changed {
                     persist_camera_source(state, outcome.configured.clone()).await?;
                 }
@@ -331,7 +332,8 @@ async fn managed_admin(
     let action = request.action.trim().to_ascii_lowercase();
     let response = match action.as_str() {
         "list_camera_device_inventory" => {
-            let inventory = match camera_device::inventory::list_camera_device_inventory(&cfg).await {
+            let inventory = match camera_device::inventory::list_camera_device_inventory(&cfg).await
+            {
                 Ok(inventory) => inventory,
                 Err(err) => {
                     return (
@@ -350,7 +352,9 @@ async fn managed_admin(
                     Err(err) => {
                         return (
                             StatusCode::BAD_REQUEST,
-                            Json::<Value>(json!({ "error": format!("invalid mount request: {err}") })),
+                            Json::<Value>(
+                                json!({ "error": format!("invalid mount request: {err}") }),
+                            ),
                         )
                             .into_response();
                     }
@@ -383,21 +387,24 @@ async fn managed_admin(
                     Err(err) => {
                         return (
                             StatusCode::BAD_REQUEST,
-                            Json::<Value>(json!({ "error": format!("invalid apply request: {err}") })),
+                            Json::<Value>(
+                                json!({ "error": format!("invalid apply request: {err}") }),
+                            ),
                         )
                             .into_response();
                     }
                 };
-            let applied = match camera_device::apply::apply_camera_device_config(&cfg, apply_request).await {
-                Ok(result) => result,
-                Err(err) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json::<Value>(json!({ "error": err.to_string() })),
-                    )
-                        .into_response();
-                }
-            };
+            let applied =
+                match camera_device::apply::apply_camera_device_config(&cfg, apply_request).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json::<Value>(json!({ "error": err.to_string() })),
+                        )
+                            .into_response();
+                    }
+                };
             if let Err(err) =
                 persist_camera_source(state.as_ref(), applied.configured.clone()).await
             {
@@ -417,7 +424,8 @@ async fn managed_admin(
                 .unwrap_or_default()
                 .trim()
                 .to_string();
-            let mounted = match camera_device::inventory::read_camera_device(&cfg, &source_id).await {
+            let mounted = match camera_device::inventory::read_camera_device(&cfg, &source_id).await
+            {
                 Ok(result) => result,
                 Err(err) => {
                     return (
@@ -436,7 +444,9 @@ async fn managed_admin(
                     Err(err) => {
                         return (
                             StatusCode::BAD_REQUEST,
-                            Json::<Value>(json!({ "error": format!("invalid probe request: {err}") })),
+                            Json::<Value>(
+                                json!({ "error": format!("invalid probe request: {err}") }),
+                            ),
                         )
                             .into_response();
                     }
@@ -499,6 +509,7 @@ struct CipherEnvelope {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 enum ClientCommand {
     ListSources,
     ListSourceStates,
@@ -558,7 +569,7 @@ struct SourceUpsert {
 }
 
 impl SourceUpsert {
-    fn into_camera(self) -> Result<CameraConfig> {
+    fn into_camera(self) -> Result<CameraDeviceConfig> {
         if self.source_id.trim().is_empty() {
             return Err(anyhow!("sourceId is required"));
         }
@@ -568,7 +579,7 @@ impl SourceUpsert {
         if self.onvif_host.trim().is_empty() {
             return Err(anyhow!("onvif_host is required"));
         }
-        Ok(CameraConfig {
+        Ok(CameraDeviceConfig {
             source_id: self.source_id.trim().to_string(),
             name: if self.name.trim().is_empty() {
                 self.source_id.trim().to_string()
@@ -592,7 +603,7 @@ impl SourceUpsert {
             ptz_capable: self.source_id.trim().starts_with("reolink-"),
             enabled: self.enabled,
             segment_secs: self.segment_secs.max(2),
-            desired: CameraDesiredConfig {
+            desired: CameraDeviceDesiredConfig {
                 display_name: if self.name.trim().is_empty() {
                     self.source_id.trim().to_string()
                 } else {
@@ -776,7 +787,7 @@ fn validate_hello(cfg: &Config, hello: &HelloReq) -> Result<()> {
         return Err(anyhow!("hello timestamp outside allowed skew"));
     }
 
-    if cfg.api.allow_unsigned_hello_mvp {
+    if cfg.api.allow_unsigned_debug_hello {
         return Ok(());
     }
 
@@ -797,7 +808,7 @@ fn validate_hello(cfg: &Config, hello: &HelloReq) -> Result<()> {
 }
 
 fn session_identity_secret_hex(cfg: &Config) -> &str {
-    if cfg.api.allow_unsigned_hello_mvp {
+    if cfg.api.allow_unsigned_debug_hello {
         INSECURE_HELLO_SECRET_HEX
     } else {
         &cfg.api.identity_secret_hex
@@ -916,16 +927,12 @@ async fn handle_command(
 
             let onvif_port = if result.bridge.after_advanced.i_onvif_port_enable != 0 {
                 result.bridge.after_advanced.i_onvif_port.max(1) as u16
-            } else if result.probe.onvif_port_open {
-                8000
             } else {
                 8000
             };
 
             let rtsp_port = if result.bridge.after_advanced.i_rtsp_port_enable != 0 {
                 result.bridge.after_advanced.i_rtsp_port.max(1) as u16
-            } else if result.probe.rtsp_port_open {
-                554
             } else {
                 554
             };
@@ -951,7 +958,7 @@ async fn handle_command(
             } else {
                 model
             };
-            let camera_cfg = CameraConfig {
+            let camera_cfg = CameraDeviceConfig {
                 source_id: source_id.clone(),
                 name: source_name.clone(),
                 onvif_host: request.ip.clone(),
@@ -976,7 +983,7 @@ async fn handle_command(
                 ptz_capable: source_id.contains("e1") || source_id.contains("ptz"),
                 enabled: true,
                 segment_secs: 10,
-                desired: CameraDesiredConfig {
+                desired: CameraDeviceDesiredConfig {
                     display_name: source_name.clone(),
                     overlay_text: source_name.clone(),
                     overlay_timestamp: true,
@@ -1115,7 +1122,7 @@ async fn handle_command(
     Ok(())
 }
 
-async fn persist_camera_source(state: &ApiState, camera_cfg: CameraConfig) -> Result<()> {
+async fn persist_camera_source(state: &ApiState, camera_cfg: CameraDeviceConfig) -> Result<()> {
     let storage_root =
         {
             let mut guard = state.cfg.lock().await;

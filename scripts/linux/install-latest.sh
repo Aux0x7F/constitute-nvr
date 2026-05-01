@@ -28,7 +28,7 @@ Options:
   --repo-owner <owner>       GitHub owner (default: Aux0x7F)
   --repo-name <name>         GitHub repo (default: constitute-nvr)
   --update-interval <secs>   NVR self-update poll interval seconds (default: 300)
-  --non-interactive          Accepted for compatibility (default behavior)
+  --non-interactive          No prompts when install-time configuration is applied
   --dev-poll                 Use fast dev update interval (default: 120s)
   --force                    Reinstall even when binary hash is unchanged
   --proxy-url <url>          Use HTTP(S) proxy for release fetches
@@ -43,7 +43,7 @@ Pass-through (install context):
   --zone-key <key>             (repeatable)
   --swarm-peer <host:port>     (repeatable)
   --public-ws-url <url>
-  --allow-unsigned-hello-mvp | --require-signed-hello
+  --allow-unsigned-debug-hello | --require-signed-hello
   --pair-identity <label>
   --pair-code <code>
   --pair-code-hash <hash>
@@ -139,7 +139,7 @@ parse_passthrough_flag() {
       echo 2
       return 0
       ;;
-    --allow-unsigned-hello-mvp|--require-signed-hello|--enable-reolink-autoprovision|--disable-reolink-autoprovision|--reolink-generate-password|--apply-hardening|--skip-hardening|--no-ntp-host)
+    --allow-unsigned-debug-hello|--require-signed-hello|--enable-reolink-autoprovision|--disable-reolink-autoprovision|--reolink-generate-password|--apply-hardening|--skip-hardening|--no-ntp-host)
       WIZARD_ARGS+=("$flag")
       CONFIG_MUTATING=1
       echo 1

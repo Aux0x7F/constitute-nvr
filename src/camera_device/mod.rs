@@ -11,8 +11,7 @@ pub mod registry;
 pub mod types;
 
 use crate::config::{
-    CameraDeviceConfig as CameraConfig, CameraDeviceDesiredConfig as CameraDesiredConfig, Config,
-    adopt_camera_active_password,
+    CameraDeviceConfig, CameraDeviceDesiredConfig, Config, adopt_camera_active_password,
     camera_device_credential_candidates as camera_credential_candidates,
     finalize_camera_password_rotation,
     mark_camera_device_rotation_failed as mark_camera_rotation_failed,
@@ -51,7 +50,7 @@ const CAMERA_TIME_MAX_DRIFT_SECS: i64 = 90;
 
 pub trait CameraDriver {
     fn match_candidate(&self, candidate: &DiscoveredCameraCandidate) -> Option<DriverMatch>;
-    fn capabilities(&self, camera: &CameraConfig) -> CameraCapabilitySet;
+    fn capabilities(&self, camera: &CameraDeviceConfig) -> CameraCapabilitySet;
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -204,7 +203,7 @@ pub struct MountedCamera {
     pub rtsp_url: String,
     pub capabilities: CameraCapabilitySet,
     pub credential_safety: CameraCredentialSafety,
-    pub desired: CameraDesiredConfig,
+    pub desired: CameraDeviceDesiredConfig,
     pub observed: ObservedCameraState,
     pub current_pose: CameraPose,
     pub desired_pose: CameraPose,
@@ -259,7 +258,7 @@ pub struct MountCameraRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CameraDeviceMountResult {
     #[serde(skip_serializing, skip_deserializing)]
-    pub configured: CameraConfig,
+    pub configured: CameraDeviceConfig,
     pub mounted: MountedCamera,
 }
 
@@ -267,14 +266,14 @@ pub struct CameraDeviceMountResult {
 #[serde(rename_all = "camelCase")]
 pub struct ApplyMountedCameraRequest {
     pub source_id: String,
-    pub desired: CameraDesiredConfig,
+    pub desired: CameraDeviceDesiredConfig,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CameraDeviceApplyResult {
     #[serde(skip_serializing, skip_deserializing)]
-    pub configured: CameraConfig,
+    pub configured: CameraDeviceConfig,
     pub mounted: MountedCamera,
 }
 
@@ -325,7 +324,7 @@ impl CameraDriver for ReolinkDriver {
         })
     }
 
-    fn capabilities(&self, camera: &CameraConfig) -> CameraCapabilitySet {
+    fn capabilities(&self, camera: &CameraDeviceConfig) -> CameraCapabilitySet {
         CameraCapabilitySet {
             live_view: true,
             ptz: camera.ptz_capable,
@@ -359,7 +358,7 @@ impl CameraDriver for GenericOnvifRtspDriver {
         })
     }
 
-    fn capabilities(&self, camera: &CameraConfig) -> CameraCapabilitySet {
+    fn capabilities(&self, camera: &CameraDeviceConfig) -> CameraCapabilitySet {
         CameraCapabilitySet {
             live_view: true,
             ptz: camera.ptz_capable,
@@ -383,7 +382,7 @@ impl CameraDriver for Xm40eDriver {
         })
     }
 
-    fn capabilities(&self, _camera: &CameraConfig) -> CameraCapabilitySet {
+    fn capabilities(&self, _camera: &CameraDeviceConfig) -> CameraCapabilitySet {
         CameraCapabilitySet {
             live_view: true,
             ptz: false,
@@ -442,18 +441,18 @@ fn same_ipv4_subnet(left: Ipv4Addr, right: Ipv4Addr, prefix: u8) -> bool {
     (u32::from(left) & mask) == (u32::from(right) & mask)
 }
 
-fn effective_ntp_server_for_camera(cfg: &Config, camera: &CameraConfig) -> Option<String> {
+fn effective_ntp_server_for_camera(cfg: &Config, camera: &CameraDeviceConfig) -> Option<String> {
     let host = camera.onvif_host.trim().parse::<Ipv4Addr>().ok()?;
     let iface = cfg.camera_network.interface.trim();
     if iface.is_empty() {
         return None;
     }
-    interface_ipv4_cidrs(iface).into_iter().find_map(|(addr, prefix)| {
-        same_ipv4_subnet(addr, host, prefix).then(|| addr.to_string())
-    })
+    interface_ipv4_cidrs(iface)
+        .into_iter()
+        .find_map(|(addr, prefix)| same_ipv4_subnet(addr, host, prefix).then(|| addr.to_string()))
 }
 
-fn effective_site_time_policy(cfg: &Config, camera: &CameraConfig) -> SiteTimePolicy {
+fn effective_site_time_policy(cfg: &Config, camera: &CameraDeviceConfig) -> SiteTimePolicy {
     let mut policy = site_time_policy(cfg);
     if let Some(ntp_server) = effective_ntp_server_for_camera(cfg, camera) {
         policy.ntp_server = ntp_server;
@@ -483,8 +482,8 @@ fn observed_site_time_offset_secs(
     now_utc: DateTime<Utc>,
 ) -> Option<i64> {
     let tz: Tz = site_timezone.trim().parse().ok()?;
-    let naive = NaiveDateTime::parse_from_str(observed_manual_time.trim(), "%Y-%m-%dT%H:%M:%S")
-        .ok()?;
+    let naive =
+        NaiveDateTime::parse_from_str(observed_manual_time.trim(), "%Y-%m-%dT%H:%M:%S").ok()?;
     let local = match tz.from_local_datetime(&naive) {
         LocalResult::Single(value) => value,
         LocalResult::Ambiguous(first, _) => first,
@@ -505,7 +504,9 @@ fn observed_timezone_matches(policy: &SiteTimePolicy, observed: &ObservedCameraS
         .get("time")
         .and_then(|value| value.get("timezoneCode"))
         .and_then(Value::as_i64)
-        .and_then(|code| site_timezone_code(&policy.timezone, Utc::now()).map(|expected| code == expected as i64))
+        .and_then(|code| {
+            site_timezone_code(&policy.timezone, Utc::now()).map(|expected| code == expected as i64)
+        })
         .unwrap_or(false)
 }
 
@@ -652,11 +653,14 @@ pub async fn discover_candidates(cfg: &Config) -> Result<Vec<DiscoveredCameraCan
     }
 
     let mut out = map.into_values().collect::<Vec<_>>();
-    out.sort_by(|left, right| candidate_sort_key(left).cmp(&candidate_sort_key(right)));
+    out.sort_by_key(candidate_sort_key);
     Ok(out)
 }
 
-fn sync_display_name_and_linked_overlay(existing: &CameraConfig, next: &mut CameraConfig) {
+fn sync_display_name_and_linked_overlay(
+    existing: &CameraDeviceConfig,
+    next: &mut CameraDeviceConfig,
+) {
     let requested_display_name = next.desired.display_name.trim();
     if requested_display_name.is_empty() {
         return;
@@ -679,7 +683,7 @@ fn sync_display_name_and_linked_overlay(existing: &CameraConfig, next: &mut Came
 }
 
 pub async fn control_mounted_camera(
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
     ptz_payload: &Value,
 ) -> Result<CameraPtzControlResult> {
     match camera.driver_id.trim() {
@@ -763,7 +767,7 @@ pub async fn probe_camera_device(cfg: &Config, request: ProbeCameraRequest) -> R
 }
 
 async fn control_reolink_camera(
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
     ptz_payload: &Value,
 ) -> Result<CameraPtzControlResult> {
     let ports = probe_common_ports(&camera.onvif_host).await;
@@ -827,7 +831,7 @@ async fn control_reolink_camera(
 }
 
 async fn control_onvif_camera(
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
     ptz_payload: &Value,
 ) -> Result<CameraPtzControlResult> {
     if let Some(target_pose) = parse_requested_pose(ptz_payload) {
@@ -1009,7 +1013,7 @@ fn camera_pose_from_requested_pose(value: RequestedPose) -> CameraPose {
     }
 }
 
-fn reolink_native_ptz_profile(camera: &CameraConfig) -> Option<ReolinkNativePtzProfile> {
+fn reolink_native_ptz_profile(camera: &CameraDeviceConfig) -> Option<ReolinkNativePtzProfile> {
     let label = format!("{} {}", camera.model, camera.name).to_ascii_lowercase();
     if label.contains("e1 outdoor") {
         return Some(ReolinkNativePtzProfile {
@@ -1113,7 +1117,7 @@ fn reolink_native_ptz_json(native: &ReolinkNativePtzObservation) -> Value {
 }
 
 async fn resolve_reolink_native_connection(
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
     preferred_passwords: &[String],
 ) -> Result<reolink::ReolinkConnectRequest> {
     let mut candidates = Vec::new();
@@ -1148,7 +1152,7 @@ async fn resolve_reolink_native_connection(
 }
 
 async fn try_reolink_native_ptz_observation(
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
     preferred_passwords: &[String],
 ) -> Option<ReolinkNativePtzObservation> {
     let profile = reolink_native_ptz_profile(camera)?;
@@ -1160,7 +1164,7 @@ async fn try_reolink_native_ptz_observation(
 }
 
 async fn wait_for_reolink_native_target(
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
     connection: &reolink::ReolinkConnectRequest,
     profile: ReolinkNativePtzProfile,
     requested: RequestedPose,
@@ -1189,7 +1193,7 @@ async fn wait_for_reolink_native_target(
 }
 
 async fn control_reolink_native_absolute(
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
     target_pose: RequestedPose,
 ) -> Result<CameraPtzControlResult> {
     let profile = reolink_native_ptz_profile(camera).ok_or_else(|| {
@@ -1320,7 +1324,7 @@ async fn send_reolink_cgi_pulse(
 }
 
 async fn control_reolink_observed_step_fallback(
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
     target_pose: RequestedPose,
     native_error: Option<String>,
 ) -> Result<CameraPtzControlResult> {
@@ -1335,7 +1339,7 @@ async fn control_reolink_observed_step_fallback(
     let cgi_connection = resolve_reolink_connection_for(
         &camera.onvif_host,
         &camera.username,
-        &[native_connection.password.clone()],
+        std::slice::from_ref(&native_connection.password),
     )
     .await?;
     let mut observed_raw = reolink::read_native_ptz_position(native_connection.clone()).await?;
@@ -1447,17 +1451,17 @@ fn reolink_fallback_pulse_ms(step: RequestedPose) -> u64 {
 }
 
 fn reolink_fallback_command(ptz_payload: &Value) -> Option<ReolinkFallbackPtzCommand> {
-    if let Some(step) = parse_pose_step(ptz_payload) {
-        if let Some(op) = reolink_fallback_direction_from_pose(step) {
-            return Some(ReolinkFallbackPtzCommand {
-                op,
-                pulse_ms: Some(reolink_fallback_pulse_ms(step)),
-                desired_pose: parse_requested_pose(ptz_payload)
-                    .map(camera_pose_from_requested_pose)
-                    .unwrap_or_default(),
-                pose_status: "directed".to_string(),
-            });
-        }
+    if let Some(step) = parse_pose_step(ptz_payload)
+        && let Some(op) = reolink_fallback_direction_from_pose(step)
+    {
+        return Some(ReolinkFallbackPtzCommand {
+            op,
+            pulse_ms: Some(reolink_fallback_pulse_ms(step)),
+            desired_pose: parse_requested_pose(ptz_payload)
+                .map(camera_pose_from_requested_pose)
+                .unwrap_or_default(),
+            pose_status: "directed".to_string(),
+        });
     }
 
     let direction = ptz_payload
@@ -1498,7 +1502,7 @@ fn reolink_fallback_command(ptz_payload: &Value) -> Option<ReolinkFallbackPtzCom
 }
 
 async fn control_reolink_cgi_fallback(
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
     ptz_payload: &Value,
     native_error: Option<&str>,
 ) -> Result<CameraPtzControlResult> {
@@ -1519,16 +1523,17 @@ async fn control_reolink_cgi_fallback(
         reolink_cgi::ptz_stop(&connection).await?;
     } else {
         reolink_cgi::ptz_command(&connection, command.op, REOLINK_CGI_FALLBACK_SPEED).await?;
-        if let Some(pulse_ms) = command.pulse_ms {
-            if pulse_ms > 0 {
-                sleep(Duration::from_millis(pulse_ms)).await;
-                reolink_cgi::ptz_stop(&connection).await?;
-            }
+        if let Some(pulse_ms) = command.pulse_ms
+            && pulse_ms > 0
+        {
+            sleep(Duration::from_millis(pulse_ms)).await;
+            reolink_cgi::ptz_stop(&connection).await?;
         }
     }
 
     let native_observation =
-        try_reolink_native_ptz_observation(camera, &[connection.password.clone()]).await;
+        try_reolink_native_ptz_observation(camera, std::slice::from_ref(&connection.password))
+            .await;
 
     Ok(CameraPtzControlResult {
         current_pose: native_observation
@@ -1547,7 +1552,6 @@ async fn control_reolink_cgi_fallback(
             "nativeObservation": native_observation.as_ref().map(reolink_native_ptz_json),
             "nativeError": native_error,
         }),
-        ..Default::default()
     })
 }
 
@@ -1570,7 +1574,7 @@ fn match_candidate(candidate: &DiscoveredCameraCandidate) -> DriverMatch {
     }
 }
 
-fn driver_capabilities(camera: &CameraConfig) -> CameraCapabilitySet {
+fn driver_capabilities(camera: &CameraDeviceConfig) -> CameraCapabilitySet {
     if camera.driver_id.trim() == DRIVER_ID_REOLINK {
         ReolinkDriver.capabilities(camera)
     } else if driver_is_xm(&camera.driver_id) {
@@ -1588,7 +1592,7 @@ fn driver_capabilities(camera: &CameraConfig) -> CameraCapabilitySet {
 }
 
 fn capabilities_for_observed(
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
     mut capabilities: CameraCapabilitySet,
     observed: &ObservedCameraState,
 ) -> CameraCapabilitySet {
@@ -1678,7 +1682,10 @@ fn observed_management_plane(observed: &ObservedCameraState) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-async fn apply_driver_mount(cfg: &Config, camera: &CameraConfig) -> Result<CameraConfig> {
+async fn apply_driver_mount(
+    cfg: &Config,
+    camera: &CameraDeviceConfig,
+) -> Result<CameraDeviceConfig> {
     if camera.driver_id.trim() == DRIVER_ID_REOLINK {
         return apply_driver_desired(cfg, camera, camera).await;
     }
@@ -1690,9 +1697,9 @@ async fn apply_driver_mount(cfg: &Config, camera: &CameraConfig) -> Result<Camer
 
 async fn apply_driver_desired(
     cfg: &Config,
-    existing: &CameraConfig,
-    next: &CameraConfig,
-) -> Result<CameraConfig> {
+    existing: &CameraDeviceConfig,
+    next: &CameraDeviceConfig,
+) -> Result<CameraDeviceConfig> {
     if next.driver_id.trim() == DRIVER_ID_REOLINK {
         apply_reolink_desired(cfg, existing, next).await
     } else if driver_is_xm(&next.driver_id) {
@@ -1704,7 +1711,10 @@ async fn apply_driver_desired(
     }
 }
 
-async fn apply_generic_onvif_desired(cfg: &Config, next: &CameraConfig) -> Result<CameraConfig> {
+async fn apply_generic_onvif_desired(
+    cfg: &Config,
+    next: &CameraDeviceConfig,
+) -> Result<CameraDeviceConfig> {
     let policy = effective_site_time_policy(cfg, next);
     if !policy.ntp_enabled {
         return Ok(next.clone());
@@ -1722,9 +1732,9 @@ async fn apply_generic_onvif_desired(cfg: &Config, next: &CameraConfig) -> Resul
 
 async fn apply_xm_40e_desired(
     cfg: &Config,
-    _existing: &CameraConfig,
-    next: &CameraConfig,
-) -> Result<CameraConfig> {
+    _existing: &CameraDeviceConfig,
+    next: &CameraDeviceConfig,
+) -> Result<CameraDeviceConfig> {
     let _ = ffprobe_rtsp_stream(&next.rtsp_url)
         .await
         .with_context(|| format!("XM RTSP apply validation failed for {}", next.onvif_host))?;
@@ -1766,9 +1776,9 @@ async fn apply_xm_40e_desired(
 
 async fn apply_reolink_desired(
     cfg: &Config,
-    existing: &CameraConfig,
-    next: &CameraConfig,
-) -> Result<CameraConfig> {
+    existing: &CameraDeviceConfig,
+    next: &CameraDeviceConfig,
+) -> Result<CameraDeviceConfig> {
     let ports = probe_common_ports(&next.onvif_host).await;
     if (ports.http || ports.https)
         && resolve_reolink_connection_for(
@@ -1800,7 +1810,7 @@ async fn apply_reolink_desired(
     ))
 }
 
-fn reolink_desired_requires_cgi(existing: &CameraConfig, next: &CameraConfig) -> bool {
+fn reolink_desired_requires_cgi(existing: &CameraDeviceConfig, next: &CameraDeviceConfig) -> bool {
     let current = &existing.desired;
     let desired = &next.desired;
     desired.generate_password
@@ -1818,9 +1828,9 @@ fn reolink_desired_requires_cgi(existing: &CameraConfig, next: &CameraConfig) ->
 
 async fn apply_reolink_onvif_bridge_desired(
     cfg: &Config,
-    existing: &CameraConfig,
-    next: &CameraConfig,
-) -> Result<CameraConfig> {
+    existing: &CameraDeviceConfig,
+    next: &CameraDeviceConfig,
+) -> Result<CameraDeviceConfig> {
     let _ = apply_reolink_onvif_desired(cfg, existing, next).await?;
     ensure_reolink_cgi_lane_via_onvif(existing).await?;
     apply_reolink_cgi_desired(cfg, existing, next, true, true).await
@@ -1828,11 +1838,11 @@ async fn apply_reolink_onvif_bridge_desired(
 
 async fn apply_reolink_cgi_desired(
     cfg: &Config,
-    existing: &CameraConfig,
-    next: &CameraConfig,
+    existing: &CameraDeviceConfig,
+    next: &CameraDeviceConfig,
     allow_onvif_only_final_state: bool,
     apply_site_time_via_onvif: bool,
-) -> Result<CameraConfig> {
+) -> Result<CameraDeviceConfig> {
     let desired = &next.desired;
     let final_cgi_disabled = desired.hardening.disable_http && desired.hardening.disable_https;
     if final_cgi_disabled && !(allow_onvif_only_final_state && desired.hardening.enable_onvif) {
@@ -1940,8 +1950,9 @@ async fn apply_reolink_cgi_desired(
     }
 
     let site_time = site_time_policy(cfg);
-    if apply_site_time_via_onvif && site_time.ntp_enabled {
-        if let Err(error) = onvif::apply_site_time_settings(
+    if apply_site_time_via_onvif
+        && site_time.ntp_enabled
+        && let Err(error) = onvif::apply_site_time_settings(
             &next.onvif_host,
             next.onvif_port.max(1),
             &next.username,
@@ -1949,32 +1960,33 @@ async fn apply_reolink_cgi_desired(
             &to_onvif_site_time_policy(&site_time),
         )
         .await
-        {
-            let suffix = format!("failed applying site time policy through ONVIF: {error}");
-            updated.credentials.last_rotation_error =
-                if updated.credentials.last_rotation_error.trim().is_empty() {
-                    suffix
-                } else {
-                    format!("{}; {}", updated.credentials.last_rotation_error, suffix)
-                };
-        }
+    {
+        let suffix = format!("failed applying site time policy through ONVIF: {error}");
+        updated.credentials.last_rotation_error =
+            if updated.credentials.last_rotation_error.trim().is_empty() {
+                suffix
+            } else {
+                format!("{}; {}", updated.credentials.last_rotation_error, suffix)
+            };
     }
 
-    if let Err(error) = reolink_cgi::apply_presentation_state(&reolink_cgi::ReolinkPresentationApplyRequest {
-        connection: active_connection.clone(),
-        // Reolink keeps the feed-facing clock presentation in CGI. Apply the
-        // feed-facing fields on that lane and seed the current site-local wall
-        // clock so the baked timestamp converges immediately instead of waiting
-        // for the camera's next NTP poll. NTP mode/server remain ONVIF-owned.
-        time_mode: None,
-        ntp_server: None,
-        manual_time: site_local_time_string(&site_time.timezone, Utc::now()),
-        timezone: nonempty_option(&site_time.timezone),
-        enforce_clock_display: true,
-        overlay_text: nonempty_option(&desired.overlay_text),
-        overlay_timestamp: Some(desired.overlay_timestamp),
-    })
-    .await {
+    if let Err(error) =
+        reolink_cgi::apply_presentation_state(&reolink_cgi::ReolinkPresentationApplyRequest {
+            connection: active_connection.clone(),
+            // Reolink keeps the feed-facing clock presentation in CGI. Apply the
+            // feed-facing fields on that lane and seed the current site-local wall
+            // clock so the baked timestamp converges immediately instead of waiting
+            // for the camera's next NTP poll. NTP mode/server remain ONVIF-owned.
+            time_mode: None,
+            ntp_server: None,
+            manual_time: site_local_time_string(&site_time.timezone, Utc::now()),
+            timezone: nonempty_option(&site_time.timezone),
+            enforce_clock_display: true,
+            overlay_text: nonempty_option(&desired.overlay_text),
+            overlay_timestamp: Some(desired.overlay_timestamp),
+        })
+        .await
+    {
         let suffix = format!("failed applying presentation state: {error}");
         updated.credentials.last_rotation_error =
             if updated.credentials.last_rotation_error.trim().is_empty() {
@@ -2008,7 +2020,7 @@ async fn apply_reolink_cgi_desired(
 }
 
 fn build_reolink_setup_request(
-    next: &CameraConfig,
+    next: &CameraDeviceConfig,
     password: String,
     desired_password: String,
     generate_password: bool,
@@ -2047,9 +2059,9 @@ fn build_reolink_setup_request(
 
 async fn apply_reolink_onvif_desired(
     cfg: &Config,
-    existing: &CameraConfig,
-    next: &CameraConfig,
-) -> Result<CameraConfig> {
+    existing: &CameraDeviceConfig,
+    next: &CameraDeviceConfig,
+) -> Result<CameraDeviceConfig> {
     let mut updated = next.clone();
     let site_time = site_time_policy(cfg);
     onvif::apply_site_time_settings(
@@ -2070,7 +2082,7 @@ async fn apply_reolink_onvif_desired(
     Ok(updated)
 }
 
-async fn ensure_reolink_cgi_lane_via_onvif(camera: &CameraConfig) -> Result<()> {
+async fn ensure_reolink_cgi_lane_via_onvif(camera: &CameraDeviceConfig) -> Result<()> {
     let onvif_state = onvif::read_state(
         &camera.onvif_host,
         camera.onvif_port.max(1),
@@ -2158,7 +2170,7 @@ fn find_onvif_protocol(
 }
 
 async fn read_reolink_presentation_via_onvif_bridge(
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
     onvif_state: &onvif::OnvifState,
 ) -> Result<reolink_cgi::ReolinkPresentationState> {
     if let Ok(connection) = resolve_reolink_connection_for(
@@ -2231,7 +2243,7 @@ async fn read_reolink_presentation_via_onvif_bridge(
 }
 
 async fn restore_reolink_onvif_protocols(
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
     protocols: &[onvif::OnvifNetworkProtocol],
 ) -> Result<()> {
     for protocol in protocols {
@@ -2249,7 +2261,7 @@ async fn restore_reolink_onvif_protocols(
     Ok(())
 }
 
-async fn read_observed_state(camera: &CameraConfig) -> Result<ObservedCameraState> {
+async fn read_observed_state(camera: &CameraDeviceConfig) -> Result<ObservedCameraState> {
     if camera.driver_id.trim() == DRIVER_ID_REOLINK {
         read_reolink_observed_state(camera).await
     } else if driver_is_xm(&camera.driver_id) {
@@ -2259,204 +2271,204 @@ async fn read_observed_state(camera: &CameraConfig) -> Result<ObservedCameraStat
     }
 }
 
-async fn read_reolink_observed_state(camera: &CameraConfig) -> Result<ObservedCameraState> {
+async fn read_reolink_observed_state(camera: &CameraDeviceConfig) -> Result<ObservedCameraState> {
     let ports = probe_common_ports(&camera.onvif_host).await;
     let probe = reolink::probe(&camera.onvif_host, 2)
         .await
         .unwrap_or_default();
-    if ports.http || ports.https {
-        if let Ok((connection, state)) = resolve_reolink_state(camera).await {
-            let presentation = reolink_cgi::read_presentation_state(&connection)
+    if (ports.http || ports.https)
+        && let Ok((connection, state)) = resolve_reolink_state(camera).await
+    {
+        let presentation = reolink_cgi::read_presentation_state(&connection)
+            .await
+            .unwrap_or_default();
+        let onvif_state = if ports.onvif {
+            onvif::read_state(
+                &camera.onvif_host,
+                camera.onvif_port.max(1),
+                &camera.username,
+                &connection.password,
+            )
+            .await
+            .ok()
+        } else {
+            None
+        };
+        let ptz_capable = reolink_ptz_capable(camera, &probe, &presentation);
+        let native_ptz = if probe.proprietary_port_open {
+            try_reolink_native_ptz_observation(camera, std::slice::from_ref(&connection.password))
                 .await
-                .unwrap_or_default();
-            let onvif_state = if ports.onvif {
-                onvif::read_state(
-                    &camera.onvif_host,
-                    camera.onvif_port.max(1),
-                    &camera.username,
-                    &connection.password,
-                )
-                .await
-                .ok()
-            } else {
-                None
-            };
-            let ptz_capable = reolink_ptz_capable(camera, &probe, &presentation);
-            let native_ptz = if probe.proprietary_port_open {
-                try_reolink_native_ptz_observation(camera, &[connection.password.clone()]).await
-            } else {
-                None
-            };
-            let management_plane = if onvif_state.is_some() {
-                "hybrid"
-            } else {
-                "cgi"
-            };
-            return Ok(ObservedCameraState {
-                display_name: presentation.overlay_text.trim().to_string(),
-                driver_id: camera.driver_id.clone(),
-                vendor: first_nonempty(
-                    &camera.vendor,
-                    &onvif_state
-                        .as_ref()
-                        .map(|state| first_nonempty(&state.manufacturer, "Reolink"))
-                        .unwrap_or_else(|| "Reolink".to_string()),
-                ),
-                model: first_nonempty(
-                    &camera.model,
-                    &onvif_state
-                        .as_ref()
-                        .map(|state| first_nonempty(&state.model, &presentation.model))
-                        .unwrap_or_else(|| presentation.model.clone()),
-                ),
-                ip: camera.onvif_host.clone(),
-                mac_address: camera.mac_address.clone(),
-                time_mode: reolink_observed_time_mode(onvif_state.as_ref(), &presentation),
-                ntp_server: reolink_observed_ntp_server(onvif_state.as_ref(), &presentation),
-                manual_time: reolink_observed_manual_time(onvif_state.as_ref(), &presentation),
-                timezone: reolink_observed_timezone(onvif_state.as_ref(), &presentation),
-                overlay_text: presentation.overlay_text.clone(),
-                overlay_timestamp: presentation.overlay_timestamp,
-                ptz_capable,
-                current_pose: native_ptz
+        } else {
+            None
+        };
+        let management_plane = if onvif_state.is_some() {
+            "hybrid"
+        } else {
+            "cgi"
+        };
+        return Ok(ObservedCameraState {
+            display_name: presentation.overlay_text.trim().to_string(),
+            driver_id: camera.driver_id.clone(),
+            vendor: first_nonempty(
+                &camera.vendor,
+                &onvif_state
                     .as_ref()
-                    .map(|native| native.normalized.clone())
-                    .unwrap_or_default(),
-                pose_status: if native_ptz.is_some() {
-                    "settled".to_string()
-                } else {
-                    String::new()
-                },
-                pose_source: if native_ptz.is_some() {
-                    "reolink_native".to_string()
-                } else {
-                    "cgi".to_string()
-                },
-                services: json!({
-                    "managementPlane": management_plane,
-                    "timeManagementPlane": if onvif_state.is_some() { "hybrid" } else { "cgi" },
-                    "normalizedTimeManagementPlane": if onvif_state.is_some() { "onvif" } else { "cgi" },
-                    "feedClockManagementPlane": "cgi",
-                    "presentationManagementPlane": "cgi",
-                    "ptzManagementPlane": if native_ptz.is_some() { "reolink_native_absolute" } else { "cgi" },
-                    "http": state.state.normal.get("iHttpPortEnable").cloned().unwrap_or(json!(0)),
-                    "https": state.state.normal.get("iHttpsPortEnable").cloned().unwrap_or(json!(0)),
-                    "onvif": state.state.advanced.get("iOnvifPortEnable").cloned().unwrap_or(json!(0)),
-                    "rtsp": state.state.advanced.get("iRtspPortEnable").cloned().unwrap_or(json!(0)),
-                    "p2p": state.state.p2p.get("iEnable").cloned().unwrap_or(json!(0)),
-                    "proprietary9000": probe.proprietary_port_open,
-                    "onvifXAddr": probe.onvif_xaddr,
-                    "networkProtocols": onvif_state.as_ref().map(|state| state.network_protocols.clone()).unwrap_or_default(),
-                    "networkProtocolsSupported": onvif_state.as_ref().map(|state| state.network_protocols_writable).unwrap_or(false),
-                }),
-                raw: json!({
-                    "managementPlane": management_plane,
-                    "probe": probe,
-                    "state": state.state,
-                    "presentation": presentation,
-                    "onvif": onvif_state.as_ref().map(|state| state.raw.clone()),
-                    "nativePtz": native_ptz.as_ref().map(reolink_native_ptz_json),
-                }),
-            });
-        }
+                    .map(|state| first_nonempty(&state.manufacturer, "Reolink"))
+                    .unwrap_or_else(|| "Reolink".to_string()),
+            ),
+            model: first_nonempty(
+                &camera.model,
+                &onvif_state
+                    .as_ref()
+                    .map(|state| first_nonempty(&state.model, &presentation.model))
+                    .unwrap_or_else(|| presentation.model.clone()),
+            ),
+            ip: camera.onvif_host.clone(),
+            mac_address: camera.mac_address.clone(),
+            time_mode: reolink_observed_time_mode(onvif_state.as_ref(), &presentation),
+            ntp_server: reolink_observed_ntp_server(onvif_state.as_ref(), &presentation),
+            manual_time: reolink_observed_manual_time(onvif_state.as_ref(), &presentation),
+            timezone: reolink_observed_timezone(onvif_state.as_ref(), &presentation),
+            overlay_text: presentation.overlay_text.clone(),
+            overlay_timestamp: presentation.overlay_timestamp,
+            ptz_capable,
+            current_pose: native_ptz
+                .as_ref()
+                .map(|native| native.normalized.clone())
+                .unwrap_or_default(),
+            pose_status: if native_ptz.is_some() {
+                "settled".to_string()
+            } else {
+                String::new()
+            },
+            pose_source: if native_ptz.is_some() {
+                "reolink_native".to_string()
+            } else {
+                "cgi".to_string()
+            },
+            services: json!({
+                "managementPlane": management_plane,
+                "timeManagementPlane": if onvif_state.is_some() { "hybrid" } else { "cgi" },
+                "normalizedTimeManagementPlane": if onvif_state.is_some() { "onvif" } else { "cgi" },
+                "feedClockManagementPlane": "cgi",
+                "presentationManagementPlane": "cgi",
+                "ptzManagementPlane": if native_ptz.is_some() { "reolink_native_absolute" } else { "cgi" },
+                "http": state.state.normal.get("iHttpPortEnable").cloned().unwrap_or(json!(0)),
+                "https": state.state.normal.get("iHttpsPortEnable").cloned().unwrap_or(json!(0)),
+                "onvif": state.state.advanced.get("iOnvifPortEnable").cloned().unwrap_or(json!(0)),
+                "rtsp": state.state.advanced.get("iRtspPortEnable").cloned().unwrap_or(json!(0)),
+                "p2p": state.state.p2p.get("iEnable").cloned().unwrap_or(json!(0)),
+                "proprietary9000": probe.proprietary_port_open,
+                "onvifXAddr": probe.onvif_xaddr,
+                "networkProtocols": onvif_state.as_ref().map(|state| state.network_protocols.clone()).unwrap_or_default(),
+                "networkProtocolsSupported": onvif_state.as_ref().map(|state| state.network_protocols_writable).unwrap_or(false),
+            }),
+            raw: json!({
+                "managementPlane": management_plane,
+                "probe": probe,
+                "state": state.state,
+                "presentation": presentation,
+                "onvif": onvif_state.as_ref().map(|state| state.raw.clone()),
+                "nativePtz": native_ptz.as_ref().map(reolink_native_ptz_json),
+            }),
+        });
     }
-    if ports.onvif {
-        if let Ok(onvif_state) = onvif::read_state(
+    if ports.onvif
+        && let Ok(onvif_state) = onvif::read_state(
             &camera.onvif_host,
             camera.onvif_port.max(1),
             &camera.username,
             &camera.password,
         )
         .await
+    {
+        let presentation = read_reolink_presentation_via_onvif_bridge(camera, &onvif_state)
+            .await
+            .unwrap_or_default();
+        let ptz_capable = reolink_ptz_capable_from_strings(
+            onvif_state.ptz_capable || camera.ptz_capable,
+            &[
+                &camera.model,
+                &camera.name,
+                &onvif_state.model,
+                &presentation.model,
+            ],
+        );
+        let native_ptz = if probe.proprietary_port_open {
+            try_reolink_native_ptz_observation(camera, &[]).await
+        } else {
+            None
+        };
+        let management_plane = if !presentation.overlay_text.trim().is_empty()
+            || presentation.overlay_timestamp.is_some()
+            || !presentation.clock_date_format.trim().is_empty()
         {
-            let presentation = read_reolink_presentation_via_onvif_bridge(camera, &onvif_state)
-                .await
-                .unwrap_or_default();
-            let ptz_capable = reolink_ptz_capable_from_strings(
-                onvif_state.ptz_capable || camera.ptz_capable,
-                &[
-                    &camera.model,
-                    &camera.name,
-                    &onvif_state.model,
-                    &presentation.model,
-                ],
-            );
-            let native_ptz = if probe.proprietary_port_open {
-                try_reolink_native_ptz_observation(camera, &[]).await
-            } else {
-                None
-            };
-            let management_plane = if !presentation.overlay_text.trim().is_empty()
-                || presentation.overlay_timestamp.is_some()
-                || !presentation.clock_date_format.trim().is_empty()
-            {
-                "hybrid"
-            } else {
-                "onvif"
-            };
-            return Ok(ObservedCameraState {
-                display_name: presentation.overlay_text.trim().to_string(),
-                driver_id: camera.driver_id.clone(),
-                vendor: first_nonempty(
-                    &camera.vendor,
-                    &first_nonempty(&onvif_state.manufacturer, "Reolink"),
-                ),
-                model: first_nonempty(&camera.model, &onvif_state.model),
-                ip: camera.onvif_host.clone(),
-                mac_address: camera.mac_address.clone(),
-                time_mode: reolink_observed_time_mode(Some(&onvif_state), &presentation),
-                ntp_server: reolink_observed_ntp_server(Some(&onvif_state), &presentation),
-                manual_time: reolink_observed_manual_time(Some(&onvif_state), &presentation),
-                timezone: reolink_observed_timezone(Some(&onvif_state), &presentation),
-                overlay_text: presentation.overlay_text.clone(),
-                overlay_timestamp: presentation.overlay_timestamp,
-                ptz_capable,
-                current_pose: native_ptz
-                    .as_ref()
-                    .map(|native| native.normalized.clone())
-                    .unwrap_or_else(|| CameraPose {
-                        pan: onvif_state.current_pose.as_ref().and_then(|pose| pose.pan),
-                        tilt: onvif_state.current_pose.as_ref().and_then(|pose| pose.tilt),
-                        zoom: onvif_state.current_pose.as_ref().and_then(|pose| pose.zoom),
-                    }),
-                pose_status: if native_ptz.is_some() {
-                    "settled".to_string()
-                } else {
-                    first_nonempty(&onvif_state.pose_status, "idle")
-                },
-                pose_source: if native_ptz.is_some() {
-                    "reolink_native".to_string()
-                } else {
-                    "onvif".to_string()
-                },
-                services: json!({
-                    "managementPlane": management_plane,
-                    "timeManagementPlane": if management_plane == "hybrid" { "hybrid" } else { "onvif" },
-                    "normalizedTimeManagementPlane": "onvif",
-                    "feedClockManagementPlane": if management_plane == "hybrid" { "cgi" } else { "onvif" },
-                    "presentationManagementPlane": if management_plane == "hybrid" { "cgi" } else { "onvif" },
-                    "ptzManagementPlane": if native_ptz.is_some() { "reolink_native_absolute" } else { "onvif" },
-                    "http": ports.http,
-                    "https": ports.https,
-                    "onvif": ports.onvif,
-                    "rtsp": ports.rtsp,
-                    "proprietary9000": ports.proprietary_9000,
-                    "onvifXAddr": probe.onvif_xaddr,
-                    "mediaService": onvif_state.media_service_url,
-                    "ptzService": onvif_state.ptz_service_url,
-                    "profileToken": onvif_state.profile_token,
-                    "networkProtocols": onvif_state.network_protocols,
-                    "networkProtocolsSupported": onvif_state.network_protocols_writable,
+            "hybrid"
+        } else {
+            "onvif"
+        };
+        return Ok(ObservedCameraState {
+            display_name: presentation.overlay_text.trim().to_string(),
+            driver_id: camera.driver_id.clone(),
+            vendor: first_nonempty(
+                &camera.vendor,
+                &first_nonempty(&onvif_state.manufacturer, "Reolink"),
+            ),
+            model: first_nonempty(&camera.model, &onvif_state.model),
+            ip: camera.onvif_host.clone(),
+            mac_address: camera.mac_address.clone(),
+            time_mode: reolink_observed_time_mode(Some(&onvif_state), &presentation),
+            ntp_server: reolink_observed_ntp_server(Some(&onvif_state), &presentation),
+            manual_time: reolink_observed_manual_time(Some(&onvif_state), &presentation),
+            timezone: reolink_observed_timezone(Some(&onvif_state), &presentation),
+            overlay_text: presentation.overlay_text.clone(),
+            overlay_timestamp: presentation.overlay_timestamp,
+            ptz_capable,
+            current_pose: native_ptz
+                .as_ref()
+                .map(|native| native.normalized.clone())
+                .unwrap_or_else(|| CameraPose {
+                    pan: onvif_state.current_pose.as_ref().and_then(|pose| pose.pan),
+                    tilt: onvif_state.current_pose.as_ref().and_then(|pose| pose.tilt),
+                    zoom: onvif_state.current_pose.as_ref().and_then(|pose| pose.zoom),
                 }),
-                raw: json!({
-                    "managementPlane": management_plane,
-                    "probe": probe,
-                    "onvif": onvif_state.raw,
-                    "presentation": presentation,
-                    "nativePtz": native_ptz.as_ref().map(reolink_native_ptz_json),
-                }),
-            });
-        }
+            pose_status: if native_ptz.is_some() {
+                "settled".to_string()
+            } else {
+                first_nonempty(&onvif_state.pose_status, "idle")
+            },
+            pose_source: if native_ptz.is_some() {
+                "reolink_native".to_string()
+            } else {
+                "onvif".to_string()
+            },
+            services: json!({
+                "managementPlane": management_plane,
+                "timeManagementPlane": if management_plane == "hybrid" { "hybrid" } else { "onvif" },
+                "normalizedTimeManagementPlane": "onvif",
+                "feedClockManagementPlane": if management_plane == "hybrid" { "cgi" } else { "onvif" },
+                "presentationManagementPlane": if management_plane == "hybrid" { "cgi" } else { "onvif" },
+                "ptzManagementPlane": if native_ptz.is_some() { "reolink_native_absolute" } else { "onvif" },
+                "http": ports.http,
+                "https": ports.https,
+                "onvif": ports.onvif,
+                "rtsp": ports.rtsp,
+                "proprietary9000": ports.proprietary_9000,
+                "onvifXAddr": probe.onvif_xaddr,
+                "mediaService": onvif_state.media_service_url,
+                "ptzService": onvif_state.ptz_service_url,
+                "profileToken": onvif_state.profile_token,
+                "networkProtocols": onvif_state.network_protocols,
+                "networkProtocolsSupported": onvif_state.network_protocols_writable,
+            }),
+            raw: json!({
+                "managementPlane": management_plane,
+                "probe": probe,
+                "onvif": onvif_state.raw,
+                "presentation": presentation,
+                "nativePtz": native_ptz.as_ref().map(reolink_native_ptz_json),
+            }),
+        });
     }
     Err(anyhow!(
         "no supported management plane could read state for {} (cgi on 80/443 unavailable and ONVIF authentication/read failed)",
@@ -2470,60 +2482,59 @@ async fn probe_reolink_candidate(
 ) -> Result<Value> {
     let probe = reolink::probe(&candidate.ip, 2).await.unwrap_or_default();
     let ports = probe_common_ports(&candidate.ip).await;
-    if ports.http || ports.https {
-        if let Ok(connection) = resolve_reolink_connection_for(
+    if (ports.http || ports.https)
+        && let Ok(connection) = resolve_reolink_connection_for(
             &candidate.ip,
             request.username.trim(),
             &[request.password.trim().to_string()],
         )
         .await
-        {
-            let state = reolink_cgi::read_state(&connection).await?;
-            let presentation = reolink_cgi::read_presentation_state(&connection)
-                .await
-                .unwrap_or_default();
-            let ptz_capable = reolink_ptz_capable_from_strings(
-                false,
-                &[
-                    &candidate.signatures.model,
-                    &candidate.signatures.public_title,
-                    &presentation.model,
-                ],
-            );
-            return Ok(json!({
-                "driverId": DRIVER_ID_REOLINK,
-                "status": "ok",
-                "message": "Reolink CGI management plane authenticated and read current device state.",
-                "observed": {
-                    "vendor": first_nonempty(&candidate.signatures.vendor, "Reolink"),
-                    "model": first_nonempty(&presentation.model, &candidate.signatures.model),
-                    "ip": candidate.ip,
-                    "timeMode": presentation.time_mode,
-                    "ntpServer": presentation.ntp_server,
-                    "manualTime": presentation.manual_time,
-                    "timezone": presentation.timezone,
-                    "overlayText": presentation.overlay_text,
-                    "overlayTimestamp": presentation.overlay_timestamp,
-                    "ptzCapable": ptz_capable,
-                },
-                "services": {
-                    "managementPlane": "cgi",
-                    "http": state.state.normal.get("iHttpPortEnable").cloned().unwrap_or(json!(0)),
-                    "https": state.state.normal.get("iHttpsPortEnable").cloned().unwrap_or(json!(0)),
-                    "onvif": state.state.advanced.get("iOnvifPortEnable").cloned().unwrap_or(json!(0)),
-                    "rtsp": state.state.advanced.get("iRtspPortEnable").cloned().unwrap_or(json!(0)),
-                    "p2p": state.state.p2p.get("iEnable").cloned().unwrap_or(json!(0)),
-                    "proprietary9000": probe.proprietary_port_open,
-                    "onvifXAddr": probe.onvif_xaddr,
-                },
-                "raw": {
-                    "managementPlane": "cgi",
-                    "probe": probe,
-                    "state": state.state,
-                    "presentation": presentation,
-                }
-            }));
-        }
+    {
+        let state = reolink_cgi::read_state(&connection).await?;
+        let presentation = reolink_cgi::read_presentation_state(&connection)
+            .await
+            .unwrap_or_default();
+        let ptz_capable = reolink_ptz_capable_from_strings(
+            false,
+            &[
+                &candidate.signatures.model,
+                &candidate.signatures.public_title,
+                &presentation.model,
+            ],
+        );
+        return Ok(json!({
+            "driverId": DRIVER_ID_REOLINK,
+            "status": "ok",
+            "message": "Reolink CGI management plane authenticated and read current device state.",
+            "observed": {
+                "vendor": first_nonempty(&candidate.signatures.vendor, "Reolink"),
+                "model": first_nonempty(&presentation.model, &candidate.signatures.model),
+                "ip": candidate.ip,
+                "timeMode": presentation.time_mode,
+                "ntpServer": presentation.ntp_server,
+                "manualTime": presentation.manual_time,
+                "timezone": presentation.timezone,
+                "overlayText": presentation.overlay_text,
+                "overlayTimestamp": presentation.overlay_timestamp,
+                "ptzCapable": ptz_capable,
+            },
+            "services": {
+                "managementPlane": "cgi",
+                "http": state.state.normal.get("iHttpPortEnable").cloned().unwrap_or(json!(0)),
+                "https": state.state.normal.get("iHttpsPortEnable").cloned().unwrap_or(json!(0)),
+                "onvif": state.state.advanced.get("iOnvifPortEnable").cloned().unwrap_or(json!(0)),
+                "rtsp": state.state.advanced.get("iRtspPortEnable").cloned().unwrap_or(json!(0)),
+                "p2p": state.state.p2p.get("iEnable").cloned().unwrap_or(json!(0)),
+                "proprietary9000": probe.proprietary_port_open,
+                "onvifXAddr": probe.onvif_xaddr,
+            },
+            "raw": {
+                "managementPlane": "cgi",
+                "probe": probe,
+                "state": state.state,
+                "presentation": presentation,
+            }
+        }));
     }
     if ports.onvif {
         let onvif_state = onvif::read_state(
@@ -2533,7 +2544,7 @@ async fn probe_reolink_candidate(
             request.password.trim(),
         )
         .await?;
-        let temp_camera = CameraConfig {
+        let temp_camera = CameraDeviceConfig {
             source_id: build_source_id(candidate, DRIVER_ID_REOLINK),
             name: candidate_display_name(candidate),
             onvif_host: candidate.ip.clone(),
@@ -2555,7 +2566,7 @@ async fn probe_reolink_candidate(
             ptz_capable: candidate_ptz_capable(candidate),
             enabled: true,
             segment_secs: 10,
-            desired: CameraDesiredConfig::default(),
+            desired: CameraDeviceDesiredConfig::default(),
             credentials: Default::default(),
         };
         let presentation = read_reolink_presentation_via_onvif_bridge(&temp_camera, &onvif_state)
@@ -2617,7 +2628,7 @@ async fn probe_reolink_candidate(
     ))
 }
 
-fn xm_connect_request(camera: &CameraConfig) -> Result<xm::XmConnectRequest> {
+fn xm_connect_request(camera: &CameraDeviceConfig) -> Result<xm::XmConnectRequest> {
     let host = camera.onvif_host.trim();
     let username = camera.username.trim();
     let password = camera.password.trim();
@@ -2728,54 +2739,53 @@ async fn ffprobe_rtsp_stream(url: &str) -> Result<Value> {
     serde_json::from_slice(&output.stdout).context("ffprobe returned invalid json")
 }
 
-async fn read_generic_observed_state(camera: &CameraConfig) -> Result<ObservedCameraState> {
+async fn read_generic_observed_state(camera: &CameraDeviceConfig) -> Result<ObservedCameraState> {
     let ports = probe_common_ports(&camera.onvif_host).await;
-    if ports.onvif {
-        if let Ok(onvif_state) = onvif::read_state(
+    if ports.onvif
+        && let Ok(onvif_state) = onvif::read_state(
             &camera.onvif_host,
             camera.onvif_port.max(1),
             &camera.username,
             &camera.password,
         )
         .await
-        {
-            return Ok(ObservedCameraState {
-                display_name: camera_display_name(camera),
-                driver_id: camera.driver_id.clone(),
-                vendor: first_nonempty(&camera.vendor, &onvif_state.manufacturer),
-                model: first_nonempty(&camera.model, &onvif_state.model),
-                ip: camera.onvif_host.clone(),
-                mac_address: camera.mac_address.clone(),
-                time_mode: onvif_state.time_mode.clone(),
-                ntp_server: onvif_state.ntp_server.clone(),
-                manual_time: onvif_state.manual_time.clone(),
-                timezone: onvif_state.timezone.clone(),
-                overlay_text: camera.desired.overlay_text.clone(),
-                overlay_timestamp: Some(camera.desired.overlay_timestamp),
-                ptz_capable: camera.ptz_capable || onvif_state.ptz_capable,
-                current_pose: CameraPose {
-                    pan: onvif_state.current_pose.as_ref().and_then(|pose| pose.pan),
-                    tilt: onvif_state.current_pose.as_ref().and_then(|pose| pose.tilt),
-                    zoom: onvif_state.current_pose.as_ref().and_then(|pose| pose.zoom),
-                },
-                pose_status: onvif_state.pose_status.clone(),
-                pose_source: "onvif".to_string(),
-                services: json!({
-                    "managementPlane": "onvif",
-                    "http": ports.http,
-                    "https": ports.https,
-                    "rtsp": ports.rtsp,
-                    "onvif": ports.onvif,
-                    "proprietary9000": ports.proprietary_9000,
-                    "mediaService": onvif_state.media_service_url,
-                    "ptzService": onvif_state.ptz_service_url,
-                }),
-                raw: json!({
-                    "managementPlane": "onvif",
-                    "onvif": onvif_state.raw,
-                }),
-            });
-        }
+    {
+        return Ok(ObservedCameraState {
+            display_name: camera_display_name(camera),
+            driver_id: camera.driver_id.clone(),
+            vendor: first_nonempty(&camera.vendor, &onvif_state.manufacturer),
+            model: first_nonempty(&camera.model, &onvif_state.model),
+            ip: camera.onvif_host.clone(),
+            mac_address: camera.mac_address.clone(),
+            time_mode: onvif_state.time_mode.clone(),
+            ntp_server: onvif_state.ntp_server.clone(),
+            manual_time: onvif_state.manual_time.clone(),
+            timezone: onvif_state.timezone.clone(),
+            overlay_text: camera.desired.overlay_text.clone(),
+            overlay_timestamp: Some(camera.desired.overlay_timestamp),
+            ptz_capable: camera.ptz_capable || onvif_state.ptz_capable,
+            current_pose: CameraPose {
+                pan: onvif_state.current_pose.as_ref().and_then(|pose| pose.pan),
+                tilt: onvif_state.current_pose.as_ref().and_then(|pose| pose.tilt),
+                zoom: onvif_state.current_pose.as_ref().and_then(|pose| pose.zoom),
+            },
+            pose_status: onvif_state.pose_status.clone(),
+            pose_source: "onvif".to_string(),
+            services: json!({
+                "managementPlane": "onvif",
+                "http": ports.http,
+                "https": ports.https,
+                "rtsp": ports.rtsp,
+                "onvif": ports.onvif,
+                "proprietary9000": ports.proprietary_9000,
+                "mediaService": onvif_state.media_service_url,
+                "ptzService": onvif_state.ptz_service_url,
+            }),
+            raw: json!({
+                "managementPlane": "onvif",
+                "onvif": onvif_state.raw,
+            }),
+        });
     }
     Ok(ObservedCameraState {
         display_name: camera_display_name(camera),
@@ -2808,7 +2818,7 @@ async fn read_generic_observed_state(camera: &CameraConfig) -> Result<ObservedCa
     })
 }
 
-async fn read_xm_observed_state(camera: &CameraConfig) -> Result<ObservedCameraState> {
+async fn read_xm_observed_state(camera: &CameraDeviceConfig) -> Result<ObservedCameraState> {
     let ports = probe_common_ports(&camera.onvif_host).await;
     let xm_state = xm::read_state(&xm_connect_request(camera)?).await?;
     Ok(ObservedCameraState {
@@ -2851,7 +2861,7 @@ async fn read_xm_observed_state(camera: &CameraConfig) -> Result<ObservedCameraS
     })
 }
 
-async fn fallback_observed_state(camera: &CameraConfig) -> ObservedCameraState {
+async fn fallback_observed_state(camera: &CameraDeviceConfig) -> ObservedCameraState {
     let ports = probe_common_ports(&camera.onvif_host).await;
     ObservedCameraState {
         display_name: camera_display_name(camera),
@@ -2886,7 +2896,7 @@ async fn fallback_observed_state(camera: &CameraConfig) -> ObservedCameraState {
 
 fn verification_for_observed(
     cfg: &Config,
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
     observed: &ObservedCameraState,
     capabilities: &CameraCapabilitySet,
     failed_fields: Vec<String>,
@@ -2898,10 +2908,7 @@ fn verification_for_observed(
     {
         drift_fields.push("display_name".to_string());
     }
-    if capabilities.time_sync
-        && site_time.ntp_enabled
-        && observed.time_mode.trim() != "ntp"
-    {
+    if capabilities.time_sync && site_time.ntp_enabled && observed.time_mode.trim() != "ntp" {
         drift_fields.push("time_mode".to_string());
     }
     if capabilities.time_sync
@@ -2925,12 +2932,8 @@ fn verification_for_observed(
         && site_time.ntp_enabled
         && !site_time.timezone.trim().is_empty()
         && !observed.manual_time.trim().is_empty()
-        && observed_site_time_offset_secs(
-            &site_time.timezone,
-            &observed.manual_time,
-            Utc::now(),
-        )
-        .is_some_and(|offset| offset > CAMERA_TIME_MAX_DRIFT_SECS)
+        && observed_site_time_offset_secs(&site_time.timezone, &observed.manual_time, Utc::now())
+            .is_some_and(|offset| offset > CAMERA_TIME_MAX_DRIFT_SECS)
     {
         drift_fields.push("time_clock".to_string());
     }
@@ -2970,7 +2973,7 @@ fn verification_for_observed(
 
 fn applied_fields(
     cfg: &Config,
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
     capabilities: &CameraCapabilitySet,
 ) -> Vec<String> {
     let site_time = effective_site_time_policy(cfg, camera);
@@ -3001,7 +3004,7 @@ fn applied_fields(
 
 fn unsupported_fields(
     cfg: &Config,
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
     capabilities: &CameraCapabilitySet,
 ) -> Vec<String> {
     let site_time = effective_site_time_policy(cfg, camera);
@@ -3109,7 +3112,7 @@ fn candidate_ptz_capable(candidate: &DiscoveredCameraCandidate) -> bool {
 }
 
 fn reolink_ptz_capable(
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
     probe: &reolink::ReolinkProbe,
     presentation: &reolink_cgi::ReolinkPresentationState,
 ) -> bool {
@@ -3194,10 +3197,10 @@ fn derive_onvif_port(candidate: &DiscoveredCameraCandidate) -> u16 {
 }
 
 fn derive_rtsp_port(candidate: &DiscoveredCameraCandidate, explicit_rtsp_url: &str) -> u16 {
-    if let Ok(url) = Url::parse(explicit_rtsp_url) {
-        if let Some(port) = url.port() {
-            return port;
-        }
+    if let Ok(url) = Url::parse(explicit_rtsp_url)
+        && let Some(port) = url.port()
+    {
+        return port;
     }
     let _ = candidate;
     554
@@ -3247,7 +3250,7 @@ fn xm_preview_rtsp_url(url: &str) -> String {
         .replace("_stream=0.sdp", "_stream=1.sdp")
 }
 
-fn normalize_camera_defaults(cfg: &Config, camera: &mut CameraConfig) {
+fn normalize_camera_defaults(cfg: &Config, camera: &mut CameraDeviceConfig) {
     let mut snapshot = cfg.clone();
     snapshot.camera_devices.push(camera.clone());
     snapshot.apply_defaults();
@@ -3256,7 +3259,7 @@ fn normalize_camera_defaults(cfg: &Config, camera: &mut CameraConfig) {
     }
 }
 
-fn credential_safety(camera: &CameraConfig) -> CameraCredentialSafety {
+fn credential_safety(camera: &CameraDeviceConfig) -> CameraCredentialSafety {
     CameraCredentialSafety {
         status: if camera.credentials.last_rotation_status.trim().is_empty() {
             "ready".to_string()
@@ -3269,7 +3272,7 @@ fn credential_safety(camera: &CameraConfig) -> CameraCredentialSafety {
     }
 }
 
-fn reolink_password_candidates(camera: &CameraConfig) -> Vec<String> {
+fn reolink_password_candidates(camera: &CameraDeviceConfig) -> Vec<String> {
     let mut candidates = camera_credential_candidates(camera);
     if candidates.is_empty() {
         candidates.push(String::new());
@@ -3278,8 +3281,8 @@ fn reolink_password_candidates(camera: &CameraConfig) -> Vec<String> {
 }
 
 fn reolink_post_apply_candidates(
-    existing: &CameraConfig,
-    updated: &CameraConfig,
+    existing: &CameraDeviceConfig,
+    updated: &CameraDeviceConfig,
     requested_password: &str,
 ) -> Vec<String> {
     let mut candidates = Vec::new();
@@ -3316,7 +3319,7 @@ async fn try_reolink_setup(
 }
 
 async fn resolve_reolink_state(
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
 ) -> Result<(reolink::ReolinkConnectRequest, reolink::ReolinkStateResult)> {
     let connection = resolve_reolink_connection_for(
         &camera.onvif_host,
@@ -3352,7 +3355,7 @@ async fn resolve_reolink_connection_for(
     ))
 }
 
-fn camera_display_name(camera: &CameraConfig) -> String {
+fn camera_display_name(camera: &CameraDeviceConfig) -> String {
     first_nonempty(&camera.desired.display_name, &camera.name)
 }
 
@@ -3594,7 +3597,10 @@ fn is_xm_http_fingerprint(fingerprint: &HttpFingerprint) -> bool {
         "raw_player.js",
         "pubversion=",
     ];
-    let hits = markers.iter().filter(|marker| body.contains(**marker)).count();
+    let hits = markers
+        .iter()
+        .filter(|marker| body.contains(**marker))
+        .count();
     hits >= 2 || (server.contains("gsoap/2.8") && body.contains("api_pluginplay/api_plugin.js"))
 }
 
@@ -3619,6 +3625,47 @@ fn push_unique_string(items: &mut Vec<String>, value: &str) {
     if !value.is_empty() && !items.iter().any(|item| item == value) {
         items.push(value.to_string());
     }
+}
+
+fn requested_apply_fields(existing: &CameraDeviceConfig, next: &CameraDeviceConfig) -> Vec<String> {
+    let mut fields = Vec::new();
+    if next.desired.display_name.trim() != existing.desired.display_name.trim()
+        || next.name.trim() != existing.name.trim()
+    {
+        fields.push("display_name".to_string());
+    }
+    if next.desired.overlay_text.trim() != existing.desired.overlay_text.trim() {
+        fields.push("overlay_text".to_string());
+    }
+    if next.desired.overlay_timestamp != existing.desired.overlay_timestamp {
+        fields.push("overlay_timestamp".to_string());
+    }
+    if next.desired.desired_password.trim() != existing.desired.desired_password.trim()
+        || next.desired.generate_password != existing.desired.generate_password
+    {
+        fields.push("password_rotate".to_string());
+    }
+    if next.desired.hardening != existing.desired.hardening {
+        fields.push("hardening".to_string());
+    }
+    fields
+}
+
+fn requested_verification_failures(
+    verification: &CameraReconcileResult,
+    requested_fields: &[String],
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for field in requested_fields {
+        if verification.failed_fields.iter().any(|item| item == field)
+            || verification.drift_fields.iter().any(|item| item == field)
+        {
+            failures.push(field.clone());
+        }
+    }
+    failures.sort();
+    failures.dedup();
+    failures
 }
 
 #[cfg(test)]
@@ -3738,7 +3785,7 @@ mod tests {
 
     #[test]
     fn observed_ptz_capability_promotes_rendered_capabilities() {
-        let camera = CameraConfig {
+        let camera = CameraDeviceConfig {
             source_id: "cam".to_string(),
             name: "Camera".to_string(),
             onvif_host: "10.0.0.1".to_string(),
@@ -3772,7 +3819,7 @@ mod tests {
 
     #[test]
     fn reolink_onvif_plane_gates_capabilities_to_supported_fields() {
-        let camera = CameraConfig {
+        let camera = CameraDeviceConfig {
             source_id: "cam".to_string(),
             name: "Camera".to_string(),
             onvif_host: "10.0.0.1".to_string(),
@@ -3809,7 +3856,7 @@ mod tests {
 
     #[test]
     fn transport_only_fallback_does_not_advertise_config_controls() {
-        let camera = CameraConfig {
+        let camera = CameraDeviceConfig {
             source_id: "cam".to_string(),
             name: "Camera".to_string(),
             onvif_host: "10.0.0.1".to_string(),
@@ -3845,7 +3892,7 @@ mod tests {
 
     #[test]
     fn reolink_e1_native_profile_round_trips_normalized_pose() {
-        let camera = CameraConfig {
+        let camera = CameraDeviceConfig {
             source_id: "cam".to_string(),
             name: "Reolink E1 Outdoor SE".to_string(),
             onvif_host: "10.0.0.1".to_string(),
@@ -4020,7 +4067,7 @@ mod tests {
 
     #[test]
     fn display_name_change_keeps_overlay_text_linked_by_default() {
-        let existing = CameraConfig {
+        let existing = CameraDeviceConfig {
             source_id: "cam".to_string(),
             name: "Front Door".to_string(),
             onvif_host: "10.0.0.1".to_string(),
@@ -4036,7 +4083,7 @@ mod tests {
             ptz_capable: false,
             enabled: true,
             segment_secs: 10,
-            desired: CameraDesiredConfig {
+            desired: CameraDeviceDesiredConfig {
                 display_name: "Front Door".to_string(),
                 overlay_text: "Front Door".to_string(),
                 ..Default::default()
@@ -4055,7 +4102,7 @@ mod tests {
 
     #[test]
     fn display_name_change_preserves_custom_overlay_text() {
-        let existing = CameraConfig {
+        let existing = CameraDeviceConfig {
             source_id: "cam".to_string(),
             name: "Front Door".to_string(),
             onvif_host: "10.0.0.1".to_string(),
@@ -4071,7 +4118,7 @@ mod tests {
             ptz_capable: false,
             enabled: true,
             segment_secs: 10,
-            desired: CameraDesiredConfig {
+            desired: CameraDeviceDesiredConfig {
                 display_name: "Front Door".to_string(),
                 overlay_text: "Package Zone".to_string(),
                 ..Default::default()
@@ -4090,7 +4137,7 @@ mod tests {
 
     #[test]
     fn xm_display_name_change_does_not_link_hidden_overlay_fields() {
-        let existing = CameraConfig {
+        let existing = CameraDeviceConfig {
             source_id: "cam".to_string(),
             name: "Front Door".to_string(),
             onvif_host: "10.0.0.1".to_string(),
@@ -4106,7 +4153,7 @@ mod tests {
             ptz_capable: false,
             enabled: true,
             segment_secs: 10,
-            desired: CameraDesiredConfig {
+            desired: CameraDeviceDesiredConfig {
                 display_name: "Front Door".to_string(),
                 overlay_text: String::new(),
                 overlay_timestamp: false,
@@ -4190,7 +4237,7 @@ mod tests {
         }))
         .expect("config");
 
-        let camera = CameraConfig {
+        let camera = CameraDeviceConfig {
             source_id: "cam".to_string(),
             name: "Carport".to_string(),
             onvif_host: "10.0.0.1".to_string(),
@@ -4206,7 +4253,7 @@ mod tests {
             ptz_capable: true,
             enabled: true,
             segment_secs: 10,
-            desired: CameraDesiredConfig {
+            desired: CameraDeviceDesiredConfig {
                 display_name: "Carport".to_string(),
                 overlay_text: "Carport".to_string(),
                 overlay_timestamp: true,
@@ -4248,7 +4295,10 @@ mod tests {
 
     #[test]
     fn observed_site_time_offset_secs_accepts_current_phoenix_time() {
-        let now = Utc.with_ymd_and_hms(2026, 4, 18, 0, 45, 0).single().unwrap();
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 18, 0, 45, 0)
+            .single()
+            .unwrap();
         assert_eq!(
             observed_site_time_offset_secs("America/Phoenix", "2026-04-17T17:45:30", now),
             Some(30)
@@ -4257,7 +4307,10 @@ mod tests {
 
     #[test]
     fn site_local_time_string_formats_current_phoenix_time() {
-        let now = Utc.with_ymd_and_hms(2026, 4, 18, 0, 45, 0).single().unwrap();
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 18, 0, 45, 0)
+            .single()
+            .unwrap();
         assert_eq!(
             site_local_time_string("America/Phoenix", now).as_deref(),
             Some("2026-04-17T17:45:00")
@@ -4266,7 +4319,10 @@ mod tests {
 
     #[test]
     fn observed_site_time_offset_secs_detects_large_clock_lead() {
-        let now = Utc.with_ymd_and_hms(2026, 4, 18, 0, 45, 0).single().unwrap();
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 18, 0, 45, 0)
+            .single()
+            .unwrap();
         assert_eq!(
             observed_site_time_offset_secs("America/Phoenix", "2026-04-17T17:50:30", now),
             Some(330)
@@ -4275,7 +4331,7 @@ mod tests {
 
     #[test]
     fn requested_apply_fields_include_display_and_overlay_changes() {
-        let existing = CameraConfig {
+        let existing = CameraDeviceConfig {
             source_id: "cam".to_string(),
             name: "Front Door".to_string(),
             onvif_host: "10.0.0.1".to_string(),
@@ -4291,7 +4347,7 @@ mod tests {
             ptz_capable: false,
             enabled: true,
             segment_secs: 10,
-            desired: CameraDesiredConfig {
+            desired: CameraDeviceDesiredConfig {
                 display_name: "Front Door".to_string(),
                 overlay_text: "Front Door".to_string(),
                 ..Default::default()
@@ -4325,47 +4381,9 @@ mod tests {
             &verification,
             &["display_name".to_string(), "overlay_text".to_string()],
         );
-        assert_eq!(failures, vec!["display_name".to_string(), "overlay_text".to_string()]);
+        assert_eq!(
+            failures,
+            vec!["display_name".to_string(), "overlay_text".to_string()]
+        );
     }
-}
-
-fn requested_apply_fields(existing: &CameraConfig, next: &CameraConfig) -> Vec<String> {
-    let mut fields = Vec::new();
-    if next.desired.display_name.trim() != existing.desired.display_name.trim()
-        || next.name.trim() != existing.name.trim()
-    {
-        fields.push("display_name".to_string());
-    }
-    if next.desired.overlay_text.trim() != existing.desired.overlay_text.trim() {
-        fields.push("overlay_text".to_string());
-    }
-    if next.desired.overlay_timestamp != existing.desired.overlay_timestamp {
-        fields.push("overlay_timestamp".to_string());
-    }
-    if next.desired.desired_password.trim() != existing.desired.desired_password.trim()
-        || next.desired.generate_password != existing.desired.generate_password
-    {
-        fields.push("password_rotate".to_string());
-    }
-    if next.desired.hardening != existing.desired.hardening {
-        fields.push("hardening".to_string());
-    }
-    fields
-}
-
-fn requested_verification_failures(
-    verification: &CameraReconcileResult,
-    requested_fields: &[String],
-) -> Vec<String> {
-    let mut failures = Vec::new();
-    for field in requested_fields {
-        if verification.failed_fields.iter().any(|item| item == field)
-            || verification.drift_fields.iter().any(|item| item == field)
-        {
-            failures.push(field.clone());
-        }
-    }
-    failures.sort();
-    failures.dedup();
-    failures
 }

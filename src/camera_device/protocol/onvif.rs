@@ -451,12 +451,11 @@ pub async fn ptz_set_pose(
     for _ in 0..5 {
         sleep(Duration::from_millis(450)).await;
         let refreshed = read_state(ip, port, username, password).await?;
-        if let Some(pose) = refreshed.current_pose {
-            if pose_looks_updated(previous_pose.as_ref(), &pose)
-                || pose_matches_target(&pose, &expected)
-            {
-                return Ok(pose);
-            }
+        if let Some(pose) = refreshed.current_pose
+            && (pose_looks_updated(previous_pose.as_ref(), &pose)
+                || pose_matches_target(&pose, &expected))
+        {
+            return Ok(pose);
         }
     }
     Err(anyhow!(
@@ -798,12 +797,9 @@ fn normalize_onvif_timezone(value: &str) -> String {
     }
     match trimmed {
         "UTC" | "GMT+00:00:00" | "UTC+00:00:00" => "UTC".to_string(),
-        "MST7"
-        | "MST7:00:00"
-        | "UTC+7:00:00"
-        | "UTC+07:00:00"
-        | "GMT+7:00:00"
-        | "GMT+07:00:00" => "America/Phoenix".to_string(),
+        "MST7" | "MST7:00:00" | "UTC+7:00:00" | "UTC+07:00:00" | "GMT+7:00:00" | "GMT+07:00:00" => {
+            "America/Phoenix".to_string()
+        }
         _ => trimmed.to_string(),
     }
 }

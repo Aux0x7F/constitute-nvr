@@ -4,13 +4,13 @@ use anyhow::{Result, anyhow};
 #[derive(Clone, Debug)]
 pub struct CameraDriftReconcileOutcome {
     pub initial_drift_fields: Vec<String>,
-    pub configured: CameraConfig,
+    pub configured: CameraDeviceConfig,
     pub mounted: MountedCamera,
 }
 
 pub async fn reconcile_camera_device(
     cfg: &Config,
-    camera: &CameraConfig,
+    camera: &CameraDeviceConfig,
 ) -> Result<Option<CameraDriftReconcileOutcome>> {
     let mounted_before = inventory::read_mounted_camera_device(cfg, camera).await;
     let initial_actionable_drift_fields =
@@ -51,14 +51,11 @@ pub async fn reconcile_camera_device(
     }
 }
 
-pub fn camera_config_changed(left: &CameraConfig, right: &CameraConfig) -> bool {
+pub fn camera_config_changed(left: &CameraDeviceConfig, right: &CameraDeviceConfig) -> bool {
     serde_json::to_value(left).ok() != serde_json::to_value(right).ok()
 }
 
-fn actionable_drift_fields(
-    camera: &CameraConfig,
-    drift_fields: &[String],
-) -> Vec<String> {
+fn actionable_drift_fields(camera: &CameraDeviceConfig, drift_fields: &[String]) -> Vec<String> {
     drift_fields
         .iter()
         .filter(|field| camera_field_is_reconcilable(camera, field))
@@ -66,7 +63,7 @@ fn actionable_drift_fields(
         .collect()
 }
 
-fn camera_field_is_reconcilable(camera: &CameraConfig, field: &str) -> bool {
+fn camera_field_is_reconcilable(camera: &CameraDeviceConfig, field: &str) -> bool {
     if camera.driver_id.trim() == DRIVER_ID_REOLINK {
         return matches!(
             field,
@@ -86,7 +83,10 @@ fn camera_field_is_reconcilable(camera: &CameraConfig, field: &str) -> bool {
         );
     }
     if camera.driver_id.trim() == DRIVER_ID_GENERIC_ONVIF_RTSP {
-        return matches!(field, "time_mode" | "ntp_server" | "timezone" | "time_clock");
+        return matches!(
+            field,
+            "time_mode" | "ntp_server" | "timezone" | "time_clock"
+        );
     }
     false
 }
@@ -95,8 +95,8 @@ fn camera_field_is_reconcilable(camera: &CameraConfig, field: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn sample_camera() -> CameraConfig {
-        CameraConfig {
+    fn sample_camera() -> CameraDeviceConfig {
+        CameraDeviceConfig {
             source_id: "cam-1".to_string(),
             name: "Front Door".to_string(),
             onvif_host: "192.168.0.201".to_string(),
@@ -112,7 +112,7 @@ mod tests {
             ptz_capable: false,
             enabled: true,
             segment_secs: 10,
-            desired: CameraDesiredConfig {
+            desired: CameraDeviceDesiredConfig {
                 display_name: "Front Door".to_string(),
                 ..Default::default()
             },
@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn reconcile_gate_only_uses_actionable_drift() {
         let mut xm_camera = sample_camera();
-        let generic = CameraConfig {
+        let generic = CameraDeviceConfig {
             driver_id: DRIVER_ID_GENERIC_ONVIF_RTSP.to_string(),
             ..xm_camera.clone()
         };
@@ -132,9 +132,7 @@ mod tests {
             actionable_drift_fields(&xm_camera, &["display_name".to_string()]),
             vec!["display_name".to_string()]
         );
-        assert!(
-            actionable_drift_fields(&generic, &["display_name".to_string()]).is_empty()
-        );
+        assert!(actionable_drift_fields(&generic, &["display_name".to_string()]).is_empty());
         xm_camera.driver_id = DRIVER_ID_REOLINK.to_string();
         assert_eq!(
             actionable_drift_fields(

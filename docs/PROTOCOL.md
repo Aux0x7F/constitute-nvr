@@ -67,7 +67,7 @@ Carries signed Nostr event payloads for:
 
 ## Managed Live Preview Negotiation
 Canonical managed path:
-1. browser shell obtains gateway-issued launch authorization for the target NVR service
+1. browser surface obtains gateway-issued launch authorization for the target NVR service
 2. Pages-hosted app surface redeems launch context
 3. gateway brokers signaling between browser and NVR
 4. NVR validates launch token and admits WebRTC session
@@ -166,5 +166,5 @@ Session key derivation:
 ## Compatibility Guardrail
 Any breaking changes to session/swarm payloads must be version-gated and coordinated with:
 - `constitute-gateway/docs/PROTOCOL.md`
-- `constitute` shell launch/signaling handling
+- `constitute-account` runtime authority and launch/signaling handling
 - `constitute-nvr-ui` managed launch/bootstrap handling

@@ -131,7 +131,7 @@ pub fn event_id_hex(unsigned: &NostrUnsignedEvent) -> Result<String> {
 
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
     let h = hex.trim();
-    if h.len() % 2 != 0 {
+    if !h.len().is_multiple_of(2) {
         return Err(anyhow!("invalid hex"));
     }
     let mut out = Vec::with_capacity(h.len() / 2);

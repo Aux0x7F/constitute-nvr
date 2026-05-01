@@ -1,7 +1,7 @@
 //! XM / NetSurveillance 40E driver lane.
 //!
 //! Driver-specific operational truth belongs here first, with only the high-level
-//! compatibility/operator summary duplicated in shared docs.
+//! operator summary duplicated in shared docs.
 //!
 //! Active product boundary:
 //! - authenticated XM SOAP-style management over the camera web endpoint
@@ -171,7 +171,8 @@ pub async fn apply_state(
 
     if let Some(policy) = site_time {
         let desired_ntp_time_xml = render_ntp_time_config_xml(&initial.time, policy);
-        if normalize_for_compare(&desired_ntp_time_xml) != normalize_for_compare(&initial.time.raw_xml)
+        if normalize_for_compare(&desired_ntp_time_xml)
+            != normalize_for_compare(&initial.time.raw_xml)
         {
             let manual_seed_xml = render_manual_time_config_xml(&initial.time, policy);
             session
@@ -317,7 +318,10 @@ fn xm_headers() -> Result<HeaderMap> {
         CONTENT_TYPE,
         HeaderValue::from_static("application/x-www-form-urlencoded"),
     );
-    headers.insert("X-Requested-With", HeaderValue::from_static("XMLHttpRequest"));
+    headers.insert(
+        "X-Requested-With",
+        HeaderValue::from_static("XMLHttpRequest"),
+    );
     headers.insert(
         ACCEPT,
         HeaderValue::from_static("text/javascript, text/html, application/xml, text/xml, */*"),
@@ -405,12 +409,8 @@ fn parse_time_config(xml: &str) -> Result<XmTimeConfig> {
         .descendants()
         .find(|node| node.has_tag_name("TimeConfig"))
         .ok_or_else(|| anyhow!("XM time XML missing TimeConfig"))?;
-    let ntp = root
-        .children()
-        .find(|node| node.has_tag_name("NTPConfig"));
-    let summer = root
-        .children()
-        .find(|node| node.has_tag_name("SummerTime"));
+    let ntp = root.children().find(|node| node.has_tag_name("NTPConfig"));
+    let summer = root.children().find(|node| node.has_tag_name("SummerTime"));
     let timezone_code = root
         .attribute("TimeZone")
         .unwrap_or("720")
@@ -423,7 +423,11 @@ fn parse_time_config(xml: &str) -> Result<XmTimeConfig> {
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase(),
-        current_time: root.attribute("CurTime").unwrap_or_default().trim().to_string(),
+        current_time: root
+            .attribute("CurTime")
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
         current_time_iso: normalize_time_value(root.attribute("CurTime").unwrap_or_default()),
         timezone_code,
         timezone_offset_minutes: timezone_code_to_offset_minutes(timezone_code),
@@ -517,7 +521,10 @@ fn parse_video_config(xml: &str) -> Result<XmVideoConfig> {
         .find(|node| node.has_tag_name("TimeOverlay"));
     let mut main_stream_format = String::new();
     let mut preview_stream_format = String::new();
-    for node in doc.descendants().filter(|node| node.has_tag_name("EncodeConfig")) {
+    for node in doc
+        .descendants()
+        .filter(|node| node.has_tag_name("EncodeConfig"))
+    {
         match node.attribute("Stream").unwrap_or_default().trim() {
             "1" => {
                 main_stream_format = node
@@ -583,7 +590,7 @@ fn first_nonempty(preferred: &str, fallback: &str) -> String {
 
 fn decode_title_hex(value: &str) -> String {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() % 2 != 0 {
+    if trimmed.is_empty() || !trimmed.len().is_multiple_of(2) {
         return String::new();
     }
     hex::decode(trimmed)
@@ -627,9 +634,7 @@ fn clear_user_overlay_config_xml(xml: &str) -> Result<String> {
 fn replace_tag_attr(tag: &str, name: &str, value: &str) -> Result<String> {
     let re = Regex::new(&format!(r#"{name}="[^"]*""#)).context("invalid XM tag regex")?;
     if re.is_match(tag) {
-        Ok(re
-            .replace(tag, format!(r#"{name}="{value}""#))
-            .into_owned())
+        Ok(re.replace(tag, format!(r#"{name}="{value}""#)).into_owned())
     } else if let Some(index) = tag.rfind("/>") {
         let mut out = String::with_capacity(tag.len() + name.len() + value.len() + 4);
         out.push_str(&tag[..index]);
@@ -645,7 +650,12 @@ fn replace_tag_attr(tag: &str, name: &str, value: &str) -> Result<String> {
     }
 }
 
-fn replace_tag_attr_in_node(xml: &str, node_name: &str, attr_name: &str, value: &str) -> Result<String> {
+fn replace_tag_attr_in_node(
+    xml: &str,
+    node_name: &str,
+    attr_name: &str,
+    value: &str,
+) -> Result<String> {
     let start = xml
         .find(&format!("<{node_name}"))
         .ok_or_else(|| anyhow!("XM XML missing {node_name} tag"))?;
@@ -696,8 +706,16 @@ fn user_overlay_requires_clear(xml: &str) -> Result<bool> {
         .filter(|node| node.has_tag_name("UserOSD"))
         .any(|node| {
             node.attribute("enable").unwrap_or("0").trim() == "1"
-                || !node.attribute("TitleUtf8").unwrap_or_default().trim().is_empty()
-                || !node.attribute("Title").unwrap_or_default().trim().is_empty()
+                || !node
+                    .attribute("TitleUtf8")
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+                || !node
+                    .attribute("Title")
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
         }))
 }
 

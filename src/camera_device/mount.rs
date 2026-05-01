@@ -24,7 +24,7 @@ pub async fn mount_camera_device(
     } else {
         request.username.trim().to_string()
     };
-    let mut camera = CameraConfig {
+    let mut camera = CameraDeviceConfig {
         source_id: build_source_id(&candidate, &driver_match.driver_id),
         name: display_name.clone(),
         onvif_host: candidate.ip.trim().to_string(),
@@ -46,7 +46,7 @@ pub async fn mount_camera_device(
         ptz_capable: candidate_ptz_capable(&candidate),
         enabled: true,
         segment_secs: 10,
-        desired: CameraDesiredConfig {
+        desired: CameraDeviceDesiredConfig {
             display_name: display_name.clone(),
             overlay_text: if driver_is_xm(&driver_match.driver_id) {
                 String::new()

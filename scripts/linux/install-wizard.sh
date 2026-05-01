@@ -28,7 +28,7 @@ EXTERNAL_CONFIG_TEMPLATE=""
 IDENTITY_ID=""
 PUBLIC_WS_URL=""
 SWARM_PEERS=()
-ALLOW_UNSIGNED_HELLO_MVP=1
+ALLOW_UNSIGNED_DEBUG_HELLO=1
 AUTHORIZED_DEVICE_PKS=()
 ZONE_KEYS=()
 PAIR_IDENTITY=""
@@ -82,7 +82,7 @@ Options:
   --zone-key <key>           Join zone key for swarm announcements (repeatable)
   --swarm-peer <host:port>   Gateway swarm UDP peer endpoint (repeatable)
   --public-ws-url <url>      Public websocket URL for /session
-  --allow-unsigned-hello-mvp Allow unsigned hello proof mode (default)
+  --allow-unsigned-debug-hello Allow unsigned local debug hello proof mode (default)
   --require-signed-hello     Require signed hello proof
   --pair-identity <label>    Pairing identity label for auto-associate
   --pair-code <code>         Pairing enrollment code
@@ -327,12 +327,12 @@ while [[ $# -gt 0 ]]; do
       PUBLIC_WS_URL="${2:?missing value for --public-ws-url}"
       shift 2
       ;;
-    --allow-unsigned-hello-mvp)
-      ALLOW_UNSIGNED_HELLO_MVP=1
+    --allow-unsigned-debug-hello)
+      ALLOW_UNSIGNED_DEBUG_HELLO=1
       shift
       ;;
     --require-signed-hello)
-      ALLOW_UNSIGNED_HELLO_MVP=0
+      ALLOW_UNSIGNED_DEBUG_HELLO=0
       shift
       ;;
     --pair-identity)
@@ -719,7 +719,7 @@ run_sudo env \
   CFG_IDENTITY_ID="${IDENTITY_ID}" \
   CFG_PUBLIC_WS_URL="${PUBLIC_WS_URL}" \
   CFG_SWARM_PEERS="${swarm_peers_joined}" \
-  CFG_ALLOW_UNSIGNED_HELLO_MVP="${ALLOW_UNSIGNED_HELLO_MVP}" \
+  CFG_ALLOW_UNSIGNED_DEBUG_HELLO="${ALLOW_UNSIGNED_DEBUG_HELLO}" \
   CFG_AUTHORIZED_DEVICE_PKS="${authorized_joined}" \
   CFG_ZONE_KEYS="${zone_keys_joined}" \
   CFG_PAIR_IDENTITY="${PAIR_IDENTITY}" \
@@ -759,7 +759,7 @@ update_build_user = os.environ.get('CFG_UPDATE_BUILD_USER', '').strip()
 identity_id = os.environ.get('CFG_IDENTITY_ID', '').strip()
 public_ws_url = os.environ.get('CFG_PUBLIC_WS_URL', '').strip()
 swarm_peers = [x.strip() for x in os.environ.get('CFG_SWARM_PEERS', '').split('|') if x.strip()]
-allow_unsigned = os.environ.get('CFG_ALLOW_UNSIGNED_HELLO_MVP', '1').strip() == '1'
+allow_unsigned = os.environ.get('CFG_ALLOW_UNSIGNED_DEBUG_HELLO', '1').strip() == '1'
 authorized = [x.strip() for x in os.environ.get('CFG_AUTHORIZED_DEVICE_PKS', '').split('|') if x.strip()]
 zone_keys = [x.strip() for x in os.environ.get('CFG_ZONE_KEYS', '').split('|') if x.strip()]
 pair_identity = os.environ.get('CFG_PAIR_IDENTITY', '').strip()
@@ -803,8 +803,9 @@ raw['update']['branch'] = ref
 raw['update']['script_path'] = update_script
 raw['update']['build_user'] = update_build_user
 
-raw.setdefault('api', {})['identity_id'] = identity_id
-raw['api']['allow_unsigned_hello_mvp'] = allow_unsigned
+api = raw.setdefault('api', {})
+api['identity_id'] = identity_id
+api['allow_unsigned_debug_hello'] = allow_unsigned
 if public_ws_url:
     raw['api']['public_ws_url'] = public_ws_url
 if authorized:
