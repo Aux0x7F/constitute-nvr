@@ -43,7 +43,7 @@
 
 The product-surface split is current local convergence work. Host capability adoption remains planned later.
 
-The next NVR/security architecture slice after current convergence is cryptographic media projection:
+The next NVR/Physical Security architecture slice after current convergence is cryptographic media projection:
 - keep a warm low-resolution/browser-safe preview projection where host policy allows
 - let live preview attach to an existing projection instead of always waking a cold RTSP/ffmpeg path
 - let recording/history consume the same projection boundary instead of duplicating ingest assumptions
@@ -59,8 +59,10 @@ The next NVR/security architecture slice after current convergence is cryptograp
 - [ ] introduce media projection as a first-class NVR runtime boundary before burying stream warmth in live or recording
 - [ ] measure cold/warm direct-entry path from account/runtime attach through first browser track
 - [ ] define cryptographic service capability shape beyond transitional short-lived launch token semantics
-- [ ] consume `constitute-security` capability leases for hostile camera-network policy and anomaly/reporting integration instead of treating camera-interface hardening as only local script posture
+- [ ] emit structured event truth for `constitute-logging` before Cybersecurity or Physical Security consume NVR timelines
+- [ ] consume `constitute-cybersec` capability leases for hostile camera-network policy and anomaly/reporting integration instead of treating camera-interface hardening as only local script posture
 - [ ] consume `constitute-storage` capability leases for durable encrypted object/archive semantics where shared storage behavior matters
+- [ ] expose NVR projections cleanly enough that future `constitute-physec` can consume cameras/history without owning camera drivers or media projection internals
 - [ ] keep service-local config/control state and ephemeral working/runtime state local even after storage capability adoption
 
 ### Iteration 6: Platform Product-Surface Convergence

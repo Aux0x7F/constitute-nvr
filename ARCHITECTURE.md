@@ -9,6 +9,8 @@
 
 `constitute-nvr` does not replace gateway transport. It is a hosted service-backed device and should be reached through gateway-managed launch/auth in the canonical path.
 
+Future `constitute-physec` may consume NVR camera/media/history projections as a Physical Security app. NVR remains the camera/media workload and does not own armed modes, incident response, sensor fusion, or physical-security product workflows.
+
 ## Runtime Layers
 
 ### 1. Service Identity Layer
@@ -47,7 +49,9 @@ Media projection will own:
 
 It will consume `camera_device` stream truth and `media` plans.
 It will feed `live`, `recording`, and future encrypted storage output.
-It must not become camera driver truth, gateway signaling, or storage implementation.
+It should emit structured event truth for future `constitute-logging`.
+It should expose posture facts cleanly enough for future `constitute-cybersec`.
+It must not become camera driver truth, gateway signaling, cybersecurity policy, Physical Security product workflow, or storage implementation.
 
 ### 5. Recorded Session/API Layer
 - health endpoint: `GET /health`
@@ -64,6 +68,7 @@ It must not become camera driver truth, gateway signaling, or storage implementa
 - camera network is expected to be isolated
 - camera network should be treated as hostile ingress by default
 - optional hardening script restricts camera-interface exposure
+- future `constitute-cybersec` should own hostile-ingress policy, flow classification, quarantine/block decisions, and related notifications
 - transport metadata remains observable
 - gateway is the canonical browser auth/signaling boundary
 - app surfaces should not be asked to carry long-lived identity secrets in the normal path
@@ -95,3 +100,4 @@ The target model is explicit cryptographic service capability state bound to ide
 3. preserve recorded segment retrieval while live preview continues to evolve
 4. measure cold/warm launch penalties from runtime attach through first browser track
 5. introduce media projection planning for warm preview streams and future recording/storage consumers
+6. keep NVR projections clean for future Physical Security consumption without moving Physical Security ownership into NVR
