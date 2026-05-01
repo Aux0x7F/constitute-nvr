@@ -5,6 +5,7 @@ mod crypto;
 mod hosted_registry;
 mod live;
 mod media;
+mod media_projection;
 mod nostr;
 mod recording;
 mod storage;

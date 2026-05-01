@@ -5,7 +5,8 @@ use crate::crypto;
 use crate::hosted_registry;
 use crate::live::{
     ManagedAdminRequest, ManagedCloseRequest, ManagedControlRequest, ManagedOfferRequest,
-    PreviewManager, resolve_admin_token, resolve_control_camera,
+    PreviewManager, SealedServiceAccessRequest, open_sealed_service_access_request,
+    resolve_admin_token, resolve_control_camera,
 };
 use crate::recording::RecorderManager;
 use crate::storage::StorageManager;
@@ -18,6 +19,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
+use constitute_protocol::ReplayCache;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -40,6 +42,7 @@ pub struct ApiState {
     pub storage: StorageManager,
     pub recorder: RecorderManager,
     pub preview: PreviewManager,
+    pub service_replay: Arc<Mutex<ReplayCache>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,6 +86,7 @@ pub async fn run(
     let bind = cfg.api.bind.clone();
     let state = Arc::new(ApiState {
         preview: PreviewManager::new(&cfg)?,
+        service_replay: Arc::new(Mutex::new(ReplayCache::default())),
         cfg: Arc::new(Mutex::new(cfg)),
         cfg_path,
         storage,
@@ -93,10 +97,10 @@ pub async fn run(
     let app = Router::new()
         .route("/health", get(health))
         .route("/session", get(ws_session))
-        .route("/managed/offer", post(managed_offer))
-        .route("/managed/control", post(managed_control))
-        .route("/managed/admin", post(managed_admin))
-        .route("/managed/close", post(managed_close))
+        .route("/service-access/offer", post(managed_offer))
+        .route("/service-access/control", post(managed_control))
+        .route("/service-access/admin", post(managed_admin))
+        .route("/service-access/close", post(managed_close))
         .with_state(state);
 
     let listener = TcpListener::bind(&bind).await?;
@@ -159,6 +163,7 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
     let retained_sources = state.storage.list_sources().await.unwrap_or_default();
     let runtime = state.recorder.list_states().await;
     let cfg = state.cfg.lock().await.clone();
+    let media_projection = state.preview.media_projection_health(&cfg).await;
     let sources = cfg
         .camera_devices
         .iter()
@@ -207,6 +212,7 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
         "retainedSources": retained_sources,
         "cameraDevices": cameras,
         "cameraNetwork": camera_network,
+        "mediaProjection": media_projection,
         "sourceRuntime": runtime,
         "configuredSources": cfg.camera_devices.len(),
     }))
@@ -218,9 +224,24 @@ async fn ws_session(ws: WebSocketUpgrade, State(state): State<Arc<ApiState>>) ->
 
 async fn managed_offer(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<ManagedOfferRequest>,
+    Json(request): Json<SealedServiceAccessRequest>,
 ) -> impl IntoResponse {
     let cfg = state.cfg.lock().await.clone();
+    let request: ManagedOfferRequest = match {
+        let mut replay = state.service_replay.lock().await;
+        open_sealed_service_access_request(&cfg, &mut replay, request, "offer")
+    } {
+        Ok(request) => request,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json::<Value>(json!({
+                    "error": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
     match state.preview.handle_offer(&cfg, request).await {
         Ok(response) => Json::<Value>(json!({
             "signalType": response.signal_type,
@@ -242,9 +263,24 @@ async fn managed_offer(
 
 async fn managed_close(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<ManagedCloseRequest>,
+    Json(request): Json<SealedServiceAccessRequest>,
 ) -> impl IntoResponse {
     let cfg = state.cfg.lock().await.clone();
+    let request: ManagedCloseRequest = match {
+        let mut replay = state.service_replay.lock().await;
+        open_sealed_service_access_request(&cfg, &mut replay, request, "session_close")
+    } {
+        Ok(request) => request,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json::<Value>(json!({
+                    "error": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
     match state.preview.handle_close(&cfg, request).await {
         Ok(response) => Json::<Value>(response).into_response(),
         Err(err) => (
@@ -259,9 +295,24 @@ async fn managed_close(
 
 async fn managed_control(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<ManagedControlRequest>,
+    Json(request): Json<SealedServiceAccessRequest>,
 ) -> impl IntoResponse {
     let cfg = state.cfg.lock().await.clone();
+    let request: ManagedControlRequest = match {
+        let mut replay = state.service_replay.lock().await;
+        open_sealed_service_access_request(&cfg, &mut replay, request, "control")
+    } {
+        Ok(request) => request,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json::<Value>(json!({
+                    "error": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
     let camera = match resolve_control_camera(&cfg, &request) {
         Ok(camera) => camera,
         Err(err) => {
@@ -318,10 +369,25 @@ async fn managed_control(
 
 async fn managed_admin(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<ManagedAdminRequest>,
+    Json(request): Json<SealedServiceAccessRequest>,
 ) -> impl IntoResponse {
     let cfg = state.cfg.lock().await.clone();
-    if let Err(err) = resolve_admin_token(&cfg, &request.launch_token) {
+    let request: ManagedAdminRequest = match {
+        let mut replay = state.service_replay.lock().await;
+        open_sealed_service_access_request(&cfg, &mut replay, request, "admin")
+    } {
+        Ok(request) => request,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json::<Value>(json!({
+                    "error": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    if let Err(err) = resolve_admin_token(&cfg, &request.service_capability) {
         return (
             StatusCode::FORBIDDEN,
             Json::<Value>(json!({ "error": err.to_string() })),

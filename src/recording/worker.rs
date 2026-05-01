@@ -58,8 +58,8 @@ pub async fn record_loop(
                 if err.kind() == std::io::ErrorKind::NotFound {
                     return Err(anyhow!("ffmpeg not found in PATH"));
                 }
-                let message = format!("failed to launch ffmpeg: {}", err);
-                warn!(source = %cam.source_id, error = %err, "failed to launch ffmpeg; retrying");
+                let message = format!("failed to start ffmpeg: {}", err);
+                warn!(source = %cam.source_id, error = %err, "failed to start ffmpeg; retrying");
                 restart_attempt = restart_attempt.saturating_add(1);
                 let backoff = backoff_secs(restart_attempt);
                 update_state(&state, "backoff", restart_attempt, message, Some(backoff)).await;

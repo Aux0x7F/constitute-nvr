@@ -50,7 +50,7 @@ pub fn spawn_update_poller(cfg: Config) {
                     warn!(code = ?status.code(), "update poll script returned non-zero");
                 }
                 Err(err) => {
-                    warn!(error = %err, script = %script, "update poll failed to launch");
+                    warn!(error = %err, script = %script, "update poll script failed");
                 }
             }
         }

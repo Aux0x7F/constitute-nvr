@@ -7,7 +7,7 @@
 - `constitute-nvr-ui`: Pages-hosted NVR app surface
 - `constitute-nvr`: native service workload for camera ingest, retention, and managed live preview
 
-`constitute-nvr` does not replace gateway transport. It is a hosted service-backed device and should be reached through gateway-managed launch/auth in the canonical path.
+`constitute-nvr` does not replace gateway transport. It is a hosted service-backed device and should be reached through gateway service-access authorization in the canonical path.
 
 Future `constitute-physec` may consume NVR camera/media/history projections as a Physical Security app. NVR remains the camera/media workload and does not own armed modes, incident response, sensor fusion, or physical-security product workflows.
 
@@ -33,22 +33,22 @@ Future `constitute-physec` may consume NVR camera/media/history projections as a
 
 ### 4. Live Preview Layer
 - managed live preview uses WebRTC
-- gateway-issued short-lived authorization is required in the canonical path
+- gateway-issued CAAC service capability is required in the canonical path
 - H.264 preview tracks are exposed for browser consumption
 - live preview and recorded retrieval remain separate paths
 
-### 4a. Planned Media Projection Layer
-The next architecture slice introduces media projection as a first-class runtime boundary.
+### 4a. Media Projection Layer
+Media projection is now a first-class runtime boundary and is exposed through `/health.mediaProjection`.
 
-Media projection will own:
+Media projection owns or is actively converging toward:
 - warm camera ingest where host policy allows
 - browser-safe preview projection
 - stream normalization and projection fanout
 - projection health/backoff/resource policy
 - encryption/key-policy hooks for live and future storage consumers
 
-It will consume `camera_device` stream truth and `media` plans.
-It will feed `live`, `recording`, and future encrypted storage output.
+It consumes `camera_device` stream truth and `media` plans.
+It feeds `live`, `recording`, and future encrypted storage output.
 It should emit structured event truth for future `constitute-logging`.
 It should expose posture facts cleanly enough for future `constitute-cybersec`.
 It must not become camera driver truth, gateway signaling, cybersecurity policy, Physical Security product workflow, or storage implementation.
@@ -79,14 +79,13 @@ It must not become camera driver truth, gateway signaling, cybersecurity policy,
 Canonical flow:
 1. a first-party app surface selects an owned gateway and target NVR service
 2. gateway validates device membership and capability
-3. gateway issues short-lived launch/session authorization
+3. gateway issues short-lived service access/session authorization
 4. app surface redeems that context and negotiates signaling
-5. NVR validates the gateway-issued authorization before admitting WebRTC live preview
+5. NVR decrypts and validates the gateway-issued CAAC service capability before admitting WebRTC live preview
 
 Direct/manual debug mode remains available but is not the canonical managed path.
 
-Current launch authorization is a transitional bearer-style capability.
-The target model is explicit cryptographic service capability state bound to identity, device, gateway, service, scope, expiry, and replay protection, with sensitive session material encrypted to intended principals/devices.
+Current service access authorization uses `constitute-protocol` CAAC service capabilities. NVR decrypts and validates the gateway-issued capability before offer/control/admin/close handling. Sensitive capability claims are encrypted to the gateway and service; the browser carries `serviceCapability` opaquely. Relay-facing browser/gateway service-access and service-signal metadata is sealed through CAAC before account surfaces receive local decrypted projections.
 
 ## Current Constraints
 - ingest path depends on host `ffmpeg`
@@ -98,6 +97,6 @@ The target model is explicit cryptographic service capability state bound to ide
 1. close and main the current `camera_device + media + live + recording + storage` refactor
 2. keep managed live preview recovery and camera drift reconcile verified
 3. preserve recorded segment retrieval while live preview continues to evolve
-4. measure cold/warm launch penalties from runtime attach through first browser track
-5. introduce media projection planning for warm preview streams and future recording/storage consumers
+4. measure cold/warm service access penalties from runtime attach through first browser track
+5. keep warm media projection workers healthy across camera down/up recovery and prove first-track timing against the warmed path
 6. keep NVR projections clean for future Physical Security consumption without moving Physical Security ownership into NVR

@@ -48,7 +48,7 @@ This file stays at operator/compatibility-summary level.
   - preview note:
     - live preview depends on host HEVC decode because the validated RTSP profiles are HEVC
     - installer/runtime now treat decoder-capable `ffmpeg` as part of the supported contract
-    - temporary hard down/up should resume live preview without relaunch once the camera becomes reachable again
+    - temporary hard down/up should resume live preview without reservice access once the camera becomes reachable again
   - XM-specific management notes:
     - baked feed title is controlled by `TitleOverlay.TitleUtf8`
     - site time is controlled by `/setTimeConfig` with manual seed -> NTP transition

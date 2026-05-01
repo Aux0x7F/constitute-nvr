@@ -116,7 +116,7 @@ Notes:
 - `/health` is intentionally redacted; camera credentials and raw credential-bearing RTSP URLs are never returned.
 - `/health` uses `cameraDevices` as the active pre-prod NVR camera payload key.
 - `cameraNetwork` should reflect the provisioned camera NIC, DHCP range, and active site-time policy (`ntp_enabled`, `ntp_server`, `timezone`).
-- temporary live-preview source loss should self-heal inside the running service; routine camera/network blips should not require relaunching the NVR page to resume tiles
+- temporary live-preview source loss should self-heal inside the running service; routine camera/network blips should not require reopening the NVR page to resume tiles
 - verified supported drift after camera reboot should self-heal inside the running service; drift should not remain a permanent operator burden when the device is reachable again
 
 ## 7) Camera Hardening Script

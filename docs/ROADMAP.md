@@ -20,9 +20,9 @@
 - [x] service metrics publication in swarm records
 - [x] Reolink DHCP bootstrap + proprietary discovery + standards-readiness probe
 
-## Iteration 3: Managed Launch + Live Preview
+## Iteration 3: Service Access + Live Preview
 - [x] service-backed device metadata parity with gateway/web
-- [x] gateway-issued launch/session authorization
+- [x] gateway-issued service access/session authorization
 - [x] WebRTC signaling and session admission
 - [x] H.264 live preview path for camera grid
 - [ ] recorded retrieval preserved alongside live preview (`docs/issues/nvr-history-incomplete.md`)
@@ -48,7 +48,7 @@ The next NVR/Physical Security architecture slice after current convergence is c
 - let live preview attach to an existing projection instead of always waking a cold RTSP/ffmpeg path
 - let recording/history consume the same projection boundary instead of duplicating ingest assumptions
 - keep `camera_device` as device truth and `media` as planning/ffmpeg strategy
-- audit launch/signaling/session material for signed-versus-encrypted boundaries
+- audit service access/signaling/session material for signed-versus-encrypted boundaries
 - treat camera-to-NVR ingest as hostile camera-network traffic unless proven otherwise
 
 ## Backlog Product Surface Follow-Ups
@@ -56,9 +56,11 @@ The next NVR/Physical Security architecture slice after current convergence is c
 - [ ] group live preview into location sections when multiple assigned locations are present (`#21`)
 
 ### Iteration 5: Host Capability Adoption
-- [ ] introduce media projection as a first-class NVR runtime boundary before burying stream warmth in live or recording
+- [x] introduce media projection as a first-class NVR runtime boundary before burying stream warmth in live or recording
 - [ ] measure cold/warm direct-entry path from account/runtime attach through first browser track
-- [ ] define cryptographic service capability shape beyond transitional short-lived launch token semantics
+- [x] adopt CAAC service capability shape for gateway-issued NVR service access
+- [x] extend media projection from health/projection ownership into warm fanout workers
+- [ ] prove camera hard down/up recovery through media projection without requiring browser relaunch
 - [ ] emit structured event truth for `constitute-logging` before Cybersecurity or Physical Security consume NVR timelines
 - [ ] consume `constitute-cybersec` capability leases for hostile camera-network policy and anomaly/reporting integration instead of treating camera-interface hardening as only local script posture
 - [ ] consume `constitute-storage` capability leases for durable encrypted object/archive semantics where shared storage behavior matters
@@ -66,5 +68,5 @@ The next NVR/Physical Security architecture slice after current convergence is c
 - [ ] keep service-local config/control state and ephemeral working/runtime state local even after storage capability adoption
 
 ### Iteration 6: Platform Product-Surface Convergence
-- [ ] keep NVR launch/auth assumptions aligned with direct app entry through account/session/grant flows
+- [ ] keep NVR service access/auth assumptions aligned with direct app entry through account/session/grant flows
 - [ ] keep hosted-service UX aligned with the current split between `constitute-account` and `constitute-gateway-ui`

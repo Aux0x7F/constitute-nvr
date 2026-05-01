@@ -602,6 +602,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
+ "constitute-protocol",
  "des",
  "futures-util",
  "hex",
@@ -627,6 +628,22 @@ dependencies = [
  "webrtc",
  "webrtc-util",
  "x25519-dalek",
+]
+
+[[package]]
+name = "constitute-protocol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "hex",
+ "hkdf",
+ "rand 0.8.5",
+ "secp256k1",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

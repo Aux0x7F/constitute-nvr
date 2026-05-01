@@ -1,21 +1,23 @@
 use crate::camera_device::registry::driver_is_xm;
 use crate::config::{CameraDeviceConfig, Config, LivePreviewConfig};
-use crate::media::{ffmpeg, planner, types::OutputCodec};
-use crate::nostr::{self, NostrEvent};
-use crate::recording::runtime::backoff_secs;
+use crate::media::planner;
+#[cfg(test)]
+use crate::media::{ffmpeg, types::OutputCodec};
+use crate::media_projection::{
+    MediaProjectionRuntime, MediaProjectionSubscription, ProjectionCodec,
+};
 use anyhow::{Context, Result, anyhow};
-use rtp::packet::Packet as RtpPacket;
-use serde::{Deserialize, Serialize};
+use constitute_protocol::{
+    CAAC_KIND_SERVICE_ACCESS_INVOCATION, CaacEnvelope, ReplayCache, ServiceAccessCapabilityClaims,
+    open_envelope,
+};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::process::Stdio;
 use std::sync::Arc;
-use tokio::net::UdpSocket;
-use tokio::process::Command;
+use tokio::sync::broadcast;
 use tokio::sync::{Mutex, watch};
-use tokio::time::{Duration, Instant, sleep, timeout};
 use tracing::{info, warn};
-use util::marshal::Unmarshal;
 use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_VP8, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
@@ -47,8 +49,8 @@ pub struct ManagedIceServerHints {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManagedOfferRequest {
-    #[serde(rename = "launchToken")]
-    pub launch_token: String,
+    #[serde(rename = "serviceCapability")]
+    pub service_capability: String,
     pub offer: Value,
     #[serde(rename = "iceServers", default)]
     pub ice_servers: ManagedIceServerHints,
@@ -57,17 +59,23 @@ pub struct ManagedOfferRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SealedServiceAccessRequest {
+    pub service_request_envelope: CaacEnvelope,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ManagedCloseRequest {
-    #[serde(rename = "launchToken")]
-    pub launch_token: String,
+    #[serde(rename = "serviceCapability")]
+    pub service_capability: String,
     #[serde(default)]
     pub payload: Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManagedControlRequest {
-    #[serde(rename = "launchToken")]
-    pub launch_token: String,
+    #[serde(rename = "serviceCapability")]
+    pub service_capability: String,
     #[serde(default)]
     pub payload: Value,
     #[serde(rename = "controlLease", default)]
@@ -78,8 +86,8 @@ pub struct ManagedControlRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManagedAdminRequest {
-    #[serde(rename = "launchToken")]
-    pub launch_token: String,
+    #[serde(rename = "serviceCapability")]
+    pub service_capability: String,
     #[serde(default)]
     pub action: String,
     #[serde(default)]
@@ -120,33 +128,7 @@ fn push_unique_ice_candidate(into: &mut Vec<RTCIceCandidateInit>, candidate: &RT
     into.push(candidate.clone());
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ManagedLaunchTokenPayload {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(rename = "gatewayPk")]
-    gateway_pk: String,
-    #[serde(rename = "servicePk")]
-    service_pk: String,
-    service: String,
-    #[serde(rename = "identityId")]
-    identity_id: String,
-    #[serde(rename = "devicePk")]
-    device_pk: String,
-    capability: String,
-    #[serde(default)]
-    owner: bool,
-    #[serde(rename = "viewSources", default)]
-    view_sources: Vec<String>,
-    #[serde(rename = "controlSources", default)]
-    control_sources: Vec<String>,
-    #[serde(rename = "launchNonce")]
-    launch_nonce: String,
-    #[serde(rename = "issuedAt")]
-    issued_at: u64,
-    #[serde(rename = "expiresAt")]
-    expires_at: u64,
-}
+type ServiceAccessTokenPayload = ServiceAccessCapabilityClaims;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreviewCodec {
@@ -155,13 +137,6 @@ enum PreviewCodec {
 }
 
 impl PreviewCodec {
-    fn label(self) -> &'static str {
-        match self {
-            Self::H264 => "h264",
-            Self::Vp8 => "vp8",
-        }
-    }
-
     fn capability(self) -> RTCRtpCodecCapability {
         match self {
             Self::H264 => RTCRtpCodecCapability {
@@ -184,6 +159,7 @@ impl PreviewCodec {
 #[derive(Debug)]
 struct PreviewSessionHandle {
     session_id: String,
+    source_ids: Vec<String>,
     peer_connection: Arc<RTCPeerConnection>,
     stops: Vec<watch::Sender<bool>>,
 }
@@ -192,6 +168,7 @@ impl Clone for PreviewSessionHandle {
     fn clone(&self) -> Self {
         Self {
             session_id: self.session_id.clone(),
+            source_ids: self.source_ids.clone(),
             peer_connection: Arc::clone(&self.peer_connection),
             stops: self.stops.clone(),
         }
@@ -211,6 +188,7 @@ impl PreviewSessionHandle {
 pub struct PreviewManager {
     api: Arc<webrtc::api::API>,
     sessions: Arc<Mutex<HashMap<String, PreviewSessionHandle>>>,
+    media_projection: MediaProjectionRuntime,
 }
 
 impl PreviewManager {
@@ -224,10 +202,26 @@ impl PreviewManager {
             .with_media_engine(media_engine)
             .with_setting_engine(setting_engine)
             .build();
+        let media_projection = MediaProjectionRuntime::new();
+        if !cfg!(test) {
+            let warm_runtime = media_projection.clone();
+            let warm_cfg = cfg.clone();
+            tokio::spawn(async move {
+                warm_runtime.warm_enabled_previews(&warm_cfg).await;
+            });
+        }
         Ok(Self {
             api: Arc::new(api),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            media_projection,
         })
+    }
+
+    pub async fn media_projection_health(
+        &self,
+        cfg: &Config,
+    ) -> crate::media_projection::MediaProjectionHealth {
+        self.media_projection.health(cfg).await
     }
 
     pub async fn handle_offer(
@@ -235,7 +229,7 @@ impl PreviewManager {
         cfg: &Config,
         request: ManagedOfferRequest,
     ) -> Result<ManagedOfferResponse> {
-        let token = validate_launch_token(cfg, &request.launch_token)?;
+        let token = validate_service_capability(cfg, &request.service_capability)?;
         let offer = parse_offer_description(&request.offer)?;
         let selected = select_sources(cfg, source_ids_from_offer(&request.offer), &token)?;
         let remote_candidates = request_candidates(&request);
@@ -245,7 +239,7 @@ impl PreviewManager {
             ));
         }
 
-        let session_key = session_key_for_token(&token);
+        let session_key = session_key_for_capability(&token);
         if let Some(existing) = self.sessions.lock().await.remove(&session_key) {
             existing.close().await;
         }
@@ -276,7 +270,7 @@ impl PreviewManager {
                 }
             })
         }));
-        let session_id = format!("nvr-preview-{}", token.launch_nonce);
+        let session_id = format!("nvr-preview-{}", token.nonce);
         let cleanup_sessions = Arc::clone(&self.sessions);
         let cleanup_key = session_key.clone();
         let cleanup_pc = Arc::clone(&pc);
@@ -323,12 +317,11 @@ impl PreviewManager {
             .await?;
             let (stop_tx, stop_rx) = watch::channel(false);
             stops.push(stop_tx);
-            tokio::spawn(run_camera_forwarder(
-                camera.clone(),
-                track,
-                stop_rx,
-                preview_codec,
-            ));
+            let subscription = self
+                .media_projection
+                .subscribe_preview(camera.clone(), projection_codec_for_preview(preview_codec))
+                .await;
+            tokio::spawn(run_projection_subscriber(subscription, track, stop_rx));
             response_sources.push(ManagedSourceInfo {
                 source_id: camera.source_id.clone(),
                 name: camera.name.clone(),
@@ -354,6 +347,10 @@ impl PreviewManager {
             session_key,
             PreviewSessionHandle {
                 session_id: session_id.clone(),
+                source_ids: selected
+                    .iter()
+                    .map(|camera| camera.source_id.clone())
+                    .collect(),
                 peer_connection: Arc::clone(&pc),
                 stops,
             },
@@ -369,14 +366,14 @@ impl PreviewManager {
     }
 
     pub async fn handle_close(&self, cfg: &Config, request: ManagedCloseRequest) -> Result<Value> {
-        let token = validate_launch_token(cfg, &request.launch_token)?;
-        let session_key = session_key_for_token(&token);
+        let token = validate_service_capability(cfg, &request.service_capability)?;
+        let session_key = session_key_for_capability(&token);
         if let Some(session) = self.sessions.lock().await.remove(&session_key) {
             session.close().await;
         }
         Ok(json!({
             "ok": true,
-            "sessionId": format!("nvr-preview-{}", token.launch_nonce),
+            "sessionId": format!("nvr-preview-{}", token.nonce),
             "reason": request.payload.get("reason").cloned().unwrap_or_else(|| json!("closed")),
         }))
     }
@@ -386,7 +383,7 @@ pub fn resolve_control_camera(
     cfg: &Config,
     request: &ManagedControlRequest,
 ) -> Result<CameraDeviceConfig> {
-    let token = validate_launch_token(cfg, &request.launch_token)?;
+    let token = validate_service_capability(cfg, &request.service_capability)?;
     let source_id = request
         .payload
         .get("sourceId")
@@ -481,38 +478,72 @@ async fn apply_remote_candidates(
     Ok(())
 }
 
-fn validate_launch_token(cfg: &Config, token: &str) -> Result<ManagedLaunchTokenPayload> {
-    let event: NostrEvent =
-        serde_json::from_str(token).context("invalid gateway launch token json")?;
-    if !nostr::verify_event(&event)? {
-        return Err(anyhow!("invalid gateway launch token signature"));
+fn validate_service_capability(cfg: &Config, token: &str) -> Result<ServiceAccessTokenPayload> {
+    let envelope: CaacEnvelope =
+        serde_json::from_str(token).context("invalid gateway service capability envelope json")?;
+    let gateway_pk = cfg.gateway.host_gateway_pk.trim();
+    if gateway_pk.is_empty() {
+        return Err(anyhow!("host gateway pk is not configured"));
     }
-    let payload: ManagedLaunchTokenPayload =
-        serde_json::from_str(&event.content).context("invalid gateway launch token payload")?;
-    if payload.kind.trim() != "managed_launch_token" {
-        return Err(anyhow!("unexpected launch token type"));
+    if envelope.issuer_pk.trim() != gateway_pk {
+        return Err(anyhow!("service capability issuer mismatch"));
+    }
+    let now_ms = crate::util::now_ms();
+    let claims = open_envelope(&envelope, &cfg.nostr_sk_hex, now_ms, None)
+        .context("service capability decrypt/verify failed")?;
+    let payload: ServiceAccessTokenPayload =
+        serde_json::from_value(claims).context("invalid gateway service capability claims")?;
+    if payload.gateway_pk.trim() != gateway_pk {
+        return Err(anyhow!("service capability gateway mismatch"));
+    }
+    if payload.service.trim() != "nvr" {
+        return Err(anyhow!("service capability service mismatch"));
+    }
+    if payload.service_pk.trim() != cfg.nostr_pubkey.trim() {
+        return Err(anyhow!("service capability target service mismatch"));
+    }
+    if payload.identity_id.trim() != cfg.api.identity_id.trim() {
+        return Err(anyhow!("service capability identity mismatch"));
+    }
+    if payload.expires_at < now_ms {
+        return Err(anyhow!("service capability expired"));
+    }
+    Ok(payload)
+}
+
+pub fn open_sealed_service_access_request<T>(
+    cfg: &Config,
+    replay: &mut ReplayCache,
+    request: SealedServiceAccessRequest,
+    expected_signal_type: &str,
+) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let envelope = request.service_request_envelope;
+    if envelope.kind != CAAC_KIND_SERVICE_ACCESS_INVOCATION {
+        return Err(anyhow!("unexpected service invocation envelope kind"));
     }
     let gateway_pk = cfg.gateway.host_gateway_pk.trim();
     if gateway_pk.is_empty() {
         return Err(anyhow!("host gateway pk is not configured"));
     }
-    if event.pubkey.trim() != gateway_pk || payload.gateway_pk.trim() != gateway_pk {
-        return Err(anyhow!("launch token gateway mismatch"));
-    }
-    if payload.service.trim() != "nvr" {
-        return Err(anyhow!("launch token service mismatch"));
-    }
-    if payload.service_pk.trim() != cfg.nostr_pubkey.trim() {
-        return Err(anyhow!("launch token target service mismatch"));
-    }
-    if payload.identity_id.trim() != cfg.api.identity_id.trim() {
-        return Err(anyhow!("launch token identity mismatch"));
+    if envelope.issuer_pk.trim() != gateway_pk {
+        return Err(anyhow!("service invocation issuer mismatch"));
     }
     let now_ms = crate::util::now_ms();
-    if payload.expires_at < now_ms {
-        return Err(anyhow!("launch token expired"));
+    let claims = open_envelope(&envelope, &cfg.nostr_sk_hex, now_ms, Some(replay))
+        .context("service invocation decrypt/verify failed")?;
+    let signal_type = claims
+        .get("signalType")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if signal_type != expected_signal_type {
+        return Err(anyhow!("service invocation signal type mismatch"));
     }
-    Ok(payload)
+    serde_json::from_value(claims).context("invalid service invocation claims")
 }
 
 fn parse_offer_description(value: &Value) -> Result<RTCSessionDescription> {
@@ -552,10 +583,10 @@ fn source_ids_from_offer(value: &Value) -> Vec<String> {
 }
 
 pub fn resolve_admin_token(cfg: &Config, token: &str) -> Result<()> {
-    let payload = validate_launch_token(cfg, token)?;
+    let payload = validate_service_capability(cfg, token)?;
     if !payload.owner {
         return Err(anyhow!(
-            "owner launch is required for camera administration"
+            "owner service access is required for camera administration"
         ));
     }
     Ok(())
@@ -629,7 +660,7 @@ fn select_preview_codec_for_camera(
 fn select_sources(
     cfg: &Config,
     requested: Vec<String>,
-    token: &ManagedLaunchTokenPayload,
+    token: &ServiceAccessTokenPayload,
 ) -> Result<Vec<CameraDeviceConfig>> {
     let enabled = cfg
         .camera_devices
@@ -669,8 +700,8 @@ fn select_sources(
     Ok(out)
 }
 
-fn session_key_for_token(token: &ManagedLaunchTokenPayload) -> String {
-    format!("{}:{}", token.device_pk.trim(), token.launch_nonce.trim())
+fn session_key_for_capability(token: &ServiceAccessTokenPayload) -> String {
+    format!("{}:{}", token.device_pk.trim(), token.nonce.trim())
 }
 
 async fn available_offer_video_transceivers(
@@ -765,253 +796,54 @@ fn with_firefox_compatible_answer_msid(
     normalized
 }
 
-async fn run_camera_forwarder(
-    camera: CameraDeviceConfig,
+fn projection_codec_for_preview(codec: PreviewCodec) -> ProjectionCodec {
+    match codec {
+        PreviewCodec::H264 => ProjectionCodec::H264,
+        PreviewCodec::Vp8 => ProjectionCodec::Vp8,
+    }
+}
+
+async fn run_projection_subscriber(
+    mut subscription: MediaProjectionSubscription,
     track: Arc<TrackLocalStaticRTP>,
     mut stop_rx: watch::Receiver<bool>,
-    codec: PreviewCodec,
 ) {
-    let plan = planner::preview_pipeline_plan_for_codec(
-        &camera,
-        match codec {
-            PreviewCodec::H264 => OutputCodec::H264,
-            PreviewCodec::Vp8 => OutputCodec::Vp8,
-        },
-    );
-    let preview_url = plan.input_url.clone();
-    let std_socket = match std::net::UdpSocket::bind("127.0.0.1:0") {
-        Ok(socket) => socket,
-        Err(err) => {
-            warn!(source = %camera.source_id, error = %err, "live preview UDP bind failed");
-            return;
-        }
-    };
-    if let Err(err) = std_socket.set_nonblocking(true) {
-        warn!(source = %camera.source_id, error = %err, "live preview UDP nonblocking setup failed");
-        return;
-    }
-    let local_addr = match std_socket.local_addr() {
-        Ok(addr) => addr,
-        Err(err) => {
-            warn!(source = %camera.source_id, error = %err, "live preview UDP local addr failed");
-            return;
-        }
-    };
-    let socket = match UdpSocket::from_std(std_socket) {
-        Ok(socket) => socket,
-        Err(err) => {
-            warn!(source = %camera.source_id, error = %err, "live preview UDP socket init failed");
-            return;
-        }
-    };
-    let mut buf = vec![0u8; 1600];
-    let mut restart_attempt = 0_u64;
-    let mut restart_deadline: Option<Instant> = None;
-    let mut continuity = PreviewRtpContinuity::default();
-
     loop {
-        if *stop_rx.borrow() {
-            break;
-        }
-
-        if let Some(deadline) = restart_deadline.take() {
-            let mut stop_wait = stop_rx.clone();
-            tokio::select! {
-                _ = stop_wait.changed() => {
-                    break;
-                }
-                _ = sleep(deadline.saturating_duration_since(Instant::now())) => {}
+        tokio::select! {
+            _ = stop_rx.changed() => {
+                break;
             }
-        }
-
-        let mut ffmpeg = Command::new("ffmpeg");
-        ffmpeg.args(ffmpeg::build_live_preview_ffmpeg_args(
-            &plan,
-            local_addr.port(),
-        ));
-
-        let mut child = match ffmpeg.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                restart_attempt += 1;
-                let backoff = backoff_secs(restart_attempt);
-                warn!(
-                    source = %camera.source_id,
-                    error = %err,
-                    backoff_secs = backoff,
-                    "failed to launch ffmpeg live preview; will retry"
-                );
-                restart_deadline = Some(Instant::now() + Duration::from_secs(backoff));
-                continue;
-            }
-        };
-
-        info!(
-            source = %camera.source_id,
-            url = %preview_url,
-            codec = codec.label(),
-            restart_attempt,
-            "live preview forwarder started"
-        );
-
-        let exit_reason = loop {
-            tokio::select! {
-                _ = stop_rx.changed() => {
-                    break PreviewExitReason::Stopped;
-                }
-                status = child.wait() => {
-                    break match status {
-                        Ok(status) => PreviewExitReason::ChildExited(format!("ffmpeg exited with status {}", status)),
-                        Err(err) => PreviewExitReason::ChildWaitFailed(err.to_string()),
-                    };
-                }
-                recv = timeout(Duration::from_secs(preview_no_packet_timeout_secs()), socket.recv_from(&mut buf)) => {
-                    match recv {
-                        Ok(Ok((len, _))) => {
-                            restart_attempt = 0;
-                            let mut slice = &buf[..len];
-                            let mut packet = match RtpPacket::unmarshal(&mut slice) {
-                                Ok(packet) => packet,
-                                Err(err) => {
-                                    warn!(source = %camera.source_id, error = %err, "live preview RTP unmarshal failed");
-                                    continue;
-                                }
-                            };
-                            continuity.rewrite(&mut packet);
-                            if let Err(err) = track.write_rtp(&packet).await {
-                                warn!(source = %camera.source_id, error = %err, "live preview RTP write failed");
-                            }
-                        }
-                        Ok(Err(err)) => {
-                            break PreviewExitReason::SocketRecvFailed(err.to_string());
-                        }
-                        Err(_) => {
-                            break PreviewExitReason::NoPackets(preview_no_packet_timeout_secs());
+            packet = subscription.receiver.recv() => {
+                match packet {
+                    Ok(packet) => {
+                        if let Err(err) = track.write_rtp(&packet).await {
+                            warn!(
+                                source = %subscription.source_id,
+                                codec = subscription.codec.label(),
+                                error = %err,
+                                "media projection RTP write failed"
+                            );
                         }
                     }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(
+                            source = %subscription.source_id,
+                            codec = subscription.codec.label(),
+                            skipped,
+                            "media projection subscriber lagged"
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-        };
-
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-
-        match exit_reason {
-            PreviewExitReason::Stopped => break,
-            PreviewExitReason::ChildExited(message)
-            | PreviewExitReason::ChildWaitFailed(message)
-            | PreviewExitReason::SocketRecvFailed(message) => {
-                restart_attempt += 1;
-                let backoff = backoff_secs(restart_attempt);
-                warn!(
-                    source = %camera.source_id,
-                    message,
-                    backoff_secs = backoff,
-                    "live preview forwarder exited; restarting"
-                );
-                restart_deadline = Some(Instant::now() + Duration::from_secs(backoff));
-            }
-            PreviewExitReason::NoPackets(timeout_secs) => {
-                restart_attempt += 1;
-                let backoff = backoff_secs(restart_attempt);
-                warn!(
-                    source = %camera.source_id,
-                    idle_timeout_secs = timeout_secs,
-                    backoff_secs = backoff,
-                    "live preview forwarder stalled without RTP; restarting"
-                );
-                restart_deadline = Some(Instant::now() + Duration::from_secs(backoff));
-            }
         }
     }
 
-    info!(source = %camera.source_id, "live preview forwarder stopped");
-}
-
-#[derive(Debug)]
-enum PreviewExitReason {
-    Stopped,
-    ChildExited(String),
-    ChildWaitFailed(String),
-    SocketRecvFailed(String),
-    NoPackets(u64),
-}
-
-#[derive(Debug, Default)]
-struct PreviewRtpContinuity {
-    last_source_sequence: Option<u16>,
-    last_source_timestamp: Option<u32>,
-    last_output_sequence: Option<u16>,
-    last_output_timestamp: Option<u32>,
-    last_timestamp_step: u32,
-}
-
-impl PreviewRtpContinuity {
-    fn rewrite(&mut self, packet: &mut RtpPacket) {
-        let source_sequence = packet.header.sequence_number;
-        let source_timestamp = packet.header.timestamp;
-
-        match (
-            self.last_source_sequence,
-            self.last_source_timestamp,
-            self.last_output_sequence,
-            self.last_output_timestamp,
-        ) {
-            (Some(prev_src_seq), Some(prev_src_ts), Some(prev_out_seq), Some(prev_out_ts)) => {
-                let sequence_step = continuity_sequence_step(prev_src_seq, source_sequence);
-                let timestamp_step = continuity_timestamp_step(
-                    prev_src_ts,
-                    source_timestamp,
-                    self.last_timestamp_step,
-                );
-                let output_sequence = prev_out_seq.wrapping_add(sequence_step);
-                let output_timestamp = prev_out_ts.wrapping_add(timestamp_step);
-                packet.header.sequence_number = output_sequence;
-                packet.header.timestamp = output_timestamp;
-                self.last_output_sequence = Some(output_sequence);
-                self.last_output_timestamp = Some(output_timestamp);
-                self.last_timestamp_step = timestamp_step.max(1);
-            }
-            _ => {
-                packet.header.sequence_number = source_sequence;
-                packet.header.timestamp = source_timestamp;
-                self.last_output_sequence = Some(source_sequence);
-                self.last_output_timestamp = Some(source_timestamp);
-                self.last_timestamp_step = default_preview_timestamp_step();
-            }
-        }
-
-        self.last_source_sequence = Some(source_sequence);
-        self.last_source_timestamp = Some(source_timestamp);
-    }
-}
-
-fn continuity_sequence_step(previous: u16, current: u16) -> u16 {
-    let delta = current.wrapping_sub(previous);
-    if delta == 0 || delta > 4096 { 1 } else { delta }
-}
-
-fn continuity_timestamp_step(previous: u32, current: u32, last_step: u32) -> u32 {
-    let delta = current.wrapping_sub(previous);
-    if delta == 0 {
-        0
-    } else if delta > continuity_restart_timestamp_threshold() {
-        last_step.max(default_preview_timestamp_step())
-    } else {
-        delta
-    }
-}
-
-fn default_preview_timestamp_step() -> u32 {
-    3000
-}
-
-fn continuity_restart_timestamp_threshold() -> u32 {
-    90_000 * 5
-}
-
-fn preview_no_packet_timeout_secs() -> u64 {
-    8
+    info!(
+        source = %subscription.source_id,
+        codec = subscription.codec.label(),
+        "media projection subscriber stopped"
+    );
 }
 
 #[cfg(test)]
@@ -1027,7 +859,9 @@ mod tests {
         ));
         let (mut cfg, _) = Config::load_or_create(&path).expect("config");
         cfg.api.identity_id = "identity-1".to_string();
-        cfg.nostr_pubkey = "service-pk".to_string();
+        let (service_pk, service_sk) = constitute_protocol::generate_keypair();
+        cfg.nostr_pubkey = service_pk;
+        cfg.nostr_sk_hex = service_sk;
         cfg.camera_devices.push(CameraDeviceConfig {
             source_id: "cam-1".to_string(),
             name: "Front".to_string(),
@@ -1055,12 +889,21 @@ mod tests {
         cfg
     }
 
-    fn launch_token(cfg: &mut Config) -> String {
-        let (gateway_pk, gateway_sk) = nostr::generate_keypair();
+    fn service_capability(cfg: &mut Config) -> String {
+        let (gateway_pk, gateway_sk) = constitute_protocol::generate_keypair();
         cfg.gateway.host_gateway_pk = gateway_pk.clone();
-        let payload = ManagedLaunchTokenPayload {
-            kind: "managed_launch_token".to_string(),
-            gateway_pk: gateway_pk.clone(),
+        service_capability_for_gateway(cfg, &gateway_pk, &gateway_sk, "nonce-1")
+    }
+
+    fn service_capability_for_gateway(
+        cfg: &Config,
+        gateway_pk: &str,
+        gateway_sk: &str,
+        nonce: &str,
+    ) -> String {
+        let payload = ServiceAccessTokenPayload {
+            capability_id: "cap-test".to_string(),
+            gateway_pk: gateway_pk.to_string(),
             service_pk: cfg.nostr_pubkey.clone(),
             service: "nvr".to_string(),
             identity_id: cfg.api.identity_id.clone(),
@@ -1069,22 +912,21 @@ mod tests {
             owner: true,
             view_sources: vec!["cam-1".to_string()],
             control_sources: vec!["cam-1".to_string()],
-            launch_nonce: "nonce-1".to_string(),
+            nonce: nonce.to_string(),
             issued_at: crate::util::now_ms(),
             expires_at: crate::util::now_ms() + 60_000,
         };
-        let unsigned = nostr::build_unsigned_event(
-            &gateway_pk,
-            27235,
-            vec![
-                vec!["t".to_string(), "constitute".to_string()],
-                vec!["type".to_string(), "managed_launch_token".to_string()],
-            ],
-            serde_json::to_string(&payload).expect("payload"),
-            crate::util::now_unix_seconds(),
-        );
-        let event = nostr::sign_event(&unsigned, &gateway_sk).expect("sign");
-        serde_json::to_string(&event).expect("event")
+        let claims = serde_json::to_value(&payload).expect("claims");
+        let envelope = constitute_protocol::seal_envelope(
+            constitute_protocol::CAAC_KIND_SERVICE_ACCESS_CAPABILITY,
+            &claims,
+            gateway_sk,
+            &[gateway_pk.to_string(), cfg.nostr_pubkey.clone()],
+            payload.issued_at,
+            payload.expires_at,
+        )
+        .expect("seal");
+        serde_json::to_string(&envelope).expect("envelope")
     }
 
     #[test]
@@ -1099,8 +941,8 @@ mod tests {
     #[test]
     fn select_sources_defaults_to_enabled() {
         let cfg = sample_config();
-        let token = ManagedLaunchTokenPayload {
-            kind: "managed_launch_token".to_string(),
+        let token = ServiceAccessTokenPayload {
+            capability_id: "cap-test".to_string(),
             gateway_pk: "gateway".to_string(),
             service_pk: cfg.nostr_pubkey.clone(),
             service: "nvr".to_string(),
@@ -1110,7 +952,7 @@ mod tests {
             owner: true,
             view_sources: vec!["cam-1".to_string()],
             control_sources: vec!["cam-1".to_string()],
-            launch_nonce: "nonce".to_string(),
+            nonce: "nonce".to_string(),
             issued_at: crate::util::now_ms(),
             expires_at: crate::util::now_ms() + 60_000,
         };
@@ -1136,7 +978,7 @@ mod tests {
     #[test]
     fn request_candidates_accept_top_level_and_nested_offer_candidates() {
         let request = ManagedOfferRequest {
-            launch_token: "token".to_string(),
+            service_capability: "token".to_string(),
             offer: json!({
                 "description": {
                     "type": "offer",
@@ -1277,12 +1119,57 @@ mod tests {
     }
 
     #[test]
-    fn validate_launch_token_accepts_matching_gateway_and_service() {
+    fn validate_service_capability_accepts_matching_gateway_and_service() {
         let mut cfg = sample_config();
-        let token = launch_token(&mut cfg);
-        let payload = validate_launch_token(&cfg, &token).expect("token");
+        let token = service_capability(&mut cfg);
+        let payload = validate_service_capability(&cfg, &token).expect("token");
         assert_eq!(payload.gateway_pk, cfg.gateway.host_gateway_pk);
         assert_eq!(payload.service_pk, cfg.nostr_pubkey);
+    }
+
+    #[test]
+    fn sealed_service_invocation_decrypts_once_for_expected_signal_type() {
+        let mut cfg = sample_config();
+        let (gateway_pk, gateway_sk) = constitute_protocol::generate_keypair();
+        cfg.gateway.host_gateway_pk = gateway_pk.clone();
+        let service_capability =
+            service_capability_for_gateway(&cfg, &gateway_pk, &gateway_sk, "nonce-invocation");
+        let issued_at = crate::util::now_ms();
+        let claims = json!({
+            "signalType": "admin",
+            "serviceCapability": service_capability,
+            "action": "list_camera_device_inventory",
+            "payload": {},
+        });
+        let envelope = constitute_protocol::seal_envelope(
+            constitute_protocol::CAAC_KIND_SERVICE_ACCESS_INVOCATION,
+            &claims,
+            &gateway_sk,
+            &[cfg.nostr_pubkey.clone()],
+            issued_at,
+            issued_at + 60_000,
+        )
+        .expect("seal invocation");
+        let request = SealedServiceAccessRequest {
+            service_request_envelope: envelope.clone(),
+        };
+        let mut replay = ReplayCache::default();
+        let opened: ManagedAdminRequest =
+            open_sealed_service_access_request(&cfg, &mut replay, request, "admin")
+                .expect("open invocation");
+        assert_eq!(opened.action, "list_camera_device_inventory");
+        let replayed = SealedServiceAccessRequest {
+            service_request_envelope: envelope,
+        };
+        assert!(
+            open_sealed_service_access_request::<ManagedAdminRequest>(
+                &cfg,
+                &mut replay,
+                replayed,
+                "admin"
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1406,35 +1293,5 @@ mod tests {
         assert!(output.contains("a=msid-semantic:WMS *\r\n"));
         assert!(output.contains("a=mid:0\r\na=msid:session-1 cam-1\r\n"));
         assert!(output.contains("a=mid:1\r\na=msid:session-1 cam-2\r\n"));
-    }
-
-    #[test]
-    fn preview_no_packet_timeout_stays_short() {
-        assert_eq!(preview_no_packet_timeout_secs(), 8);
-    }
-
-    #[test]
-    fn preview_rtp_continuity_rewrites_large_restart_jumps() {
-        let mut continuity = PreviewRtpContinuity::default();
-        let mut first = RtpPacket::default();
-        first.header.sequence_number = 40_000;
-        first.header.timestamp = 120_000;
-        continuity.rewrite(&mut first);
-        assert_eq!(first.header.sequence_number, 40_000);
-        assert_eq!(first.header.timestamp, 120_000);
-
-        let mut second = RtpPacket::default();
-        second.header.sequence_number = 40_003;
-        second.header.timestamp = 123_000;
-        continuity.rewrite(&mut second);
-        assert_eq!(second.header.sequence_number, 40_003);
-        assert_eq!(second.header.timestamp, 123_000);
-
-        let mut restarted = RtpPacket::default();
-        restarted.header.sequence_number = 7;
-        restarted.header.timestamp = 9_000;
-        continuity.rewrite(&mut restarted);
-        assert_eq!(restarted.header.sequence_number, 40_004);
-        assert_eq!(restarted.header.timestamp, 126_000);
     }
 }
