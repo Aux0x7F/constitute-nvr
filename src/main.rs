@@ -4,6 +4,7 @@ mod config;
 mod crypto;
 mod hosted_registry;
 mod live;
+mod logging_surface;
 mod media;
 mod media_projection;
 mod nostr;

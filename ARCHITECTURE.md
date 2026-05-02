@@ -5,6 +5,7 @@
 - `constitute-account`: browser identity/session/grant authority and shared runtime owner
 - `constitute-gateway-ui`: gateway host and hosted-service management surface
 - `constitute-nvr-ui`: Pages-hosted NVR app surface
+- `constitute-logging`: blind structured event observation and safe-fact projection
 - `constitute-nvr`: native service workload for camera ingest, retention, and managed live preview
 
 `constitute-nvr` does not replace gateway transport. It is a hosted service-backed device and should be reached through gateway service-access authorization in the canonical path.
@@ -30,6 +31,7 @@ Future `constitute-physec` may consume NVR camera/media/history projections as a
 - segment files written under `storage.root/segments/<source_id>/`
 - background encryption pass converts `.mp4` to encrypted `.cnv`
 - plaintext segment files removed after encryption
+- this local segment layer is not `constitute-storage`; durable encrypted object/archive semantics converge on the external storage capability
 
 ### 4. Live Preview Layer
 - managed live preview uses WebRTC
@@ -49,7 +51,7 @@ Media projection owns or is actively converging toward:
 
 It consumes `camera_device` stream truth and `media` plans.
 It feeds `live`, `recording`, and future encrypted storage output.
-It should emit structured event truth for future `constitute-logging`.
+It emits structured event truth through the NVR logging surface for `constitute-logging`.
 It should expose posture facts cleanly enough for future `constitute-cybersec`.
 It must not become camera driver truth, gateway signaling, cybersecurity policy, Physical Security product workflow, or storage implementation.
 
@@ -87,6 +89,15 @@ Direct/manual debug mode remains available but is not the canonical managed path
 
 Current service access authorization uses `constitute-protocol` CAAC service capabilities. NVR decrypts and validates the gateway-issued capability before offer/control/admin/close handling. Sensitive capability claims are encrypted to the gateway and service; the browser carries `serviceCapability` opaquely. Relay-facing browser/gateway service-access and service-signal metadata is sealed through CAAC before account surfaces receive local decrypted projections.
 
+## Logging Surface
+NVR exposes a durable cursor-based logging surface for `constitute-logging`.
+Current producer-owned event streams cover camera device state, media/session lifecycle, admin/control calls, projection recovery, recording lifecycle, and worker supervision.
+
+NVR formulates safe facts from its own plaintext context and encrypts sensitive detail before exposing the log record.
+The logging surface intentionally excludes camera credentials, service capabilities, CAAC plaintext, raw admin/control payloads, decrypted request bodies, raw source secrets, credential-bearing RTSP URLs, and worker argv secrets from safe facts.
+
+Direct storage proof hooks are retired as the primary observability path. Storage remains the durable archive substrate behind `constitute-logging`.
+
 ## Current Constraints
 - ingest path depends on host `ffmpeg`
 - encrypted storage is service-key based (no HSM integration yet)
@@ -100,3 +111,4 @@ Current service access authorization uses `constitute-protocol` CAAC service cap
 4. measure cold/warm service access penalties from runtime attach through first browser track
 5. keep warm media projection workers healthy across camera down/up recovery and prove first-track timing against the warmed path
 6. keep NVR projections clean for future Physical Security consumption without moving Physical Security ownership into NVR
+7. keep NVR logging surface safe, cursorable, and replayable for `constitute-logging`
