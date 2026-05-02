@@ -164,9 +164,21 @@ fn logging_url() -> Option<String> {
 }
 
 fn outbox_path() -> Option<PathBuf> {
-    std::env::var("CONSTITUTE_NVR_LOG_OUTBOX")
+    let override_path = std::env::var("CONSTITUTE_NVR_LOG_OUTBOX")
         .ok()
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+        .filter(|value| !value.is_empty());
+    Some(
+        override_path
+            .map(PathBuf::from)
+            .unwrap_or_else(default_outbox_path),
+    )
+}
+
+fn default_outbox_path() -> PathBuf {
+    if std::path::Path::new("/data").is_dir() {
+        PathBuf::from("/data/constitute-nvr/log-events.jsonl")
+    } else {
+        PathBuf::from("/var/lib/constitute-nvr/log-events.jsonl")
+    }
 }
