@@ -30,6 +30,7 @@ Future `constitute-physec` may consume NVR camera/media/history projections as a
 - segment files written under `storage.root/segments/<source_id>/`
 - background encryption pass converts `.mp4` to encrypted `.cnv`
 - plaintext segment files removed after encryption
+- this local segment layer is not `constitute-storage`; durable encrypted object/archive semantics converge on the external storage capability
 
 ### 4. Live Preview Layer
 - managed live preview uses WebRTC
@@ -86,6 +87,11 @@ Canonical flow:
 Direct/manual debug mode remains available but is not the canonical managed path.
 
 Current service access authorization uses `constitute-protocol` CAAC service capabilities. NVR decrypts and validates the gateway-issued capability before offer/control/admin/close handling. Sensitive capability claims are encrypted to the gateway and service; the browser carries `serviceCapability` opaquely. Relay-facing browser/gateway service-access and service-signal metadata is sealed through CAAC before account surfaces receive local decrypted projections.
+
+## Storage Proof Hook
+NVR can submit safe structured proof facts to `constitute-storage` when `CONSTITUTE_STORAGE_URL` is set.
+Current proof records cover service-access offer, control, admin, and close paths.
+The hook intentionally excludes camera source IDs, service capabilities, raw admin/control payloads, decrypted request bodies, and raw credential-bearing errors.
 
 ## Current Constraints
 - ingest path depends on host `ffmpeg`

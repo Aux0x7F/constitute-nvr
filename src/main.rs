@@ -9,6 +9,7 @@ mod media_projection;
 mod nostr;
 mod recording;
 mod storage;
+mod storage_proof;
 mod swarm;
 mod update;
 mod util;

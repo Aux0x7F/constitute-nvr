@@ -242,6 +242,18 @@ async fn managed_offer(
                 .into_response();
         }
     };
+    crate::storage_proof::submit_safe_event(
+        "nvr-proof",
+        "nvr.service_access.offer",
+        "nvr",
+        "normal",
+        &["nvr", "service_access", "offer"],
+        json!({
+            "signalType": "offer",
+            "candidateCount": request.candidates.len(),
+        }),
+    )
+    .await;
     match state.preview.handle_offer(&cfg, request).await {
         Ok(response) => Json::<Value>(json!({
             "signalType": response.signal_type,
@@ -281,6 +293,17 @@ async fn managed_close(
                 .into_response();
         }
     };
+    crate::storage_proof::submit_safe_event(
+        "nvr-proof",
+        "nvr.service_access.close",
+        "nvr",
+        "normal",
+        &["nvr", "service_access", "close"],
+        json!({
+            "signalType": "session_close",
+        }),
+    )
+    .await;
     match state.preview.handle_close(&cfg, request).await {
         Ok(response) => Json::<Value>(response).into_response(),
         Err(err) => (
@@ -313,6 +336,18 @@ async fn managed_control(
                 .into_response();
         }
     };
+    crate::storage_proof::submit_safe_event(
+        "nvr-proof",
+        "nvr.service_access.control",
+        "nvr",
+        "normal",
+        &["nvr", "service_access", "control"],
+        json!({
+            "signalType": "control",
+            "ptzRequested": request.payload.get("ptz").is_some(),
+        }),
+    )
+    .await;
     let camera = match resolve_control_camera(&cfg, &request) {
         Ok(camera) => camera,
         Err(err) => {
@@ -396,6 +431,18 @@ async fn managed_admin(
     }
 
     let action = request.action.trim().to_ascii_lowercase();
+    crate::storage_proof::submit_safe_event(
+        "nvr-proof",
+        "nvr.service_access.admin",
+        "nvr",
+        "normal",
+        &["nvr", "service_access", "admin"],
+        json!({
+            "signalType": "admin",
+            "action": action.clone(),
+        }),
+    )
+    .await;
     let response = match action.as_str() {
         "list_camera_device_inventory" => {
             let inventory = match camera_device::inventory::list_camera_device_inventory(&cfg).await
