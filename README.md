@@ -10,6 +10,7 @@ It runs as a Fedora/Linux service, joins swarm as a service-backed device with `
 - encrypted segment store (`.cnv` blobs)
 - service-backed device publication with host gateway relationship and service metrics
 - gateway-authorized WebRTC H.264 live preview
+- producer-owned structured logging surface for camera/media/admin/worker events
 - recorded retrieval path preserved for archive access
 - systemd self-update timer flow
 - Reolink managed-driver onboarding using LAN discovery + HTTP CGI setup/read/apply (RTSP/ONVIF enable, P2P disable) while native `9000` replacement remains under R&D
@@ -71,6 +72,7 @@ Optional auto-provision flags:
 - Direct debug admission supports the signed HMAC proof flow for lab work.
 - Unsigned local debug mode is for local integration bring-up only and is not the canonical managed path.
 - Camera-network bootstrap is installer-managed; health output is redacted and never exposes camera credentials.
+- Structured logging safe facts exclude camera credentials, service capabilities, raw admin/control payloads, CAAC plaintext, and credential-bearing RTSP URLs.
 - TURN remains intentionally incomplete in this iteration; direct ICE is the active path and decentralized gateway-hosted TURN stays on the roadmap for later work.
 
 ## Local Dev

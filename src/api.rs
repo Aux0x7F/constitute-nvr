@@ -13,13 +13,13 @@ use crate::storage::StorageManager;
 use crate::util;
 use anyhow::{Result, anyhow};
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{State, WebSocketUpgrade};
+use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
-use constitute_protocol::ReplayCache;
+use constitute_protocol::{LogCategory, LogOutcome, LogSeverity, LogSubjectRef, ReplayCache};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -101,6 +101,7 @@ pub async fn run(
         .route("/service-access/control", post(managed_control))
         .route("/service-access/admin", post(managed_admin))
         .route("/service-access/close", post(managed_close))
+        .route("/v1/logging/events", get(logging_events))
         .with_state(state);
 
     let listener = TcpListener::bind(&bind).await?;
@@ -242,11 +243,16 @@ async fn managed_offer(
                 .into_response();
         }
     };
-    crate::storage_proof::submit_safe_event(
-        "nvr-proof",
-        "nvr.service_access.offer",
-        "nvr",
-        "normal",
+    crate::logging_surface::submit_safe_event(
+        "live",
+        LogCategory::ServiceAccess,
+        LogSeverity::Info,
+        LogOutcome::Observed,
+        LogSubjectRef {
+            kind: "service".to_string(),
+            id: Some("nvr".to_string()),
+            display: Some("Security Cameras".to_string()),
+        },
         &["nvr", "service_access", "offer"],
         json!({
             "signalType": "offer",
@@ -293,11 +299,16 @@ async fn managed_close(
                 .into_response();
         }
     };
-    crate::storage_proof::submit_safe_event(
-        "nvr-proof",
-        "nvr.service_access.close",
-        "nvr",
-        "normal",
+    crate::logging_surface::submit_safe_event(
+        "live",
+        LogCategory::ServiceAccess,
+        LogSeverity::Info,
+        LogOutcome::Observed,
+        LogSubjectRef {
+            kind: "service".to_string(),
+            id: Some("nvr".to_string()),
+            display: Some("Security Cameras".to_string()),
+        },
         &["nvr", "service_access", "close"],
         json!({
             "signalType": "session_close",
@@ -336,11 +347,16 @@ async fn managed_control(
                 .into_response();
         }
     };
-    crate::storage_proof::submit_safe_event(
-        "nvr-proof",
-        "nvr.service_access.control",
-        "nvr",
-        "normal",
+    crate::logging_surface::submit_safe_event(
+        "live",
+        LogCategory::ServiceAccess,
+        LogSeverity::Info,
+        LogOutcome::Observed,
+        LogSubjectRef {
+            kind: "service".to_string(),
+            id: Some("nvr".to_string()),
+            display: Some("Security Cameras".to_string()),
+        },
         &["nvr", "service_access", "control"],
         json!({
             "signalType": "control",
@@ -431,11 +447,16 @@ async fn managed_admin(
     }
 
     let action = request.action.trim().to_ascii_lowercase();
-    crate::storage_proof::submit_safe_event(
-        "nvr-proof",
-        "nvr.service_access.admin",
-        "nvr",
-        "normal",
+    crate::logging_surface::submit_safe_event(
+        "admin",
+        LogCategory::ServiceAccess,
+        LogSeverity::Info,
+        LogOutcome::Observed,
+        LogSubjectRef {
+            kind: "service".to_string(),
+            id: Some("nvr".to_string()),
+            display: Some("Security Cameras".to_string()),
+        },
         &["nvr", "service_access", "admin"],
         json!({
             "signalType": "admin",
@@ -585,6 +606,12 @@ async fn managed_admin(
         }
     };
     Json::<Value>(response).into_response()
+}
+
+async fn logging_events(
+    Query(query): Query<crate::logging_surface::LoggingEventsQuery>,
+) -> impl IntoResponse {
+    Json(crate::logging_surface::read_events(query))
 }
 
 #[derive(Debug, Deserialize)]
