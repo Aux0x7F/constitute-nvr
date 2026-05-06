@@ -472,7 +472,14 @@ async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<
             554
         };
 
-        let source_id = reolink_source_id(&device.uid, &ip);
+        let Some(source_id) = camera_device::reolink_stable_source_id(&device.uid, &device.mac)
+        else {
+            warn!(
+                ip = %ip,
+                "reolink auto-provision skipped candidate without stable UID or MAC"
+            );
+            continue;
+        };
         let source_name = if device.model.trim().is_empty() {
             format!("Reolink {}", ip)
         } else {
@@ -538,25 +545,6 @@ async fn run_reolink_autoprovision(cfg: &mut Config, cfg_path: &Path) -> Result<
     }
 
     Ok(())
-}
-
-fn reolink_source_id(uid: &str, ip: &str) -> String {
-    let key = if uid.trim().is_empty() {
-        ip.trim()
-    } else {
-        uid.trim()
-    };
-    let sanitized = key
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    format!("reolink-{}", sanitized.trim_matches('-'))
 }
 
 fn init_logging(level: &str) {

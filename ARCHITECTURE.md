@@ -24,6 +24,7 @@ Future `constitute-physec` may consume NVR camera/media/history projections as a
 ### 2. Ingest Layer
 - ONVIF WS-Discovery probe support
 - camera source registry from config plus control-plane mutations
+- stable camera identity owns `source_id`; current IP/RTSP endpoints are driver-resolved transport state and may change after DHCP/power events
 - RTSP ingest execution via `ffmpeg` with explicit runtime state machine and restart/backoff
 - substream preference where camera capabilities allow
 
@@ -51,7 +52,7 @@ Media projection owns or is actively converging toward:
 
 It consumes `camera_device` stream truth and `media` plans.
 It feeds `live`, `recording`, and future encrypted storage output.
-It emits structured event truth through the NVR logging surface for `constitute-logging`.
+It emits structured event truth through the NVR logging surface for `constitute-logging`, including preview projection stalls, ffmpeg start/exit/socket failures, retry/backoff scheduling, and recovery after packets resume.
 It should expose posture facts cleanly enough for future `constitute-cybersec`.
 It must not become camera driver truth, gateway signaling, cybersecurity policy, Physical Security product workflow, or storage implementation.
 
@@ -91,7 +92,7 @@ Current service access authorization uses `constitute-protocol` CAAC service cap
 
 ## Logging Surface
 NVR exposes a durable cursor-based logging surface for `constitute-logging`.
-Current producer-owned event streams cover camera device state, media/session lifecycle, admin/control calls, projection recovery, recording lifecycle, and worker supervision.
+Current producer-owned event streams cover camera device state, camera drift convergence/failure, media/session lifecycle, admin/control calls, projection stall/retry/recovery, recording lifecycle, and worker supervision.
 
 NVR formulates safe facts from its own plaintext context and encrypts sensitive detail before exposing the log record.
 The logging surface intentionally excludes camera credentials, service capabilities, CAAC plaintext, raw admin/control payloads, decrypted request bodies, raw source secrets, credential-bearing RTSP URLs, and worker argv secrets from safe facts.

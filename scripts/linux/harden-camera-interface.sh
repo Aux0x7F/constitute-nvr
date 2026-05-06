@@ -214,6 +214,39 @@ if ! ip link show "$IFACE" >/dev/null 2>&1; then
   exit 1
 fi
 
+mapfile -t CAMERA_NETWORK_CIDRS < <(
+  {
+    printf '%s\n' "$CAMERA_CIDR"
+    ip -4 -o addr show dev "$IFACE" scope global 2>/dev/null | awk '{ print $4 }'
+  } | python3 -c '
+import ipaddress
+import sys
+
+seen = set()
+for raw in sys.stdin:
+    value = raw.strip()
+    if not value:
+        continue
+    try:
+        network = ipaddress.ip_interface(value).network
+    except ValueError:
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            print(f"invalid camera network CIDR: {value}", file=sys.stderr)
+            sys.exit(1)
+    normalized = str(network)
+    if normalized not in seen:
+        seen.add(normalized)
+        print(normalized)
+'
+)
+if [[ "${#CAMERA_NETWORK_CIDRS[@]}" -eq 0 ]]; then
+  echo "No camera networks resolved for $IFACE" >&2
+  exit 1
+fi
+log "camera networks: ${CAMERA_NETWORK_CIDRS[*]}"
+
 if ! run_sudo firewall-cmd --permanent --get-zones | tr ' ' '\n' | grep -qx "$ZONE_NAME"; then
   log "creating firewalld zone: $ZONE_NAME"
   run_sudo firewall-cmd --permanent --new-zone="$ZONE_NAME" >/dev/null
@@ -227,7 +260,6 @@ if ! run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --query-interface="$I
   run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --add-interface="$IFACE" >/dev/null
 fi
 
-ntp_rule="rule family=\"ipv4\" source address=\"${CAMERA_CIDR}\" port protocol=\"udp\" port=\"123\" accept"
 while IFS= read -r existing_rule; do
   [[ -z "$existing_rule" ]] && continue
   if [[ "$existing_rule" == *'port port="67" protocol="udp"'* || "$existing_rule" == *'port port="123" protocol="udp"'* ]]; then
@@ -238,10 +270,12 @@ done < <(run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --list-rich-rules
 log "allowing camera->host DHCP bootstrap (udp/67) on $IFACE"
 run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --add-port=67/udp >/dev/null 2>&1 || true
 
-run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --remove-rich-rule="$ntp_rule" >/dev/null 2>&1 || true
 if [[ "$ALLOW_NTP_HOST" -eq 1 ]]; then
-  log "allowing camera->host NTP (udp/123) from $CAMERA_CIDR"
-  run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --add-rich-rule="$ntp_rule" >/dev/null
+  for cidr in "${CAMERA_NETWORK_CIDRS[@]}"; do
+    ntp_rule="rule family=\"ipv4\" source address=\"${cidr}\" port protocol=\"udp\" port=\"123\" accept"
+    log "allowing camera->host NTP (udp/123) from $cidr"
+    run_sudo firewall-cmd --permanent --zone="$ZONE_NAME" --add-rich-rule="$ntp_rule" >/dev/null
+  done
 fi
 
 log "reloading firewalld"
@@ -252,18 +286,20 @@ run_sudo nft "add table inet ${NFT_TABLE}" >/dev/null 2>&1 || true
 run_sudo nft "delete chain inet ${NFT_TABLE} output" >/dev/null 2>&1 || true
 run_sudo nft "add chain inet ${NFT_TABLE} output { type filter hook output priority 0; policy accept; }"
 
-run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${CAMERA_CIDR} tcp dport { ${ALLOWED_TCP_PORTS//,/ , } } accept"
-run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${CAMERA_CIDR} udp dport 68 accept"
-run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${CAMERA_CIDR} udp dport { 2000, 3000 } accept"
-if [[ "$ALLOW_ONVIF_DISCOVERY" -eq 1 ]]; then
-  run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${CAMERA_CIDR} udp dport 3702 accept"
-fi
-if [[ "$ALLOW_NTP_HOST" -eq 1 ]]; then
-  run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${CAMERA_CIDR} udp dport 123 accept"
-fi
-if [[ "$NO_EGRESS_LOCK" -eq 0 ]]; then
-  run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${CAMERA_CIDR} drop"
-fi
+for cidr in "${CAMERA_NETWORK_CIDRS[@]}"; do
+  run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${cidr} tcp dport { ${ALLOWED_TCP_PORTS//,/ , } } accept"
+  run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${cidr} udp dport 68 accept"
+  run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${cidr} udp dport { 2000, 3000 } accept"
+  if [[ "$ALLOW_ONVIF_DISCOVERY" -eq 1 ]]; then
+    run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${cidr} udp dport 3702 accept"
+  fi
+  if [[ "$ALLOW_NTP_HOST" -eq 1 ]]; then
+    run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${cidr} udp dport 123 accept"
+  fi
+  if [[ "$NO_EGRESS_LOCK" -eq 0 ]]; then
+    run_sudo nft "add rule inet ${NFT_TABLE} output oifname \"${IFACE}\" ip daddr ${cidr} drop"
+  fi
+done
 
 log "applied"
 run_sudo firewall-cmd --zone="$ZONE_NAME" --list-all || true

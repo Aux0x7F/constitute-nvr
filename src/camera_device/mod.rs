@@ -234,7 +234,7 @@ pub use apply::apply_camera_device_config;
 pub use control::control_camera_device;
 pub use inventory::{list_camera_device_inventory, read_camera_device};
 pub use mount::mount_camera_device;
-pub use reconcile::reconcile_camera_device;
+pub use reconcile::{reconcile_camera_device, reconcile_camera_identity_and_endpoint};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3145,10 +3145,51 @@ fn candidate_id(candidate: &DiscoveredCameraCandidate) -> String {
     })
 }
 
+pub(crate) fn reolink_stable_source_id(uid: &str, mac: &str) -> Option<String> {
+    let key = if !uid.trim().is_empty() {
+        uid.trim()
+    } else if !mac.trim().is_empty() {
+        mac.trim()
+    } else {
+        ""
+    };
+    if key.is_empty() {
+        None
+    } else {
+        Some(format!("reolink-{}", sanitize_id(key)))
+    }
+}
+
+pub(crate) fn reolink_candidate_stable_source_id(
+    candidate: &DiscoveredCameraCandidate,
+) -> Option<String> {
+    reolink_stable_source_id(&candidate.signatures.reolink_uid, &candidate.mac)
+}
+
+pub(crate) fn reolink_source_id_is_ip_derived(source_id: &str) -> bool {
+    let Some(suffix) = source_id.trim().strip_prefix("reolink-") else {
+        return false;
+    };
+    looks_like_sanitized_ipv4(suffix)
+}
+
+fn looks_like_sanitized_ipv4(value: &str) -> bool {
+    let parts = value.split('-').collect::<Vec<_>>();
+    parts.len() == 4
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.len() <= 3
+                && part.chars().all(|ch| ch.is_ascii_digit())
+                && part.parse::<u8>().is_ok()
+        })
+}
+
 fn build_source_id(candidate: &DiscoveredCameraCandidate, driver_id: &str) -> String {
     let raw =
         if driver_id == DRIVER_ID_REOLINK && !candidate.signatures.reolink_uid.trim().is_empty() {
             format!("reolink-{}", candidate.signatures.reolink_uid.trim())
+        } else if driver_id == DRIVER_ID_REOLINK && !candidate.mac.trim().is_empty() {
+            format!("reolink-{}", candidate.mac.trim())
         } else if driver_id == DRIVER_ID_REOLINK {
             format!("reolink-{}", candidate.ip.trim())
         } else if driver_is_xm(driver_id) {
@@ -3243,6 +3284,22 @@ fn derive_rtsp_url(
         );
     }
     format!("rtsp://{auth}{}:554/", candidate.ip.trim())
+}
+
+pub(crate) fn rewrite_rtsp_url_host(rtsp_url: &str, host: &str, fallback_port: u16) -> String {
+    let host = host.trim();
+    if host.is_empty() {
+        return rtsp_url.trim().to_string();
+    }
+    if let Ok(mut url) = Url::parse(rtsp_url.trim()) {
+        if url.set_host(Some(host)).is_ok() {
+            if url.port().is_none() && fallback_port > 0 {
+                let _ = url.set_port(Some(fallback_port));
+            }
+            return url.to_string();
+        }
+    }
+    rtsp_url.trim().to_string()
 }
 
 fn xm_preview_rtsp_url(url: &str) -> String {
@@ -3481,6 +3538,7 @@ async fn active_scan_candidate(ip: &str) -> Option<DiscoveredCameraCandidate> {
         return None;
     }
     let mut candidate = blank_candidate(ip);
+    candidate.mac = neighbor_mac_for_ip(ip);
     candidate.transports.http = ports.http;
     candidate.transports.https = ports.https;
     candidate.transports.rtsp = ports.rtsp;
@@ -3488,6 +3546,28 @@ async fn active_scan_candidate(ip: &str) -> Option<DiscoveredCameraCandidate> {
     candidate.transports.proprietary_9000 = ports.proprietary_9000;
     push_unique_string(&mut candidate.discovered_via, "interface_scan");
     Some(candidate)
+}
+
+fn neighbor_mac_for_ip(ip: &str) -> String {
+    let output = match Command::new("ip")
+        .args(["neigh", "show", "to", ip.trim()])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return String::new(),
+    };
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let parts = raw.split_whitespace().collect::<Vec<_>>();
+    parts
+        .windows(2)
+        .find_map(|window| {
+            if window[0] == "lladdr" {
+                Some(window[1].trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
 }
 
 fn host_and_port_from_xaddr(value: &str) -> Option<(String, u16)> {
@@ -3743,6 +3823,51 @@ mod tests {
         assert_eq!(
             derive_rtsp_url(&candidate, DRIVER_ID_XM_40E, "admin", "123456", ""),
             "rtsp://admin:123456@192.168.0.201:554/user=admin_password=123456_channel=1_stream=0.sdp?real_stream"
+        );
+    }
+
+    #[test]
+    fn reolink_source_id_prefers_uid_then_mac_over_ip() {
+        let uid_candidate = DiscoveredCameraCandidate {
+            ip: "192.168.250.98".to_string(),
+            mac: "ec:71:db:32:0a:8f".to_string(),
+            signatures: CameraSignatureSet {
+                reolink_uid: "95270001ABC".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mac_candidate = DiscoveredCameraCandidate {
+            ip: "192.168.250.98".to_string(),
+            mac: "ec:71:db:32:0a:8f".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            build_source_id(&uid_candidate, DRIVER_ID_REOLINK),
+            "reolink-95270001abc"
+        );
+        assert_eq!(
+            build_source_id(&mac_candidate, DRIVER_ID_REOLINK),
+            "reolink-ec-71-db-32-0a-8f"
+        );
+        assert_eq!(
+            reolink_stable_source_id("", "ec:71:db:32:0a:8f").as_deref(),
+            Some("reolink-ec-71-db-32-0a-8f")
+        );
+    }
+
+    #[test]
+    fn rewrite_rtsp_url_host_preserves_credentials_and_path() {
+        let rewritten = rewrite_rtsp_url_host(
+            "rtsp://admin:secret@192.168.250.97:554/h264Preview_01_main",
+            "192.168.250.98",
+            554,
+        );
+
+        assert_eq!(
+            rewritten,
+            "rtsp://admin:secret@192.168.250.98:554/h264Preview_01_main"
         );
     }
 

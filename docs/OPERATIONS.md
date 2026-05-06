@@ -103,6 +103,8 @@ Notes:
   - current recording uses video-only MP4 segmentation because the validated lab camera exposes `pcm_mulaw` audio that cannot be copied directly into MP4
   - live preview for this camera requires HEVC decode on the host because the validated RTSP profiles are HEVC, not H.264
   - site time for the lab XM camera is served from the host-side onboarding alias `192.168.0.2`
+  - chrony and the camera-NIC firewall must allow the managed camera subnet and any onboarding alias subnets on the camera NIC
+  - `camera_network.ntp_server` is policy; the driver resolves the reachable per-camera NTP endpoint
   - the baked feed title is driven through `TitleOverlay.TitleUtf8`
   - the hidden XM `UserOverlay` lane must stay cleared so stale lower-left text does not leak into the baked feed
 
@@ -138,6 +140,7 @@ sudo bash scripts/linux/harden-camera-interface.sh \
 Expected effect:
 - camera NIC zone target `DROP`
 - camera->host DHCP remains allowed on the isolated segment
+- camera->host NTP is allowed from the managed camera subnet and any IPv4 alias subnets assigned to the camera NIC
 - host egress on camera NIC restricted to DHCP/camera-control/RTSP (+ Reolink discovery UDP `2000/3000`, optional WS-Discovery, optional NTP); default control allowlist includes Reolink `9000/tcp`
 
 ## 8) Manual Session Protocol Test (Identity-bound)

@@ -750,8 +750,15 @@ fn apply_camera_device_defaults(
         camera.driver_id = "generic_onvif_rtsp".to_string();
         changed = true;
     }
-    if camera.vendor.trim().is_empty() && camera.driver_id == "reolink" {
+    if camera.driver_id == "reolink" && camera.vendor.trim() != "Reolink" {
         camera.vendor = "Reolink".to_string();
+        changed = true;
+    }
+    if camera.driver_id == "reolink"
+        && reolink_source_id_is_ip_derived(&camera.source_id)
+        && !camera.mac_address.trim().is_empty()
+    {
+        camera.source_id = reolink_mac_source_id(&camera.mac_address);
         changed = true;
     }
     if camera.vendor.trim().is_empty() && camera.driver_id == "xm_40e" {
@@ -846,6 +853,36 @@ fn normalize_site_timezone_candidate(value: &str) -> Option<String> {
         return Some(trimmed);
     }
     None
+}
+
+fn reolink_source_id_is_ip_derived(source_id: &str) -> bool {
+    let Some(suffix) = source_id.trim().strip_prefix("reolink-") else {
+        return false;
+    };
+    let parts = suffix.split('-').collect::<Vec<_>>();
+    parts.len() == 4
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.len() <= 3
+                && part.chars().all(|ch| ch.is_ascii_digit())
+                && part.parse::<u8>().is_ok()
+        })
+}
+
+fn reolink_mac_source_id(mac: &str) -> String {
+    let sanitized = mac
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    format!("reolink-{sanitized}")
 }
 
 fn infer_camera_device_model(camera: &CameraDeviceConfig) -> String {
@@ -1331,7 +1368,7 @@ mod tests {
             username: "admin".to_string(),
             password: "old-secret".to_string(),
             driver_id: "reolink".to_string(),
-            vendor: "Reolink".to_string(),
+            vendor: "ONVIF/RTSP".to_string(),
             model: "E1 Outdoor".to_string(),
             mac_address: String::new(),
             rtsp_port: 554,
@@ -1502,5 +1539,33 @@ mod tests {
         let camera = &cfg.camera_devices[0];
         assert_eq!(camera.driver_id, "generic_onvif_rtsp");
         assert_eq!(camera.desired.display_name, "Manual Camera");
+    }
+
+    #[test]
+    fn apply_defaults_converges_reolink_ip_source_id_when_mac_is_known() {
+        let mut cfg = Config::default_generated();
+        cfg.camera_devices.push(CameraDeviceConfig {
+            source_id: "reolink-192-168-250-97".to_string(),
+            name: "Reolink Patio".to_string(),
+            onvif_host: "192.168.250.98".to_string(),
+            onvif_port: 8000,
+            rtsp_url: "rtsp://admin:secret@192.168.250.98:554/h264Preview_01_main".to_string(),
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            driver_id: "reolink".to_string(),
+            vendor: "Reolink".to_string(),
+            model: "E1 Outdoor SE".to_string(),
+            mac_address: "ec:71:db:32:0a:8f".to_string(),
+            rtsp_port: 554,
+            ptz_capable: true,
+            enabled: true,
+            segment_secs: 10,
+            desired: CameraDeviceDesiredConfig::default(),
+            credentials: CameraCredentialState::default(),
+        });
+
+        assert!(cfg.apply_defaults());
+        assert_eq!(cfg.camera_devices[0].source_id, "reolink-ec-71-db-32-0a-8f");
+        assert_eq!(cfg.camera_devices[0].vendor, "Reolink");
     }
 }
