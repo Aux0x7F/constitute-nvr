@@ -132,6 +132,36 @@ async fn run_camera_reconcile_cycle(state: &ApiState) -> Result<()> {
         .filter(|camera| camera.enabled)
         .cloned()
     {
+        let mut camera = camera;
+        match camera_device::reconcile_camera_identity_and_endpoint(&cfg, &camera).await {
+            Ok(Some(outcome)) => {
+                persist_camera_source_replacing(
+                    state,
+                    &outcome.previous_source_id,
+                    &outcome.previous_host,
+                    outcome.configured.clone(),
+                )
+                .await?;
+                submit_camera_identity_reconcile_event(&outcome).await;
+                info!(
+                    previous_source = %outcome.previous_source_id,
+                    source = %outcome.configured.source_id,
+                    match_kind = %outcome.match_kind,
+                    confidence = outcome.confidence,
+                    "camera identity endpoint reconcile applied"
+                );
+                camera = outcome.configured;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(
+                    source = %camera.source_id,
+                    error = %err,
+                    "camera identity endpoint reconcile failed"
+                );
+            }
+        }
+
         match camera_device::reconcile_camera_device(&cfg, &camera).await {
             Ok(Some(outcome)) => {
                 let changed =
@@ -139,6 +169,7 @@ async fn run_camera_reconcile_cycle(state: &ApiState) -> Result<()> {
                 if changed {
                     persist_camera_source(state, outcome.configured.clone()).await?;
                 }
+                submit_camera_drift_reconcile_event(&outcome, changed).await;
                 info!(
                     source = %camera.source_id,
                     changed,
@@ -149,6 +180,7 @@ async fn run_camera_reconcile_cycle(state: &ApiState) -> Result<()> {
             }
             Ok(None) => {}
             Err(err) => {
+                submit_camera_drift_reconcile_failed_event(&camera).await;
                 warn!(
                     source = %camera.source_id,
                     error = %err,
@@ -158,6 +190,100 @@ async fn run_camera_reconcile_cycle(state: &ApiState) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn submit_camera_identity_reconcile_event(
+    outcome: &camera_device::reconcile::CameraIdentityReconcileOutcome,
+) {
+    crate::logging_surface::submit_safe_event(
+        "camera_device",
+        LogCategory::CameraDevice,
+        LogSeverity::Notice,
+        LogOutcome::Recovered,
+        LogSubjectRef {
+            kind: "camera".to_string(),
+            id: Some(outcome.configured.source_id.clone()),
+            display: Some(outcome.configured.name.clone()),
+        },
+        &["nvr", "camera_device", "identity_reconcile"],
+        json!({
+            "eventType": "camera_identity_endpoint_reconciled",
+            "sourceId": outcome.configured.source_id,
+            "previousSourceId": outcome.previous_source_id,
+            "driverId": outcome.configured.driver_id,
+            "vendor": outcome.configured.vendor,
+            "model": outcome.configured.model,
+            "matchKind": outcome.match_kind,
+            "confidence": outcome.confidence,
+            "endpointChanged": outcome.previous_host != outcome.configured.onvif_host,
+        }),
+    )
+    .await;
+}
+
+async fn submit_camera_drift_reconcile_event(
+    outcome: &camera_device::reconcile::CameraDriftReconcileOutcome,
+    changed: bool,
+) {
+    crate::logging_surface::submit_safe_event(
+        "camera_device",
+        LogCategory::CameraDevice,
+        LogSeverity::Notice,
+        LogOutcome::Recovered,
+        camera_log_subject(&outcome.configured),
+        &["nvr", "camera_device", "drift_reconcile"],
+        camera_drift_reconcile_safe_facts(outcome, changed),
+    )
+    .await;
+}
+
+async fn submit_camera_drift_reconcile_failed_event(camera: &CameraDeviceConfig) {
+    crate::logging_surface::submit_safe_event(
+        "camera_device",
+        LogCategory::CameraDevice,
+        LogSeverity::Warning,
+        LogOutcome::Failed,
+        camera_log_subject(camera),
+        &["nvr", "camera_device", "drift_reconcile", "repair_needed"],
+        json!({
+            "eventType": "camera_drift_reconcile_failed",
+            "sourceId": camera.source_id,
+            "cameraName": camera.name,
+            "driverId": camera.driver_id,
+            "vendor": camera.vendor,
+            "model": camera.model,
+            "repairNeeded": true,
+            "errorClass": "camera_drift_reconcile_failed",
+        }),
+    )
+    .await;
+}
+
+fn camera_log_subject(camera: &CameraDeviceConfig) -> LogSubjectRef {
+    LogSubjectRef {
+        kind: "camera".to_string(),
+        id: Some(camera.source_id.clone()),
+        display: Some(camera.name.clone()),
+    }
+}
+
+fn camera_drift_reconcile_safe_facts(
+    outcome: &camera_device::reconcile::CameraDriftReconcileOutcome,
+    changed: bool,
+) -> Value {
+    json!({
+        "eventType": "camera_drift_reconciled",
+        "sourceId": outcome.configured.source_id,
+        "cameraName": outcome.configured.name,
+        "driverId": outcome.configured.driver_id,
+        "vendor": outcome.configured.vendor,
+        "model": outcome.configured.model,
+        "driftFields": outcome.initial_drift_fields,
+        "changed": changed,
+        "verificationStatus": outcome.mounted.verification.status,
+        "remainingDriftFields": outcome.mounted.verification.drift_fields,
+        "repairNeeded": false,
+    })
 }
 
 async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
@@ -1087,12 +1213,21 @@ async fn handle_command(
                 .as_ref()
                 .map(|d| d.uid.clone())
                 .unwrap_or_default();
+            let mac = discovered_entry
+                .as_ref()
+                .map(|d| d.mac.clone())
+                .unwrap_or_default();
             let model = discovered_entry
                 .as_ref()
                 .map(|d| d.model.clone())
                 .unwrap_or_default();
 
-            let source_id = build_reolink_source_id(&uid, &request.ip);
+            let source_id =
+                camera_device::reolink_stable_source_id(&uid, &mac).ok_or_else(|| {
+                    anyhow!(
+                        "Reolink setup did not discover a stable UID or MAC for source identity"
+                    )
+                })?;
             let source_name = if model.trim().is_empty() {
                 format!("Reolink {}", request.ip)
             } else {
@@ -1115,10 +1250,7 @@ async fn handle_command(
                     .as_ref()
                     .map(|entry| entry.model.clone())
                     .unwrap_or_default(),
-                mac_address: discovered_entry
-                    .as_ref()
-                    .map(|entry| entry.mac.clone())
-                    .unwrap_or_default(),
+                mac_address: mac,
                 rtsp_port,
                 ptz_capable: source_id.contains("e1") || source_id.contains("ptz"),
                 enabled: true,
@@ -1263,45 +1395,46 @@ async fn handle_command(
 }
 
 async fn persist_camera_source(state: &ApiState, camera_cfg: CameraDeviceConfig) -> Result<()> {
-    let storage_root =
-        {
-            let mut guard = state.cfg.lock().await;
-            if let Some(existing) = guard.camera_devices.iter_mut().find(|c| {
-                c.source_id == camera_cfg.source_id || c.onvif_host == camera_cfg.onvif_host
-            }) {
-                *existing = camera_cfg.clone();
-            } else {
-                guard.camera_devices.push(camera_cfg.clone());
-            }
-            guard.apply_defaults();
-            let snapshot = guard.clone();
-            snapshot.persist(&state.cfg_path)?;
-            let _ = hosted_registry::persist_hosted_service_manifest(&snapshot);
-            snapshot.storage_root()
-        };
+    persist_camera_source_replacing(state, "", "", camera_cfg).await
+}
 
+async fn persist_camera_source_replacing(
+    state: &ApiState,
+    previous_source_id: &str,
+    previous_host: &str,
+    camera_cfg: CameraDeviceConfig,
+) -> Result<()> {
+    let storage_root = {
+        let mut guard = state.cfg.lock().await;
+        if let Some(index) = guard.camera_devices.iter().position(|c| {
+            (!previous_source_id.trim().is_empty()
+                && c.source_id.trim() == previous_source_id.trim())
+                || c.source_id == camera_cfg.source_id
+                || (!previous_host.trim().is_empty() && c.onvif_host.trim() == previous_host.trim())
+                || c.onvif_host == camera_cfg.onvif_host
+        }) {
+            guard.camera_devices[index] = camera_cfg.clone();
+        } else {
+            guard.camera_devices.push(camera_cfg.clone());
+        }
+        guard.apply_defaults();
+        let snapshot = guard.clone();
+        snapshot.persist(&state.cfg_path)?;
+        let _ = hosted_registry::persist_hosted_service_manifest(&snapshot);
+        snapshot.storage_root()
+    };
+
+    if !previous_source_id.trim().is_empty()
+        && previous_source_id.trim() != camera_cfg.source_id.trim()
+    {
+        state
+            .recorder
+            .remove_camera(previous_source_id.trim())
+            .await;
+    }
     state.recorder.upsert_camera(storage_root, camera_cfg).await;
 
     Ok(())
-}
-
-fn build_reolink_source_id(uid: &str, ip: &str) -> String {
-    let key = if uid.trim().is_empty() {
-        ip.trim()
-    } else {
-        uid.trim()
-    };
-    let sanitized = key
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    format!("reolink-{}", sanitized.trim_matches('-'))
 }
 
 async fn send_cipher_error(socket: &mut WebSocket, key: &[u8], message: &str) -> Result<()> {
@@ -1335,4 +1468,65 @@ fn default_enabled() -> bool {
 
 fn default_segment_secs() -> u64 {
     10
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_camera() -> CameraDeviceConfig {
+        CameraDeviceConfig {
+            source_id: "xm-40e-front-door".to_string(),
+            name: "Front Door".to_string(),
+            onvif_host: "192.0.2.10".to_string(),
+            onvif_port: 80,
+            rtsp_url: "rtsp://example.invalid/redacted".to_string(),
+            username: "admin".to_string(),
+            password: "redacted".to_string(),
+            driver_id: "xm_40e".to_string(),
+            vendor: "XM".to_string(),
+            model: "40E".to_string(),
+            mac_address: "00:00:00:00:00:00".to_string(),
+            rtsp_port: 554,
+            ptz_capable: false,
+            enabled: true,
+            segment_secs: 10,
+            desired: CameraDeviceDesiredConfig::default(),
+            credentials: Default::default(),
+        }
+    }
+
+    #[test]
+    fn camera_drift_reconcile_safe_facts_do_not_expose_transport_or_secrets() {
+        let camera = test_camera();
+        let mut mounted = camera_device::MountedCamera {
+            source_id: camera.source_id.clone(),
+            driver_id: camera.driver_id.clone(),
+            display_name: camera.name.clone(),
+            vendor: camera.vendor.clone(),
+            model: camera.model.clone(),
+            ..Default::default()
+        };
+        mounted.verification.status = "verified".to_string();
+        mounted.verification.drift_fields = vec!["time_clock".to_string()];
+        let outcome = camera_device::reconcile::CameraDriftReconcileOutcome {
+            initial_drift_fields: vec!["timezone".to_string(), "time_clock".to_string()],
+            configured: camera,
+            mounted,
+        };
+
+        let facts = camera_drift_reconcile_safe_facts(&outcome, true);
+
+        assert_eq!(facts["eventType"], json!("camera_drift_reconciled"));
+        assert_eq!(facts["driverId"], json!("xm_40e"));
+        assert_eq!(facts["driftFields"][0], json!("timezone"));
+        assert_eq!(facts["changed"], json!(true));
+        assert_eq!(facts["repairNeeded"], json!(false));
+        assert!(facts.get("rtsp_url").is_none());
+        assert!(facts.get("rtspUrl").is_none());
+        assert!(facts.get("password").is_none());
+        assert!(facts.get("username").is_none());
+        assert!(facts.get("onvifHost").is_none());
+        assert!(facts.get("macAddress").is_none());
+    }
 }

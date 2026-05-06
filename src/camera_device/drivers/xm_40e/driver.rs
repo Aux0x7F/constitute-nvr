@@ -721,15 +721,12 @@ fn user_overlay_requires_clear(xml: &str) -> Result<bool> {
 
 fn render_ntp_time_config_xml(current: &XmTimeConfig, policy: &XmSiteTimePolicy) -> String {
     format!(
-        "<TimeConfig TimeMode=\"NTP\" CurTime=\"{}\" TimeZone=\"{}\"><NTPConfig ServerIP=\"{}\" ServerPort=\"{}\" RefreshInterval=\"{}\" /><SummerTime enable=\"{}\" auto=\"{}\" offset=\"{}\"><start month=\"{}\" week=\"{}\" weekday=\"{}\" hour=\"{}\" /><end month=\"{}\" week=\"{}\" weekday=\"{}\" hour=\"{}\" /></SummerTime></TimeConfig>",
+        "<TimeConfig TimeMode=\"NTP\" CurTime=\"{}\" TimeZone=\"{}\"><NTPConfig ServerIP=\"{}\" ServerPort=\"{}\" RefreshInterval=\"{}\" /><SummerTime enable=\"0\" auto=\"0\" offset=\"0\"><start month=\"{}\" week=\"{}\" weekday=\"{}\" hour=\"{}\" /><end month=\"{}\" week=\"{}\" weekday=\"{}\" hour=\"{}\" /></SummerTime></TimeConfig>",
         xml_escape_attr(&policy.current_local_time),
         policy.timezone_code,
         xml_escape_attr(&policy.ntp_server),
         current.ntp_port,
         current.refresh_interval_secs,
-        if current.summer_time.enabled { 1 } else { 0 },
-        if current.summer_time.automatic { 1 } else { 0 },
-        current.summer_time.offset_minutes,
         current.summer_time.start.month,
         current.summer_time.start.week,
         current.summer_time.start.weekday,
@@ -743,15 +740,12 @@ fn render_ntp_time_config_xml(current: &XmTimeConfig, policy: &XmSiteTimePolicy)
 
 fn render_manual_time_config_xml(current: &XmTimeConfig, policy: &XmSiteTimePolicy) -> String {
     format!(
-        "<TimeConfig TimeMode=\"MANUAL\" CurTime=\"{}\" TimeZone=\"{}\"><NTPConfig ServerIP=\"{}\" ServerPort=\"{}\" RefreshInterval=\"{}\" /><SummerTime enable=\"{}\" auto=\"{}\" offset=\"{}\"><start month=\"{}\" week=\"{}\" weekday=\"{}\" hour=\"{}\" /><end month=\"{}\" week=\"{}\" weekday=\"{}\" hour=\"{}\" /></SummerTime></TimeConfig>",
+        "<TimeConfig TimeMode=\"MANUAL\" CurTime=\"{}\" TimeZone=\"{}\"><NTPConfig ServerIP=\"{}\" ServerPort=\"{}\" RefreshInterval=\"{}\" /><SummerTime enable=\"0\" auto=\"0\" offset=\"0\"><start month=\"{}\" week=\"{}\" weekday=\"{}\" hour=\"{}\" /><end month=\"{}\" week=\"{}\" weekday=\"{}\" hour=\"{}\" /></SummerTime></TimeConfig>",
         xml_escape_attr(&policy.current_local_time),
         policy.timezone_code,
         xml_escape_attr(&policy.ntp_server),
         current.ntp_port,
         current.refresh_interval_secs,
-        if current.summer_time.enabled { 1 } else { 0 },
-        if current.summer_time.automatic { 1 } else { 0 },
-        current.summer_time.offset_minutes,
         current.summer_time.start.month,
         current.summer_time.start.week,
         current.summer_time.start.weekday,
@@ -852,7 +846,7 @@ mod tests {
     }
 
     #[test]
-    fn render_ntp_time_config_xml_preserves_summer_shape() {
+    fn render_ntp_time_config_xml_clears_summer_offset_for_site_policy() {
         let current = parse_time_config(r#"<TimeConfig TimeMode="MANUAL" CurTime="2026-04-18 09:54:18" TimeZone="300"><NTPConfig ServerIP="192.168.0.2" ServerPort="123" RefreshInterval="60" /><SummerTime enable="1" auto="1" offset="60"><start month="3" week="3" weekday="0" hour="2" /><end month="11" week="2" weekday="0" hour="2" /></SummerTime></TimeConfig>"#).unwrap();
         let policy = XmSiteTimePolicy {
             ntp_server: "192.168.0.2".to_string(),
@@ -863,7 +857,7 @@ mod tests {
         assert!(rendered.contains(r#"TimeMode="NTP""#));
         assert!(rendered.contains(r#"ServerIP="192.168.0.2""#));
         assert!(rendered.contains(r#"TimeZone="300""#));
-        assert!(rendered.contains(r#"<SummerTime enable="1" auto="1" offset="60">"#));
+        assert!(rendered.contains(r#"<SummerTime enable="0" auto="0" offset="0">"#));
     }
 
     #[test]
@@ -877,5 +871,6 @@ mod tests {
         let rendered = render_manual_time_config_xml(&current, &policy);
         assert!(rendered.contains(r#"TimeMode="MANUAL""#));
         assert!(rendered.contains(r#"CurTime="2026-04-18 10:00:00""#));
+        assert!(rendered.contains(r#"<SummerTime enable="0" auto="0" offset="0">"#));
     }
 }

@@ -2,8 +2,10 @@ use crate::camera_device::registry::driver_is_xm;
 use crate::config::{CameraDeviceConfig, Config};
 use crate::media::{ffmpeg, planner, types::OutputCodec};
 use crate::recording::runtime::backoff_secs;
+use constitute_protocol::{LogCategory, LogOutcome, LogSeverity, LogSubjectRef};
 use rtp::packet::Packet as RtpPacket;
 use serde::Serialize;
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -276,12 +278,14 @@ async fn run_projection_worker(
         Ok(socket) => socket,
         Err(err) => {
             set_projection_error(&state, format!("udp bind failed: {err}")).await;
+            submit_projection_runtime_error(&camera, codec, "udp_bind_failed").await;
             warn!(source = %camera.source_id, error = %err, "media projection UDP bind failed");
             return;
         }
     };
     if let Err(err) = std_socket.set_nonblocking(true) {
         set_projection_error(&state, format!("udp nonblocking setup failed: {err}")).await;
+        submit_projection_runtime_error(&camera, codec, "udp_nonblocking_failed").await;
         warn!(source = %camera.source_id, error = %err, "media projection UDP nonblocking setup failed");
         return;
     }
@@ -289,6 +293,7 @@ async fn run_projection_worker(
         Ok(addr) => addr,
         Err(err) => {
             set_projection_error(&state, format!("udp local addr failed: {err}")).await;
+            submit_projection_runtime_error(&camera, codec, "udp_local_addr_failed").await;
             warn!(source = %camera.source_id, error = %err, "media projection UDP local addr failed");
             return;
         }
@@ -297,6 +302,7 @@ async fn run_projection_worker(
         Ok(socket) => socket,
         Err(err) => {
             set_projection_error(&state, format!("udp socket init failed: {err}")).await;
+            submit_projection_runtime_error(&camera, codec, "udp_socket_init_failed").await;
             warn!(source = %camera.source_id, error = %err, "media projection UDP socket init failed");
             return;
         }
@@ -327,14 +333,24 @@ async fn run_projection_worker(
             Err(err) => {
                 let backoff =
                     note_projection_backoff(&state, format!("ffmpeg start failed: {err}")).await;
+                submit_projection_backoff_event(
+                    &camera,
+                    codec,
+                    LogSeverity::Error,
+                    "projection_start_failed",
+                    "ffmpeg_start_failed",
+                    backoff,
+                    None,
+                )
+                .await;
                 warn!(
                     source = %camera.source_id,
                     codec = codec.label(),
                     error = %err,
-                    backoff_secs = backoff,
+                    backoff_secs = backoff.backoff_secs,
                     "media projection worker failed to start; will retry"
                 );
-                wait_or_stop(Duration::from_secs(backoff), &mut stop_rx).await;
+                wait_or_stop(Duration::from_secs(backoff.backoff_secs), &mut stop_rx).await;
                 continue;
             }
         };
@@ -368,12 +384,20 @@ async fn run_projection_worker(
                                 }
                             };
                             continuity.rewrite(&mut packet);
+                            let mut recovered_restart_attempt = None;
                             {
                                 let mut current = state.lock().await;
+                                if current.restart_attempt > 0 {
+                                    recovered_restart_attempt = Some(current.restart_attempt);
+                                }
                                 current.state = "ready".to_string();
                                 current.restart_attempt = 0;
                                 current.last_packet_timestamp = Some(crate::util::now_ms());
                                 current.last_error = None;
+                            }
+                            if let Some(restart_attempt) = recovered_restart_attempt {
+                                submit_projection_recovered_event(&camera, codec, restart_attempt)
+                                    .await;
                             }
                             let _ = sender.send(packet);
                         }
@@ -393,30 +417,90 @@ async fn run_projection_worker(
 
         match exit_reason {
             ProjectionExitReason::Stopped => break,
-            ProjectionExitReason::ChildExited(message)
-            | ProjectionExitReason::ChildWaitFailed(message)
-            | ProjectionExitReason::SocketRecvFailed(message) => {
+            ProjectionExitReason::ChildExited(message) => {
                 let backoff = note_projection_backoff(&state, message.clone()).await;
+                submit_projection_backoff_event(
+                    &camera,
+                    codec,
+                    LogSeverity::Warning,
+                    "projection_worker_restarting",
+                    "ffmpeg_exited",
+                    backoff,
+                    None,
+                )
+                .await;
                 warn!(
                     source = %camera.source_id,
                     codec = codec.label(),
                     message,
-                    backoff_secs = backoff,
+                    backoff_secs = backoff.backoff_secs,
                     "media projection worker exited; restarting"
                 );
-                wait_or_stop(Duration::from_secs(backoff), &mut stop_rx).await;
+                wait_or_stop(Duration::from_secs(backoff.backoff_secs), &mut stop_rx).await;
+            }
+            ProjectionExitReason::ChildWaitFailed(message) => {
+                let backoff = note_projection_backoff(&state, message.clone()).await;
+                submit_projection_backoff_event(
+                    &camera,
+                    codec,
+                    LogSeverity::Warning,
+                    "projection_worker_restarting",
+                    "ffmpeg_wait_failed",
+                    backoff,
+                    None,
+                )
+                .await;
+                warn!(
+                    source = %camera.source_id,
+                    codec = codec.label(),
+                    message,
+                    backoff_secs = backoff.backoff_secs,
+                    "media projection worker wait failed; restarting"
+                );
+                wait_or_stop(Duration::from_secs(backoff.backoff_secs), &mut stop_rx).await;
+            }
+            ProjectionExitReason::SocketRecvFailed(message) => {
+                let backoff = note_projection_backoff(&state, message.clone()).await;
+                submit_projection_backoff_event(
+                    &camera,
+                    codec,
+                    LogSeverity::Warning,
+                    "projection_worker_restarting",
+                    "socket_receive_failed",
+                    backoff,
+                    None,
+                )
+                .await;
+                warn!(
+                    source = %camera.source_id,
+                    codec = codec.label(),
+                    message,
+                    backoff_secs = backoff.backoff_secs,
+                    "media projection worker exited; restarting"
+                );
+                wait_or_stop(Duration::from_secs(backoff.backoff_secs), &mut stop_rx).await;
             }
             ProjectionExitReason::NoPackets(timeout_secs) => {
                 let message = format!("no RTP packets for {timeout_secs}s");
                 let backoff = note_projection_backoff(&state, message).await;
+                submit_projection_backoff_event(
+                    &camera,
+                    codec,
+                    LogSeverity::Warning,
+                    "projection_stalled",
+                    "no_rtp_packets",
+                    backoff,
+                    Some(timeout_secs),
+                )
+                .await;
                 warn!(
                     source = %camera.source_id,
                     codec = codec.label(),
                     idle_timeout_secs = timeout_secs,
-                    backoff_secs = backoff,
+                    backoff_secs = backoff.backoff_secs,
                     "media projection worker stalled; restarting"
                 );
-                wait_or_stop(Duration::from_secs(backoff), &mut stop_rx).await;
+                wait_or_stop(Duration::from_secs(backoff.backoff_secs), &mut stop_rx).await;
             }
         }
     }
@@ -441,12 +525,155 @@ async fn set_projection_error(state: &Arc<Mutex<ProjectionState>>, message: Stri
     current.last_error = Some(message);
 }
 
-async fn note_projection_backoff(state: &Arc<Mutex<ProjectionState>>, message: String) -> u64 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProjectionBackoff {
+    restart_attempt: u64,
+    backoff_secs: u64,
+}
+
+async fn note_projection_backoff(
+    state: &Arc<Mutex<ProjectionState>>,
+    message: String,
+) -> ProjectionBackoff {
     let mut current = state.lock().await;
     current.restart_attempt = current.restart_attempt.saturating_add(1);
     current.state = "backoff".to_string();
     current.last_error = Some(message);
-    backoff_secs(current.restart_attempt)
+    ProjectionBackoff {
+        restart_attempt: current.restart_attempt,
+        backoff_secs: backoff_secs(current.restart_attempt),
+    }
+}
+
+async fn submit_projection_runtime_error(
+    camera: &CameraDeviceConfig,
+    codec: ProjectionCodec,
+    event_type: &str,
+) {
+    submit_projection_event(
+        camera,
+        LogSeverity::Error,
+        LogOutcome::Failed,
+        "projection_runtime_error",
+        projection_safe_facts(
+            camera,
+            codec,
+            event_type,
+            None,
+            None,
+            None,
+            false,
+            "operator_repair_required",
+        ),
+    )
+    .await;
+}
+
+async fn submit_projection_backoff_event(
+    camera: &CameraDeviceConfig,
+    codec: ProjectionCodec,
+    severity: LogSeverity,
+    event_tag: &str,
+    event_type: &str,
+    backoff: ProjectionBackoff,
+    idle_timeout_secs: Option<u64>,
+) {
+    submit_projection_event(
+        camera,
+        severity,
+        LogOutcome::Degraded,
+        event_tag,
+        projection_safe_facts(
+            camera,
+            codec,
+            event_type,
+            Some(backoff.restart_attempt),
+            Some(backoff.backoff_secs),
+            idle_timeout_secs,
+            true,
+            "projection_worker_restart_scheduled",
+        ),
+    )
+    .await;
+}
+
+async fn submit_projection_recovered_event(
+    camera: &CameraDeviceConfig,
+    codec: ProjectionCodec,
+    restart_attempt: u64,
+) {
+    submit_projection_event(
+        camera,
+        LogSeverity::Info,
+        LogOutcome::Recovered,
+        "projection_recovered",
+        projection_safe_facts(
+            camera,
+            codec,
+            "rtp_packets_resumed",
+            Some(restart_attempt),
+            None,
+            None,
+            false,
+            "projection_worker_receiving_packets",
+        ),
+    )
+    .await;
+}
+
+async fn submit_projection_event(
+    camera: &CameraDeviceConfig,
+    severity: LogSeverity,
+    outcome: LogOutcome,
+    event_tag: &str,
+    safe_facts: Value,
+) {
+    crate::logging_surface::submit_safe_event(
+        "media_projection",
+        LogCategory::MediaProjection,
+        severity,
+        outcome,
+        LogSubjectRef {
+            kind: "cameraDevice".to_string(),
+            id: Some(camera.source_id.clone()),
+            display: Some(camera.name.clone()),
+        },
+        &["nvr", "media_projection", event_tag],
+        safe_facts,
+    )
+    .await;
+}
+
+fn projection_safe_facts(
+    camera: &CameraDeviceConfig,
+    codec: ProjectionCodec,
+    event_type: &str,
+    restart_attempt: Option<u64>,
+    backoff_secs: Option<u64>,
+    idle_timeout_secs: Option<u64>,
+    repair_needed: bool,
+    mitigation: &str,
+) -> Value {
+    let mut facts = Map::new();
+    facts.insert("eventType".to_string(), json!(event_type));
+    facts.insert("sourceId".to_string(), json!(camera.source_id.as_str()));
+    facts.insert("cameraName".to_string(), json!(camera.name.as_str()));
+    facts.insert("driverId".to_string(), json!(camera.driver_id.as_str()));
+    facts.insert("vendor".to_string(), json!(camera.vendor.as_str()));
+    facts.insert("codec".to_string(), json!(codec.label()));
+    facts.insert("selectedStream".to_string(), json!("preview"));
+    facts.insert("repairNeeded".to_string(), json!(repair_needed));
+    facts.insert("mitigation".to_string(), json!(mitigation));
+    if let Some(restart_attempt) = restart_attempt {
+        facts.insert("restartAttempt".to_string(), json!(restart_attempt));
+    }
+    if let Some(backoff_secs) = backoff_secs {
+        facts.insert("backoffSecs".to_string(), json!(backoff_secs));
+    }
+    if let Some(idle_timeout_secs) = idle_timeout_secs {
+        facts.insert("idleTimeoutSecs".to_string(), json!(idle_timeout_secs));
+    }
+    Value::Object(facts)
 }
 
 fn projection_no_packet_timeout_secs() -> u64 {
@@ -569,6 +796,36 @@ mod tests {
     #[test]
     fn projection_no_packet_timeout_stays_short() {
         assert_eq!(projection_no_packet_timeout_secs(), 8);
+    }
+
+    #[test]
+    fn projection_logging_safe_facts_omit_credential_material() {
+        let mut camera = test_camera("reolink-carport", "reolink_e1_outdoor_se");
+        camera.name = "Carport".to_string();
+        camera.vendor = "Reolink".to_string();
+        camera.username = "admin".to_string();
+        camera.password = "supersecret".to_string();
+        camera.rtsp_url = "rtsp://admin:supersecret@192.168.42.50/h264Preview_01_sub".to_string();
+
+        let facts = projection_safe_facts(
+            &camera,
+            ProjectionCodec::H264,
+            "no_rtp_packets",
+            Some(3),
+            Some(8),
+            Some(8),
+            true,
+            "projection_worker_restart_scheduled",
+        );
+        let rendered = serde_json::to_string(&facts).expect("safe facts should serialize");
+
+        assert!(!rendered.contains("rtsp://"));
+        assert!(!rendered.contains("supersecret"));
+        assert!(!rendered.contains("h264Preview"));
+        assert_eq!(facts["selectedStream"], "preview");
+        assert_eq!(facts["restartAttempt"], 3);
+        assert_eq!(facts["backoffSecs"], 8);
+        assert_eq!(facts["idleTimeoutSecs"], 8);
     }
 
     #[test]

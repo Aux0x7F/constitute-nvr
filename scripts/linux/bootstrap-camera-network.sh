@@ -410,15 +410,66 @@ EOF
   run_sudo systemctl restart dnsmasq >/dev/null
 }
 
+chrony_allow_networks() {
+  {
+    printf '%s\n' "$CAMERA_CIDR"
+    ip -4 -o addr show dev "$CAMERA_IFACE" scope global 2>/dev/null | awk '{ print $4 }'
+    for alias in "${ONBOARDING_ALIASES[@]}"; do
+      ALIAS_CIDR="$alias" python3 - <<'PY'
+import ipaddress
+import os
+import sys
+
+value = os.environ.get("ALIAS_CIDR", "").strip()
+if not value:
+    sys.exit(0)
+try:
+    print(ipaddress.ip_interface(value).network)
+except ValueError:
+    try:
+        print(ipaddress.ip_network(value, strict=False))
+    except ValueError:
+        print(f"invalid onboarding alias CIDR: {value}", file=sys.stderr)
+        sys.exit(1)
+PY
+    done
+  } | python3 -c '
+import ipaddress
+import sys
+
+seen = set()
+for raw in sys.stdin:
+    value = raw.strip()
+    if not value:
+        continue
+    try:
+        network = ipaddress.ip_interface(value).network
+    except ValueError:
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            print(f"invalid camera network CIDR: {value}", file=sys.stderr)
+            sys.exit(1)
+    normalized = str(network)
+    if normalized not in seen:
+        seen.add(normalized)
+        print(normalized)
+'
+}
+
 write_chrony_config() {
   detect_chrony_dropin
   ensure_chrony_dropin_loaded
   run_sudo mkdir -p "$(dirname "$CHRONY_DROPIN")"
-  cat <<EOF | run_sudo tee "$CHRONY_DROPIN" >/dev/null
+  {
+    cat <<EOF
 # Managed by constitute-nvr camera bootstrap.
-allow ${CAMERA_CIDR}
+EOF
+    chrony_allow_networks | awk '{ print "allow " $0 }'
+    cat <<EOF
 local stratum 10
 EOF
+  } | run_sudo tee "$CHRONY_DROPIN" >/dev/null
   restart_chrony
 }
 

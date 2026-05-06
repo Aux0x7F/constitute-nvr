@@ -53,6 +53,9 @@ This file stays at operator/compatibility-summary level.
     - baked feed title is controlled by `TitleOverlay.TitleUtf8`
     - site time is controlled by `/setTimeConfig` with manual seed -> NTP transition
     - the effective NTP alias for this camera is `192.168.0.2`
+    - `camera_network.ntp_server` is the site-time policy value; the driver resolves a reachable per-camera endpoint such as the onboarding alias
+    - host NTP serving and camera-NIC firewall ingress must allow both the managed camera subnet and onboarding alias subnets assigned to the camera NIC
+    - the driver must clear stale XM `SummerTime` offset state while applying Phoenix/site time, because feed-clock truth can diverge from the normalized `TimeConfig` summary
     - a second XM `UserOverlay` lane can leak stale text into the lower-left corner; the active driver now clears that lane on apply so the feed only shows the main title and clock
     - service-side reconcile is expected to reassert baked title and site NTP/time settings after reboot-driven drift when the camera is reachable again
 - PTZ is not supported on this model
