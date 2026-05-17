@@ -22,7 +22,9 @@ use constitute_protocol::validate_resolved_member_ref;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
+use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use tokio::sync::{Mutex, watch};
 use tokio::time::{Duration, timeout};
@@ -32,7 +34,8 @@ use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_VP8, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::ice::mdns::MulticastDnsMode;
 use webrtc::ice::network_type::NetworkType;
-use webrtc::ice::udp_network::{EphemeralUDP, UDPNetwork};
+use webrtc::ice::udp_mux::{UDPMux, UDPMuxDefault, UDPMuxParams};
+use webrtc::ice::udp_network::UDPNetwork;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -155,6 +158,11 @@ fn push_unique_ice_candidate(into: &mut Vec<RTCIceCandidateInit>, candidate: &RT
 
 type ValidatedStreamAuthority = StreamAuthorityClaims;
 
+struct PreviewUdpMux {
+    network: UDPNetwork,
+    local_addr: SocketAddr,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreviewCodec {
     H264,
@@ -203,6 +211,11 @@ pub struct PreviewTransportObservationEvent {
     pub participant_role: String,
     pub state: String,
     pub connection_state: String,
+    pub ice_connection_state: Option<String>,
+    pub selected_pair_state: Option<String>,
+    pub inbound_rtp_state: Option<String>,
+    pub render_state: Option<String>,
+    pub blocked_reason: Option<String>,
     pub reason: Option<String>,
     pub source_ids: Vec<String>,
     pub grace_ms: Option<u64>,
@@ -399,6 +412,7 @@ impl PreviewManager {
             let source_ids = event_source_ids.clone();
             Box::pin(async move {
                 *state_ref.lock().await = state;
+                let reason = media_observation_reason_for_peer_state(state).map(str::to_string);
                 let _ = transport_events.send(PreviewTransportObservationEvent {
                     path_id: path_id.clone(),
                     session_id: session_id.clone(),
@@ -409,7 +423,12 @@ impl PreviewManager {
                     participant_role: "service".to_string(),
                     state: media_observation_state_for_peer_state(state).to_string(),
                     connection_state: peer_connection_state_label(state).to_string(),
-                    reason: media_observation_reason_for_peer_state(state).map(str::to_string),
+                    ice_connection_state: None,
+                    selected_pair_state: selected_pair_state_for_peer_state(state).map(str::to_string),
+                    inbound_rtp_state: None,
+                    render_state: None,
+                    blocked_reason: reason.clone(),
+                    reason,
                     source_ids: source_ids.clone(),
                     grace_ms: matches!(state, RTCPeerConnectionState::Disconnected)
                         .then_some(DISCONNECTED_RELEASE_GRACE_MS),
@@ -440,6 +459,11 @@ impl PreviewManager {
                                         participant_role: "service".to_string(),
                                         state: "released".to_string(),
                                         connection_state: "disconnected".to_string(),
+                                        ice_connection_state: None,
+                                        selected_pair_state: Some("none".to_string()),
+                                        inbound_rtp_state: None,
+                                        render_state: None,
+                                        blocked_reason: Some("disconnectedGraceExpired".to_string()),
                                         reason: Some("disconnectedGraceExpired".to_string()),
                                         source_ids,
                                         grace_ms: Some(DISCONNECTED_RELEASE_GRACE_MS),
@@ -735,11 +759,14 @@ pub fn resolve_control_camera(
 
 fn build_setting_engine(cfg: &LivePreviewConfig, camera_iface: &str) -> Result<SettingEngine> {
     let mut setting_engine = SettingEngine::default();
-    let udp_network = UDPNetwork::Ephemeral(
-        EphemeralUDP::new(cfg.udp_port_min, cfg.udp_port_max)
-            .map_err(|err| anyhow!("invalid live preview udp port range: {err}"))?,
+    let preview_mux = bind_preview_udp_mux(cfg)?;
+    info!(
+        port = preview_mux.local_addr.port(),
+        configured_min = cfg.udp_port_min,
+        configured_max = cfg.udp_port_max,
+        "live preview media transport mux bound"
     );
-    setting_engine.set_udp_network(udp_network);
+    setting_engine.set_udp_network(preview_mux.network);
     setting_engine.set_lite(true);
     setting_engine.set_network_types(vec![NetworkType::Udp4]);
     let blocked_iface = camera_iface.trim().to_string();
@@ -748,6 +775,52 @@ fn build_setting_engine(cfg: &LivePreviewConfig, camera_iface: &str) -> Result<S
         !trimmed.eq_ignore_ascii_case("lo") && trimmed != blocked_iface
     }));
     Ok(setting_engine)
+}
+
+fn bind_preview_udp_mux(cfg: &LivePreviewConfig) -> Result<PreviewUdpMux> {
+    if cfg.udp_port_max < cfg.udp_port_min {
+        return Err(anyhow!(
+            "invalid live preview udp port range: {}-{}",
+            cfg.udp_port_min,
+            cfg.udp_port_max
+        ));
+    }
+
+    let mut last_err = None;
+    for port in cfg.udp_port_min..=cfg.udp_port_max {
+        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+        match StdUdpSocket::bind(bind_addr) {
+            Ok(socket) => {
+                socket
+                    .set_nonblocking(true)
+                    .context("live preview udp mux socket nonblocking")?;
+                let socket = UdpSocket::from_std(socket)
+                    .context("live preview udp mux socket adoption")?;
+                let local_addr = socket
+                    .local_addr()
+                    .context("live preview udp mux local address")?;
+                let mux = UDPMuxDefault::new(UDPMuxParams::new(socket));
+                let mux = mux as Arc<dyn UDPMux + Send + Sync>;
+                return Ok(PreviewUdpMux {
+                    network: UDPNetwork::Muxed(mux),
+                    local_addr,
+                });
+            }
+            Err(err) => {
+                last_err = Some(err);
+            }
+        }
+    }
+
+    let detail = last_err
+        .map(|err| err.to_string())
+        .unwrap_or_else(|| "no ports attempted".to_string());
+    Err(anyhow!(
+        "no live preview udp mux port available in {}-{}: {}",
+        cfg.udp_port_min,
+        cfg.udp_port_max,
+        detail
+    ))
 }
 
 fn build_rtc_configuration(_hints: &ManagedIceServerHints) -> RTCConfiguration {
@@ -1054,6 +1127,18 @@ fn media_observation_reason_for_peer_state(state: RTCPeerConnectionState) -> Opt
         RTCPeerConnectionState::Failed => Some("peerConnectionFailed"),
         RTCPeerConnectionState::Closed => Some("peerConnectionClosed"),
         _ => None,
+    }
+}
+
+fn selected_pair_state_for_peer_state(state: RTCPeerConnectionState) -> Option<&'static str> {
+    match state {
+        RTCPeerConnectionState::Unspecified => None,
+        RTCPeerConnectionState::New | RTCPeerConnectionState::Connecting => Some("pending"),
+        RTCPeerConnectionState::Connected | RTCPeerConnectionState::Disconnected => {
+            Some("selected")
+        }
+        RTCPeerConnectionState::Failed => Some("failed"),
+        RTCPeerConnectionState::Closed => Some("none"),
     }
 }
 
@@ -1438,6 +1523,68 @@ mod tests {
             &["cam-2".to_string()]
         ));
         assert_eq!(max_preview_sessions(&cfg), 8);
+    }
+
+    #[tokio::test]
+    async fn live_preview_udp_mux_binds_one_owned_transport_port() {
+        let mut cfg = sample_config();
+        cfg.live_preview.udp_port_min = 0;
+        cfg.live_preview.udp_port_max = 0;
+
+        let mux = bind_preview_udp_mux(&cfg.live_preview).expect("preview udp mux");
+        assert!(mux.local_addr.port() > 0);
+        match mux.network {
+            UDPNetwork::Muxed(udp_mux) => {
+                udp_mux.close().await.expect("close mux");
+            }
+            UDPNetwork::Ephemeral(_) => panic!("preview should use muxed media transport"),
+        }
+    }
+
+    #[tokio::test]
+    async fn live_preview_udp_mux_skips_busy_port_in_range() {
+        let busy = StdUdpSocket::bind("0.0.0.0:0").expect("busy socket");
+        let busy_port = busy.local_addr().expect("busy addr").port();
+        let mut cfg = sample_config();
+        cfg.live_preview.udp_port_min = busy_port;
+        cfg.live_preview.udp_port_max = busy_port + 1;
+
+        let mux = bind_preview_udp_mux(&cfg.live_preview).expect("preview udp mux");
+        assert_eq!(mux.local_addr.port(), busy_port + 1);
+        match mux.network {
+            UDPNetwork::Muxed(udp_mux) => {
+                udp_mux.close().await.expect("close mux");
+            }
+            UDPNetwork::Ephemeral(_) => panic!("preview should use muxed media transport"),
+        }
+    }
+
+    #[test]
+    fn peer_state_maps_to_media_transport_witness_posture() {
+        assert_eq!(
+            selected_pair_state_for_peer_state(RTCPeerConnectionState::New),
+            Some("pending")
+        );
+        assert_eq!(
+            selected_pair_state_for_peer_state(RTCPeerConnectionState::Connecting),
+            Some("pending")
+        );
+        assert_eq!(
+            selected_pair_state_for_peer_state(RTCPeerConnectionState::Connected),
+            Some("selected")
+        );
+        assert_eq!(
+            selected_pair_state_for_peer_state(RTCPeerConnectionState::Disconnected),
+            Some("selected")
+        );
+        assert_eq!(
+            selected_pair_state_for_peer_state(RTCPeerConnectionState::Failed),
+            Some("failed")
+        );
+        assert_eq!(
+            selected_pair_state_for_peer_state(RTCPeerConnectionState::Closed),
+            Some("none")
+        );
     }
 
     #[test]
