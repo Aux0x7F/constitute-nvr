@@ -2,7 +2,10 @@ use crate::camera_device::registry::driver_is_xm;
 use crate::config::{CameraDeviceConfig, Config};
 use crate::media::{ffmpeg, planner, types::OutputCodec};
 use crate::recording::runtime::backoff_secs;
-use constitute_protocol::{LogCategory, LogOutcome, LogSeverity, LogSubjectRef};
+use constitute_protocol::{
+    LogCategory, LogOutcome, LogSeverity, LogSubjectRef, StreamSessionHealth,
+    validate_stream_session_health,
+};
 use rtp::packet::Packet as RtpPacket;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -60,6 +63,44 @@ pub struct MediaProjectionSourceHealth {
 pub struct MediaProjectionHealth {
     pub state: String,
     pub sources: Vec<MediaProjectionSourceHealth>,
+}
+
+pub fn stream_session_health_records(
+    service_pk: &str,
+    health: &MediaProjectionHealth,
+    issued_at: u64,
+) -> Vec<StreamSessionHealth> {
+    health
+        .sources
+        .iter()
+        .filter_map(|source| {
+            let record = StreamSessionHealth {
+                health_id: format!(
+                    "nvr-media-projection-{}-{}-{issued_at}",
+                    record_token(&source.source_id),
+                    record_token(&source.codec)
+                ),
+                session_id: format!("nvr-preview-source-{}", record_token(&source.source_id)),
+                status: source.state.clone(),
+                recovery: json!({
+                    "serviceRef": service_ref(service_pk),
+                    "sourceId": source.source_id,
+                    "policy": source.policy,
+                    "codec": source.codec,
+                    "selectedStream": source.selected_stream,
+                    "subscriberCount": source.subscriber_count,
+                    "restartAttempt": source.restart_attempt,
+                    "lastPacketTimestamp": source.last_packet_timestamp,
+                    "lastErrorPresent": source.last_error.is_some(),
+                    "repairNeeded": matches!(source.state.as_str(), "error" | "backoff"),
+                    "warmedAt": source.warmed_at,
+                }),
+                issued_at,
+            };
+            validate_stream_session_health(&record).ok()?;
+            Some(record)
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -129,6 +170,37 @@ impl MediaProjectionRuntime {
         }
     }
 
+    pub async fn refresh_camera_projection(
+        &self,
+        previous_source_id: &str,
+        camera: CameraDeviceConfig,
+    ) {
+        let codec = preferred_projection_codec(&camera);
+        let stale = {
+            let handles = self.inner.lock().await;
+            handles
+                .keys()
+                .filter(|key| {
+                    projection_key_matches_camera_refresh(
+                        key,
+                        previous_source_id,
+                        &camera.source_id,
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        if !stale.is_empty() {
+            let mut handles = self.inner.lock().await;
+            for key in stale {
+                if let Some(handle) = handles.remove(&key) {
+                    let _ = handle.stop.send(true);
+                }
+            }
+        }
+        self.ensure_projection(camera, codec).await;
+    }
+
     async fn ensure_projection(
         &self,
         camera: CameraDeviceConfig,
@@ -146,7 +218,7 @@ impl MediaProjectionRuntime {
         let handle = Arc::new(ProjectionHandle {
             key: key.clone(),
             sender: sender.clone(),
-            _stop: stop_tx,
+            stop: stop_tx,
             state: Arc::clone(&state),
         });
         handles.insert(key.clone(), Arc::clone(&handle));
@@ -185,7 +257,7 @@ impl ProjectionKey {
 struct ProjectionHandle {
     key: ProjectionKey,
     sender: broadcast::Sender<RtpPacket>,
-    _stop: watch::Sender<bool>,
+    stop: watch::Sender<bool>,
     state: Arc<Mutex<ProjectionState>>,
 }
 
@@ -264,6 +336,41 @@ fn aggregate_projection_state(sources: &[MediaProjectionSourceHealth]) -> String
         return "warming".to_string();
     }
     "ready".to_string()
+}
+
+fn record_token(value: &str) -> String {
+    let token = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    token.trim_matches('-').to_string()
+}
+
+fn service_ref(service_pk: &str) -> String {
+    let service_pk = service_pk.trim();
+    if service_pk.is_empty() {
+        "service:nvr".to_string()
+    } else {
+        format!("service:{service_pk}")
+    }
+}
+
+fn projection_key_matches_camera_refresh(
+    key: &ProjectionKey,
+    previous_source_id: &str,
+    current_source_id: &str,
+) -> bool {
+    let previous = previous_source_id.trim();
+    let current = current_source_id.trim();
+    (!previous.is_empty() && key.source_id == previous)
+        || (!current.is_empty() && key.source_id == current)
 }
 
 async fn run_projection_worker(
@@ -794,8 +901,60 @@ mod tests {
     }
 
     #[test]
+    fn media_projection_status_records_validate_without_sensitive_details() {
+        let health = MediaProjectionHealth {
+            state: "degraded".to_string(),
+            sources: vec![MediaProjectionSourceHealth {
+                source_id: "cam/one".to_string(),
+                state: "backoff".to_string(),
+                policy: "preview-projection".to_string(),
+                codec: "h264".to_string(),
+                selected_stream: "preview".to_string(),
+                subscriber_count: 0,
+                restart_attempt: 2,
+                last_packet_timestamp: None,
+                last_error: Some(
+                    "rtsp://admin:secret@192.0.2.10/private stream failed".to_string(),
+                ),
+                warmed_at: Some(1_700_000_000),
+            }],
+        };
+
+        let records = stream_session_health_records("service-pk", &health, 1_700_000_001);
+
+        assert_eq!(records.len(), 1);
+        validate_stream_session_health(&records[0]).expect("valid health record");
+        assert_eq!(records[0].session_id, "nvr-preview-source-cam-one");
+        let rendered = serde_json::to_string(&records[0]).expect("json");
+        assert!(!rendered.contains("rtsp://"));
+        assert!(!rendered.contains("secret"));
+        assert!(rendered.contains("lastErrorPresent"));
+    }
+
+    #[test]
     fn projection_no_packet_timeout_stays_short() {
         assert_eq!(projection_no_packet_timeout_secs(), 8);
+    }
+
+    #[test]
+    fn projection_refresh_matches_previous_or_current_source() {
+        let key = ProjectionKey::new("reolink-ec-71-db-32-0a-8f", ProjectionCodec::H264);
+
+        assert!(projection_key_matches_camera_refresh(
+            &key,
+            "reolink-192-168-250-97",
+            "reolink-ec-71-db-32-0a-8f"
+        ));
+        assert!(projection_key_matches_camera_refresh(
+            &key,
+            "reolink-ec-71-db-32-0a-8f",
+            "reolink-ec-71-db-32-0a-8f"
+        ));
+        assert!(!projection_key_matches_camera_refresh(
+            &key,
+            "xm-192-168-0-201",
+            "xm-192-168-0-201"
+        ));
     }
 
     #[test]

@@ -26,9 +26,9 @@ EXTERNAL_UPDATE_SCRIPT=""
 EXTERNAL_CONFIG_TEMPLATE=""
 
 IDENTITY_ID=""
-PUBLIC_WS_URL=""
+SWARM_EDGE_ENDPOINT=""
 SWARM_PEERS=()
-ALLOW_UNSIGNED_DEBUG_HELLO=1
+HELLO_PROOF_MODE="signed"
 AUTHORIZED_DEVICE_PKS=()
 ZONE_KEYS=()
 PAIR_IDENTITY=""
@@ -81,9 +81,9 @@ Options:
   --authorized-device-pk <pk> Add authorized identity device pk (repeatable)
   --zone-key <key>           Join zone key for swarm announcements (repeatable)
   --swarm-peer <host:port>   Gateway swarm UDP peer endpoint (repeatable)
-  --public-ws-url <url>      Public websocket URL for /session
-  --allow-unsigned-debug-hello Allow unsigned local debug hello proof mode (default)
-  --require-signed-hello     Require signed hello proof
+  --swarm-edge-endpoint <endpoint> Gateway swarm edge WebSocket endpoint
+  --allow-unsigned-debug-hello Explicitly enable unsigned local debug hello proof mode
+  --require-signed-hello     Require signed hello proof (default)
   --pair-identity <label>    Pairing identity label for auto-associate
   --pair-code <code>         Pairing enrollment code
   --pair-code-hash <hash>    Pairing enrollment code hash (base64url)
@@ -323,16 +323,16 @@ while [[ $# -gt 0 ]]; do
       SWARM_PEERS+=("${2:?missing value for --swarm-peer}")
       shift 2
       ;;
-    --public-ws-url)
-      PUBLIC_WS_URL="${2:?missing value for --public-ws-url}"
+    --swarm-edge-endpoint)
+      SWARM_EDGE_ENDPOINT="${2:?missing value for --swarm-edge-endpoint}"
       shift 2
       ;;
     --allow-unsigned-debug-hello)
-      ALLOW_UNSIGNED_DEBUG_HELLO=1
+      HELLO_PROOF_MODE="operator_debug_unsigned"
       shift
       ;;
     --require-signed-hello)
-      ALLOW_UNSIGNED_DEBUG_HELLO=0
+      HELLO_PROOF_MODE="signed"
       shift
       ;;
     --pair-identity)
@@ -424,8 +424,8 @@ if [[ "$NON_INTERACTIVE" -eq 0 ]]; then
     fi
   fi
 
-  if [[ -z "$PUBLIC_WS_URL" ]]; then
-    read -r -p "Public websocket URL (optional, example ws://host:8456/session): " PUBLIC_WS_URL
+  if [[ -z "$SWARM_EDGE_ENDPOINT" ]]; then
+    read -r -p "Gateway swarm edge endpoint (optional, example ws://host:7448): " SWARM_EDGE_ENDPOINT
   fi
 fi
 
@@ -717,9 +717,9 @@ run_sudo env \
   CFG_UPDATE_SCRIPT="${SELF_UPDATE_BIN}" \
   CFG_UPDATE_BUILD_USER="${UPDATE_BUILD_USER}" \
   CFG_IDENTITY_ID="${IDENTITY_ID}" \
-  CFG_PUBLIC_WS_URL="${PUBLIC_WS_URL}" \
+  CFG_SWARM_EDGE_ENDPOINT="${SWARM_EDGE_ENDPOINT}" \
   CFG_SWARM_PEERS="${swarm_peers_joined}" \
-  CFG_ALLOW_UNSIGNED_DEBUG_HELLO="${ALLOW_UNSIGNED_DEBUG_HELLO}" \
+  CFG_HELLO_PROOF_MODE="${HELLO_PROOF_MODE}" \
   CFG_AUTHORIZED_DEVICE_PKS="${authorized_joined}" \
   CFG_ZONE_KEYS="${zone_keys_joined}" \
   CFG_PAIR_IDENTITY="${PAIR_IDENTITY}" \
@@ -757,9 +757,10 @@ ref = os.environ.get('CFG_REF', '').strip()
 update_script = os.environ.get('CFG_UPDATE_SCRIPT', '').strip()
 update_build_user = os.environ.get('CFG_UPDATE_BUILD_USER', '').strip()
 identity_id = os.environ.get('CFG_IDENTITY_ID', '').strip()
-public_ws_url = os.environ.get('CFG_PUBLIC_WS_URL', '').strip()
+swarm_edge_endpoint = os.environ.get('CFG_SWARM_EDGE_ENDPOINT', '').strip()
 swarm_peers = [x.strip() for x in os.environ.get('CFG_SWARM_PEERS', '').split('|') if x.strip()]
-allow_unsigned = os.environ.get('CFG_ALLOW_UNSIGNED_DEBUG_HELLO', '1').strip() == '1'
+hello_proof_mode = os.environ.get('CFG_HELLO_PROOF_MODE', 'signed').strip()
+allow_unsigned = hello_proof_mode == 'operator_debug_unsigned'
 authorized = [x.strip() for x in os.environ.get('CFG_AUTHORIZED_DEVICE_PKS', '').split('|') if x.strip()]
 zone_keys = [x.strip() for x in os.environ.get('CFG_ZONE_KEYS', '').split('|') if x.strip()]
 pair_identity = os.environ.get('CFG_PAIR_IDENTITY', '').strip()
@@ -806,8 +807,8 @@ raw['update']['build_user'] = update_build_user
 api = raw.setdefault('api', {})
 api['identity_id'] = identity_id
 api['allow_unsigned_debug_hello'] = allow_unsigned
-if public_ws_url:
-    raw['api']['public_ws_url'] = public_ws_url
+if swarm_edge_endpoint:
+    raw.setdefault('gateway', {})['edge_stream_endpoint'] = swarm_edge_endpoint
 if authorized:
     raw['api']['authorized_device_pks'] = sorted(set(authorized))
 

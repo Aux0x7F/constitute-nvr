@@ -1,3 +1,14 @@
+//! Managed preview runtime.
+//!
+//! `Managed*Request` values are internal service requests assembled by
+//! `swarm_edge` only after `open_envelope` succeeds. This module must not read
+//! service-edge sealed frame payloads directly.
+
+use super::stream_records::{
+    StreamSessionExchangeRecords, StreamSessionOfferRecords, browser_webrtc_path_id,
+    parse_candidate_endpoint, session_id_for_claims, stream_session_records_for_answer,
+    stream_session_records_for_offer,
+};
 use crate::camera_device::registry::driver_is_xm;
 use crate::config::{CameraDeviceConfig, Config, LivePreviewConfig};
 use crate::media::planner;
@@ -7,16 +18,14 @@ use crate::media_projection::{
     MediaProjectionRuntime, MediaProjectionSubscription, ProjectionCodec,
 };
 use anyhow::{Context, Result, anyhow};
-use constitute_protocol::{
-    CAAC_KIND_SERVICE_ACCESS_INVOCATION, CaacEnvelope, ReplayCache, ServiceAccessCapabilityClaims,
-    open_envelope,
-};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use constitute_protocol::validate_resolved_member_ref;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::{Mutex, watch};
+use tokio::time::{Duration, timeout};
 use tracing::{info, warn};
 use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_VP8, MediaEngine};
@@ -25,7 +34,6 @@ use webrtc::ice::mdns::MulticastDnsMode;
 use webrtc::ice::network_type::NetworkType;
 use webrtc::ice::udp_network::{EphemeralUDP, UDPNetwork};
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
-use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -38,19 +46,43 @@ use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::TrackLocalWriter;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 
+const ANSWER_GATHER_WAIT_MS: u64 = 750;
+const DISCONNECTED_RELEASE_GRACE_MS: u64 = 12_000;
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ManagedIceServerHints {
     #[serde(default)]
+    #[allow(dead_code)]
     pub stun: Vec<String>,
     #[allow(dead_code)]
     #[serde(default)]
     pub turn: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamAuthorityClaims {
+    pub capability_id: String,
+    pub gateway_pk: String,
+    pub service_pk: String,
+    pub service: String,
+    pub identity_id: String,
+    pub device_pk: String,
+    pub capability: String,
+    #[serde(default)]
+    pub owner: bool,
+    #[serde(default)]
+    pub view_sources: Vec<String>,
+    #[serde(default)]
+    pub control_sources: Vec<String>,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub nonce: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManagedOfferRequest {
-    #[serde(rename = "serviceCapability")]
-    pub service_capability: String,
+    pub authority: StreamAuthorityClaims,
     pub offer: Value,
     #[serde(rename = "iceServers", default)]
     pub ice_servers: ManagedIceServerHints,
@@ -59,39 +91,30 @@ pub struct ManagedOfferRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SealedServiceAccessRequest {
-    pub service_request_envelope: CaacEnvelope,
+pub struct ManagedCloseRequest {
+    pub authority: StreamAuthorityClaims,
+    #[serde(rename = "sessionId", default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub payload: Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ManagedCloseRequest {
-    #[serde(rename = "serviceCapability")]
-    pub service_capability: String,
+pub struct ManagedCandidateRequest {
+    pub authority: StreamAuthorityClaims,
     #[serde(default)]
     pub payload: Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManagedControlRequest {
-    #[serde(rename = "serviceCapability")]
-    pub service_capability: String,
+    pub authority: StreamAuthorityClaims,
     #[serde(default)]
     pub payload: Value,
     #[serde(rename = "controlLease", default)]
     pub control_lease: Value,
     #[serde(default)]
     pub preempted: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ManagedAdminRequest {
-    #[serde(rename = "serviceCapability")]
-    pub service_capability: String,
-    #[serde(default)]
-    pub action: String,
-    #[serde(default)]
-    pub payload: Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,6 +136,8 @@ pub struct ManagedOfferResponse {
     pub sources: Vec<ManagedSourceInfo>,
     #[serde(default)]
     pub candidates: Vec<RTCIceCandidateInit>,
+    #[serde(rename = "streamSession", skip_serializing_if = "Option::is_none")]
+    pub stream_session: Option<StreamSessionExchangeRecords>,
 }
 
 fn push_unique_ice_candidate(into: &mut Vec<RTCIceCandidateInit>, candidate: &RTCIceCandidateInit) {
@@ -128,7 +153,7 @@ fn push_unique_ice_candidate(into: &mut Vec<RTCIceCandidateInit>, candidate: &RT
     into.push(candidate.clone());
 }
 
-type ServiceAccessTokenPayload = ServiceAccessCapabilityClaims;
+type ValidatedStreamAuthority = StreamAuthorityClaims;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreviewCodec {
@@ -159,16 +184,40 @@ impl PreviewCodec {
 #[derive(Debug)]
 struct PreviewSessionHandle {
     session_id: String,
+    requester_ref: String,
     source_ids: Vec<String>,
+    created_at: u64,
+    expires_at: u64,
     peer_connection: Arc<RTCPeerConnection>,
     stops: Vec<watch::Sender<bool>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreviewTransportObservationEvent {
+    pub path_id: String,
+    pub session_id: String,
+    pub activation_id: String,
+    pub route_promise_id: String,
+    pub requester_ref: String,
+    pub participant_ref: String,
+    pub participant_role: String,
+    pub state: String,
+    pub connection_state: String,
+    pub reason: Option<String>,
+    pub source_ids: Vec<String>,
+    pub grace_ms: Option<u64>,
+    pub observed_at: u64,
+    pub expires_at: Option<u64>,
 }
 
 impl Clone for PreviewSessionHandle {
     fn clone(&self) -> Self {
         Self {
             session_id: self.session_id.clone(),
+            requester_ref: self.requester_ref.clone(),
             source_ids: self.source_ids.clone(),
+            created_at: self.created_at,
+            expires_at: self.expires_at,
             peer_connection: Arc::clone(&self.peer_connection),
             stops: self.stops.clone(),
         }
@@ -189,6 +238,7 @@ pub struct PreviewManager {
     api: Arc<webrtc::api::API>,
     sessions: Arc<Mutex<HashMap<String, PreviewSessionHandle>>>,
     media_projection: MediaProjectionRuntime,
+    transport_events: broadcast::Sender<PreviewTransportObservationEvent>,
 }
 
 impl PreviewManager {
@@ -210,11 +260,19 @@ impl PreviewManager {
                 warm_runtime.warm_enabled_previews(&warm_cfg).await;
             });
         }
+        let (transport_events, _) = broadcast::channel(128);
         Ok(Self {
             api: Arc::new(api),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             media_projection,
+            transport_events,
         })
+    }
+
+    pub fn subscribe_transport_observations(
+        &self,
+    ) -> broadcast::Receiver<PreviewTransportObservationEvent> {
+        self.transport_events.subscribe()
     }
 
     pub async fn media_projection_health(
@@ -224,24 +282,69 @@ impl PreviewManager {
         self.media_projection.health(cfg).await
     }
 
+    pub async fn refresh_camera_source(
+        &self,
+        previous_source_id: &str,
+        camera: CameraDeviceConfig,
+    ) {
+        let stale_sessions = {
+            let mut sessions = self.sessions.lock().await;
+            let keys = sessions
+                .iter()
+                .filter_map(|(key, handle)| {
+                    preview_source_ids_match_refresh(
+                        &handle.source_ids,
+                        previous_source_id,
+                        &camera.source_id,
+                    )
+                    .then(|| key.clone())
+                })
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| sessions.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        for handle in stale_sessions {
+            handle.close().await;
+        }
+        self.media_projection
+            .refresh_camera_projection(previous_source_id, camera)
+            .await;
+    }
+
     pub async fn handle_offer(
         &self,
         cfg: &Config,
         request: ManagedOfferRequest,
     ) -> Result<ManagedOfferResponse> {
-        let token = validate_service_capability(cfg, &request.service_capability)?;
+        let authority = validate_stream_authority(cfg, &request.authority)?;
         let offer = parse_offer_description(&request.offer)?;
-        let selected = select_sources(cfg, source_ids_from_offer(&request.offer), &token)?;
-        let remote_candidates = request_candidates(&request);
+        let selected = select_sources(cfg, source_ids_from_offer(&request.offer), &authority)?;
+        let remote_candidates = request_candidates(&request)?;
         if selected.is_empty() {
             return Err(anyhow!(
                 "no enabled camera sources available for live preview"
             ));
         }
 
-        let session_key = session_key_for_capability(&token);
-        if let Some(existing) = self.sessions.lock().await.remove(&session_key) {
-            existing.close().await;
+        let issued_at = crate::util::now_ms();
+        let source_ids = selected
+            .iter()
+            .map(|camera| camera.source_id.clone())
+            .collect::<Vec<_>>();
+        let offer_records = stream_session_records_for_offer(cfg, &request, &authority, issued_at)?;
+        let session_id = session_id_for_claims(&authority);
+        let path_id = browser_webrtc_path_id(&session_id);
+        let activation_id = offer_records.route_promise.activation_id.clone();
+        let route_promise_id = offer_records.route_promise.promise_id.clone();
+        let requester_ref = authority.device_pk.trim().to_string();
+        let participant_ref = service_participant_ref(cfg);
+        let session_key = session_key_for_authority(&authority);
+        let stale_sessions = self
+            .take_stale_preview_sessions(cfg, &authority, &source_ids, issued_at)
+            .await;
+        for stale in stale_sessions {
+            stale.close().await;
         }
 
         let pc = Arc::new(
@@ -270,25 +373,99 @@ impl PreviewManager {
                 }
             })
         }));
-        let session_id = format!("nvr-preview-{}", token.nonce);
         let cleanup_sessions = Arc::clone(&self.sessions);
         let cleanup_key = session_key.clone();
-        let cleanup_pc = Arc::clone(&pc);
+        let cleanup_state = Arc::new(Mutex::new(RTCPeerConnectionState::New));
+        let transport_events = self.transport_events.clone();
+        let event_path_id = path_id.clone();
+        let event_session_id = session_id.clone();
+        let event_activation_id = activation_id.clone();
+        let event_route_promise_id = route_promise_id.clone();
+        let event_requester_ref = requester_ref.clone();
+        let event_participant_ref = participant_ref.clone();
+        let event_source_ids = source_ids.clone();
+        let event_expires_at = Some(authority.expires_at);
         pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
             let sessions = Arc::clone(&cleanup_sessions);
             let key = cleanup_key.clone();
-            let pc = Arc::clone(&cleanup_pc);
+            let state_ref = Arc::clone(&cleanup_state);
+            let transport_events = transport_events.clone();
+            let path_id = event_path_id.clone();
+            let session_id = event_session_id.clone();
+            let activation_id = event_activation_id.clone();
+            let route_promise_id = event_route_promise_id.clone();
+            let requester_ref = event_requester_ref.clone();
+            let participant_ref = event_participant_ref.clone();
+            let source_ids = event_source_ids.clone();
             Box::pin(async move {
-                if matches!(
-                    state,
-                    RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
-                ) {
-                    let handle = sessions.lock().await.remove(&key);
-                    if let Some(handle) = handle {
-                        handle.close().await;
-                    } else {
-                        let _ = pc.close().await;
+                *state_ref.lock().await = state;
+                let _ = transport_events.send(PreviewTransportObservationEvent {
+                    path_id: path_id.clone(),
+                    session_id: session_id.clone(),
+                    activation_id: activation_id.clone(),
+                    route_promise_id: route_promise_id.clone(),
+                    requester_ref: requester_ref.clone(),
+                    participant_ref: participant_ref.clone(),
+                    participant_role: "service".to_string(),
+                    state: media_observation_state_for_peer_state(state).to_string(),
+                    connection_state: peer_connection_state_label(state).to_string(),
+                    reason: media_observation_reason_for_peer_state(state).map(str::to_string),
+                    source_ids: source_ids.clone(),
+                    grace_ms: matches!(state, RTCPeerConnectionState::Disconnected)
+                        .then_some(DISCONNECTED_RELEASE_GRACE_MS),
+                    observed_at: crate::util::now_ms(),
+                    expires_at: event_expires_at,
+                });
+                match state {
+                    RTCPeerConnectionState::Disconnected => {
+                        let sessions = Arc::clone(&sessions);
+                        let key = key.clone();
+                        let state_ref = Arc::clone(&state_ref);
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(DISCONNECTED_RELEASE_GRACE_MS))
+                                .await;
+                            if *state_ref.lock().await == RTCPeerConnectionState::Disconnected {
+                                let removed = {
+                                    let mut sessions = sessions.lock().await;
+                                    sessions.remove(&key)
+                                };
+                                if let Some(handle) = removed {
+                                    let _ = transport_events.send(PreviewTransportObservationEvent {
+                                        path_id,
+                                        session_id: session_id.clone(),
+                                        activation_id,
+                                        route_promise_id,
+                                        requester_ref,
+                                        participant_ref,
+                                        participant_role: "service".to_string(),
+                                        state: "released".to_string(),
+                                        connection_state: "disconnected".to_string(),
+                                        reason: Some("disconnectedGraceExpired".to_string()),
+                                        source_ids,
+                                        grace_ms: Some(DISCONNECTED_RELEASE_GRACE_MS),
+                                        observed_at: crate::util::now_ms(),
+                                        expires_at: event_expires_at,
+                                    });
+                                    warn!(
+                                        session_id = %handle.session_id,
+                                        grace_ms = DISCONNECTED_RELEASE_GRACE_MS,
+                                        "preview transport disconnected past grace; releasing media path"
+                                    );
+                                    handle.close().await;
+                                }
+                            }
+                        });
                     }
+                    RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
+                        let removed = {
+                            let mut sessions = sessions.lock().await;
+                            sessions.remove(&key)
+                        };
+                        if let Some(handle) = removed {
+                            handle.close().await;
+                        }
+                    }
+                    _ => {}
                 }
             })
         }));
@@ -332,7 +509,18 @@ impl PreviewManager {
         let mut gather_complete = pc.gathering_complete_promise().await;
         let answer = pc.create_answer(None).await?;
         pc.set_local_description(answer).await?;
-        let _ = gather_complete.recv().await;
+        if timeout(
+            Duration::from_millis(ANSWER_GATHER_WAIT_MS),
+            gather_complete.recv(),
+        )
+        .await
+        .is_err()
+        {
+            warn!(
+                wait_ms = ANSWER_GATHER_WAIT_MS,
+                "ice gathering incomplete before answer response; returning current local description"
+            );
+        }
         let local_desc = pc
             .local_description()
             .await
@@ -347,34 +535,169 @@ impl PreviewManager {
             session_key,
             PreviewSessionHandle {
                 session_id: session_id.clone(),
-                source_ids: selected
-                    .iter()
-                    .map(|camera| camera.source_id.clone())
-                    .collect(),
+                requester_ref: authority.device_pk.trim().to_string(),
+                source_ids,
+                created_at: issued_at,
+                expires_at: authority.expires_at,
                 peer_connection: Arc::clone(&pc),
                 stops,
             },
         );
 
-        Ok(ManagedOfferResponse {
+        let mut response = ManagedOfferResponse {
             signal_type: "answer".to_string(),
             answer: local_desc,
             session_id,
             sources: response_sources,
             candidates: response_candidates,
-        })
+            stream_session: None,
+        };
+        let answer_records =
+            stream_session_records_for_answer(&response, &offer_records, issued_at)?;
+        response.stream_session = Some(StreamSessionExchangeRecords {
+            offer: offer_records,
+            answer: answer_records,
+        });
+        Ok(response)
+    }
+
+    pub fn offer_admission_records(
+        &self,
+        cfg: &Config,
+        request: &ManagedOfferRequest,
+        issued_at: u64,
+    ) -> Result<StreamSessionOfferRecords> {
+        let authority = validate_stream_authority(cfg, &request.authority)?;
+        parse_offer_description(&request.offer)?;
+        let selected = select_sources(cfg, source_ids_from_offer(&request.offer), &authority)?;
+        if selected.is_empty() {
+            return Err(anyhow!(
+                "no enabled camera sources available for live preview"
+            ));
+        }
+        stream_session_records_for_offer(cfg, request, &authority, issued_at)
     }
 
     pub async fn handle_close(&self, cfg: &Config, request: ManagedCloseRequest) -> Result<Value> {
-        let token = validate_service_capability(cfg, &request.service_capability)?;
-        let session_key = session_key_for_capability(&token);
-        if let Some(session) = self.sessions.lock().await.remove(&session_key) {
+        let authority = validate_stream_authority(cfg, &request.authority)?;
+        let expected_session_id = requested_close_session_id(&request, &authority);
+        if let Some(session) = self
+            .take_preview_session_for_close(&authority, &expected_session_id)
+            .await
+        {
             session.close().await;
         }
         Ok(json!({
             "ok": true,
-            "sessionId": format!("nvr-preview-{}", token.nonce),
-            "reason": request.payload.get("reason").cloned().unwrap_or_else(|| json!("closed")),
+            "sessionId": expected_session_id,
+            "reason": request
+                .payload
+                .get("reason")
+                .or_else(|| request.payload.get("reasonCode"))
+                .cloned()
+                .unwrap_or_else(|| json!("closed")),
+        }))
+    }
+
+    async fn take_preview_session_for_close(
+        &self,
+        authority: &ValidatedStreamAuthority,
+        session_id: &str,
+    ) -> Option<PreviewSessionHandle> {
+        let mut sessions = self.sessions.lock().await;
+        let session_key = session_key_for_authority(authority);
+        if let Some(session) = sessions.remove(&session_key) {
+            return Some(session);
+        }
+        if !session_id.trim().is_empty() {
+            if let Some(key) = sessions
+                .iter()
+                .find_map(|(key, handle)| (handle.session_id == session_id).then(|| key.clone()))
+            {
+                return sessions.remove(&key);
+            }
+        }
+        None
+    }
+
+    async fn take_stale_preview_sessions(
+        &self,
+        cfg: &Config,
+        authority: &ValidatedStreamAuthority,
+        source_ids: &[String],
+        now: u64,
+    ) -> Vec<PreviewSessionHandle> {
+        let max_sessions = max_preview_sessions(cfg);
+        let mut sessions = self.sessions.lock().await;
+        let mut keys = sessions
+            .iter()
+            .filter_map(|(key, handle)| {
+                let expired = handle.expires_at > 0 && handle.expires_at <= now;
+                let same_session = key == &session_key_for_authority(authority)
+                    || handle.session_id == session_id_for_claims(authority);
+                let same_requester_source = handle.requester_ref == authority.device_pk.trim()
+                    && preview_sources_overlap(&handle.source_ids, source_ids);
+                (expired || same_session || same_requester_source).then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+
+        if sessions.len().saturating_sub(keys.len()) >= max_sessions {
+            let mut oldest = sessions
+                .iter()
+                .filter(|(key, _)| !keys.iter().any(|existing| existing == *key))
+                .map(|(key, handle)| (key.clone(), handle.created_at))
+                .collect::<Vec<_>>();
+            oldest.sort_by_key(|(_, created_at)| *created_at);
+            let remove_count = sessions
+                .len()
+                .saturating_sub(keys.len())
+                .saturating_add(1)
+                .saturating_sub(max_sessions);
+            keys.extend(oldest.into_iter().take(remove_count).map(|(key, _)| key));
+        }
+
+        keys.sort();
+        keys.dedup();
+        keys.into_iter()
+            .filter_map(|key| {
+                let handle = sessions.remove(&key)?;
+                warn!(
+                    session_id = %handle.session_id,
+                    sources = ?handle.source_ids,
+                    "closing stale media transport preview lease"
+                );
+                Some(handle)
+            })
+            .collect()
+    }
+
+    pub async fn handle_candidate(
+        &self,
+        cfg: &Config,
+        request: ManagedCandidateRequest,
+    ) -> Result<Value> {
+        let authority = validate_stream_authority(cfg, &request.authority)?;
+        let session_key = session_key_for_authority(&authority);
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(&session_key)
+            .cloned()
+            .ok_or_else(|| anyhow!("stream session is not open for candidate"))?;
+        let candidate = candidate_from_payload(&request.payload)?;
+        validate_remote_candidate(&candidate)?;
+        let endpoint = candidate_endpoint_value(&candidate);
+        session
+            .peer_connection
+            .add_ice_candidate(candidate)
+            .await
+            .context("remote trickle candidate rejected")?;
+        Ok(json!({
+            "ok": true,
+            "sessionId": format!("nvr-preview-{}", authority.nonce),
+            "candidateApplied": true,
+            "endpoint": endpoint,
         }))
     }
 }
@@ -383,7 +706,7 @@ pub fn resolve_control_camera(
     cfg: &Config,
     request: &ManagedControlRequest,
 ) -> Result<CameraDeviceConfig> {
-    let token = validate_service_capability(cfg, &request.service_capability)?;
+    let authority = validate_stream_authority(cfg, &request.authority)?;
     let source_id = request
         .payload
         .get("sourceId")
@@ -395,8 +718,8 @@ pub fn resolve_control_camera(
     if source_id.is_empty() {
         return Err(anyhow!("control request is missing sourceId"));
     }
-    if !token.owner
-        && !token
+    if !authority.owner
+        && !authority
             .control_sources
             .iter()
             .any(|allowed| allowed.trim() == source_id.trim())
@@ -417,6 +740,7 @@ fn build_setting_engine(cfg: &LivePreviewConfig, camera_iface: &str) -> Result<S
             .map_err(|err| anyhow!("invalid live preview udp port range: {err}"))?,
     );
     setting_engine.set_udp_network(udp_network);
+    setting_engine.set_lite(true);
     setting_engine.set_network_types(vec![NetworkType::Udp4]);
     let blocked_iface = camera_iface.trim().to_string();
     setting_engine.set_interface_filter(Box::new(move |iface| {
@@ -426,34 +750,15 @@ fn build_setting_engine(cfg: &LivePreviewConfig, camera_iface: &str) -> Result<S
     Ok(setting_engine)
 }
 
-fn build_rtc_configuration(hints: &ManagedIceServerHints) -> RTCConfiguration {
-    let mut ice_servers = Vec::new();
-    let stun_urls = dedup_urls(&hints.stun);
-    if !stun_urls.is_empty() {
-        ice_servers.push(RTCIceServer {
-            urls: stun_urls,
-            ..Default::default()
-        });
-    }
+fn build_rtc_configuration(_hints: &ManagedIceServerHints) -> RTCConfiguration {
+    // The NVR service is an ICE-lite answerer. It advertises routable host
+    // candidates and lets the browser full ICE agent perform connectivity
+    // checks; mixing STUN-derived service candidates into ICE-lite produces
+    // unusable candidate-pair state in routed lab networks.
     RTCConfiguration {
-        ice_servers,
+        ice_servers: Vec::new(),
         ..Default::default()
     }
-}
-
-fn dedup_urls(values: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    for value in values {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let item = trimmed.to_string();
-        if !out.contains(&item) {
-            out.push(item);
-        }
-    }
-    out
 }
 
 fn ice_candidates_equal(left: &RTCIceCandidateInit, right: &RTCIceCandidateInit) -> bool {
@@ -471,6 +776,7 @@ async fn apply_remote_candidates(
         if candidate.candidate.trim().is_empty() {
             continue;
         }
+        validate_remote_candidate(candidate)?;
         pc.add_ice_candidate(candidate.clone())
             .await
             .context("remote ice candidate rejected")?;
@@ -478,72 +784,32 @@ async fn apply_remote_candidates(
     Ok(())
 }
 
-fn validate_service_capability(cfg: &Config, token: &str) -> Result<ServiceAccessTokenPayload> {
-    let envelope: CaacEnvelope =
-        serde_json::from_str(token).context("invalid gateway service capability envelope json")?;
+pub(crate) fn validate_stream_authority(
+    cfg: &Config,
+    claims: &StreamAuthorityClaims,
+) -> Result<ValidatedStreamAuthority> {
     let gateway_pk = cfg.gateway.host_gateway_pk.trim();
     if gateway_pk.is_empty() {
         return Err(anyhow!("host gateway pk is not configured"));
     }
-    if envelope.issuer_pk.trim() != gateway_pk {
-        return Err(anyhow!("service capability issuer mismatch"));
-    }
-    let now_ms = crate::util::now_ms();
-    let claims = open_envelope(&envelope, &cfg.nostr_sk_hex, now_ms, None)
-        .context("service capability decrypt/verify failed")?;
-    let payload: ServiceAccessTokenPayload =
-        serde_json::from_value(claims).context("invalid gateway service capability claims")?;
+    let payload = claims.clone();
     if payload.gateway_pk.trim() != gateway_pk {
-        return Err(anyhow!("service capability gateway mismatch"));
+        return Err(anyhow!("stream authority gateway mismatch"));
     }
     if payload.service.trim() != "nvr" {
-        return Err(anyhow!("service capability service mismatch"));
+        return Err(anyhow!("stream authority service mismatch"));
     }
     if payload.service_pk.trim() != cfg.nostr_pubkey.trim() {
-        return Err(anyhow!("service capability target service mismatch"));
+        return Err(anyhow!("stream authority target service mismatch"));
     }
     if payload.identity_id.trim() != cfg.api.identity_id.trim() {
-        return Err(anyhow!("service capability identity mismatch"));
+        return Err(anyhow!("stream authority identity mismatch"));
     }
-    if payload.expires_at < now_ms {
-        return Err(anyhow!("service capability expired"));
+    validate_resolved_member_ref(payload.device_pk.trim(), "stream authority devicePk")?;
+    if payload.expires_at < crate::util::now_ms() {
+        return Err(anyhow!("stream authority expired"));
     }
     Ok(payload)
-}
-
-pub fn open_sealed_service_access_request<T>(
-    cfg: &Config,
-    replay: &mut ReplayCache,
-    request: SealedServiceAccessRequest,
-    expected_signal_type: &str,
-) -> Result<T>
-where
-    T: DeserializeOwned,
-{
-    let envelope = request.service_request_envelope;
-    if envelope.kind != CAAC_KIND_SERVICE_ACCESS_INVOCATION {
-        return Err(anyhow!("unexpected service invocation envelope kind"));
-    }
-    let gateway_pk = cfg.gateway.host_gateway_pk.trim();
-    if gateway_pk.is_empty() {
-        return Err(anyhow!("host gateway pk is not configured"));
-    }
-    if envelope.issuer_pk.trim() != gateway_pk {
-        return Err(anyhow!("service invocation issuer mismatch"));
-    }
-    let now_ms = crate::util::now_ms();
-    let claims = open_envelope(&envelope, &cfg.nostr_sk_hex, now_ms, Some(replay))
-        .context("service invocation decrypt/verify failed")?;
-    let signal_type = claims
-        .get("signalType")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    if signal_type != expected_signal_type {
-        return Err(anyhow!("service invocation signal type mismatch"));
-    }
-    serde_json::from_value(claims).context("invalid service invocation claims")
 }
 
 fn parse_offer_description(value: &Value) -> Result<RTCSessionDescription> {
@@ -582,16 +848,6 @@ fn source_ids_from_offer(value: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub fn resolve_admin_token(cfg: &Config, token: &str) -> Result<()> {
-    let payload = validate_service_capability(cfg, token)?;
-    if !payload.owner {
-        return Err(anyhow!(
-            "owner service access is required for camera administration"
-        ));
-    }
-    Ok(())
-}
-
 fn collect_offer_candidates(value: &Value) -> Vec<RTCIceCandidateInit> {
     let mut out = Vec::new();
     for candidate_set in [
@@ -613,7 +869,48 @@ fn collect_offer_candidates(value: &Value) -> Vec<RTCIceCandidateInit> {
     out
 }
 
-fn request_candidates(request: &ManagedOfferRequest) -> Vec<RTCIceCandidateInit> {
+fn candidate_from_payload(value: &Value) -> Result<RTCIceCandidateInit> {
+    let candidate_value = value
+        .get("candidate")
+        .cloned()
+        .or_else(|| {
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("candidate"))
+                .cloned()
+        })
+        .unwrap_or_else(|| value.clone());
+    let candidate: RTCIceCandidateInit =
+        serde_json::from_value(candidate_value).context("invalid stream candidate payload")?;
+    if candidate.candidate.trim().is_empty() {
+        return Err(anyhow!("stream candidate is empty"));
+    }
+    Ok(candidate)
+}
+
+fn validate_remote_candidate(candidate: &RTCIceCandidateInit) -> Result<()> {
+    if candidate.candidate.trim().is_empty() {
+        return Err(anyhow!("stream candidate is empty"));
+    }
+    parse_candidate_endpoint(&candidate.candidate)
+        .ok_or_else(|| anyhow!("stream candidate missing actionable endpoint evidence"))?;
+    Ok(())
+}
+
+fn candidate_endpoint_value(candidate: &RTCIceCandidateInit) -> Value {
+    parse_candidate_endpoint(&candidate.candidate)
+        .map(|endpoint| {
+            json!({
+                "protocol": endpoint.protocol,
+                "address": endpoint.address,
+                "port": endpoint.port,
+                "candidateType": endpoint.candidate_type,
+            })
+        })
+        .unwrap_or(Value::Null)
+}
+
+fn request_candidates(request: &ManagedOfferRequest) -> Result<Vec<RTCIceCandidateInit>> {
     let mut out = Vec::new();
     for candidate in &request.candidates {
         push_unique_ice_candidate(&mut out, candidate);
@@ -621,7 +918,10 @@ fn request_candidates(request: &ManagedOfferRequest) -> Vec<RTCIceCandidateInit>
     for candidate in collect_offer_candidates(&request.offer) {
         push_unique_ice_candidate(&mut out, &candidate);
     }
-    out
+    for candidate in &out {
+        validate_remote_candidate(candidate)?;
+    }
+    Ok(out)
 }
 
 fn offer_description_sdp(value: &Value) -> Option<&str> {
@@ -657,10 +957,22 @@ fn select_preview_codec_for_camera(
     ))
 }
 
+fn preview_source_ids_match_refresh(
+    source_ids: &[String],
+    previous_source_id: &str,
+    current_source_id: &str,
+) -> bool {
+    let previous = previous_source_id.trim();
+    let current = current_source_id.trim();
+    source_ids.iter().any(|source| {
+        (!previous.is_empty() && source == previous) || (!current.is_empty() && source == current)
+    })
+}
+
 fn select_sources(
     cfg: &Config,
     requested: Vec<String>,
-    token: &ServiceAccessTokenPayload,
+    token: &ValidatedStreamAuthority,
 ) -> Result<Vec<CameraDeviceConfig>> {
     let enabled = cfg
         .camera_devices
@@ -700,8 +1012,80 @@ fn select_sources(
     Ok(out)
 }
 
-fn session_key_for_capability(token: &ServiceAccessTokenPayload) -> String {
-    format!("{}:{}", token.device_pk.trim(), token.nonce.trim())
+fn session_key_for_authority(authority: &ValidatedStreamAuthority) -> String {
+    format!("{}:{}", authority.device_pk.trim(), authority.nonce.trim())
+}
+
+fn service_participant_ref(cfg: &Config) -> String {
+    let service_pk = cfg.nostr_pubkey.trim();
+    if service_pk.is_empty() {
+        "service:nvr".to_string()
+    } else {
+        format!("service:{service_pk}")
+    }
+}
+
+fn peer_connection_state_label(state: RTCPeerConnectionState) -> &'static str {
+    match state {
+        RTCPeerConnectionState::Unspecified => "unspecified",
+        RTCPeerConnectionState::New => "new",
+        RTCPeerConnectionState::Connecting => "connecting",
+        RTCPeerConnectionState::Connected => "connected",
+        RTCPeerConnectionState::Disconnected => "disconnected",
+        RTCPeerConnectionState::Failed => "failed",
+        RTCPeerConnectionState::Closed => "closed",
+    }
+}
+
+fn media_observation_state_for_peer_state(state: RTCPeerConnectionState) -> &'static str {
+    match state {
+        RTCPeerConnectionState::Unspecified | RTCPeerConnectionState::New => "pending",
+        RTCPeerConnectionState::Connecting => "connecting",
+        RTCPeerConnectionState::Connected => "connected",
+        RTCPeerConnectionState::Disconnected => "disconnected",
+        RTCPeerConnectionState::Failed => "failed",
+        RTCPeerConnectionState::Closed => "closed",
+    }
+}
+
+fn media_observation_reason_for_peer_state(state: RTCPeerConnectionState) -> Option<&'static str> {
+    match state {
+        RTCPeerConnectionState::Disconnected => Some("peerConnectionDisconnected"),
+        RTCPeerConnectionState::Failed => Some("peerConnectionFailed"),
+        RTCPeerConnectionState::Closed => Some("peerConnectionClosed"),
+        _ => None,
+    }
+}
+
+fn requested_close_session_id(
+    request: &ManagedCloseRequest,
+    authority: &ValidatedStreamAuthority,
+) -> String {
+    let explicit = request.session_id.trim();
+    if !explicit.is_empty() {
+        return explicit.to_string();
+    }
+    request
+        .payload
+        .get("sessionId")
+        .or_else(|| request.payload.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| session_id_for_claims(authority))
+}
+
+fn preview_sources_overlap(left: &[String], right: &[String]) -> bool {
+    left.iter()
+        .any(|source| right.iter().any(|candidate| candidate == source))
+}
+
+fn max_preview_sessions(cfg: &Config) -> usize {
+    let min = cfg.live_preview.udp_port_min;
+    let max = cfg.live_preview.udp_port_max;
+    let port_count = max.saturating_sub(min).saturating_add(1);
+    usize::from((port_count / 4).max(2).min(16))
 }
 
 async fn available_offer_video_transceivers(
@@ -889,25 +1273,17 @@ mod tests {
         cfg
     }
 
-    fn service_capability(cfg: &mut Config) -> String {
-        let (gateway_pk, gateway_sk) = constitute_protocol::generate_keypair();
+    fn stream_authority(cfg: &mut Config, nonce: &str) -> StreamAuthorityClaims {
+        let (gateway_pk, _) = constitute_protocol::generate_keypair();
+        let (device_pk, _) = constitute_protocol::generate_keypair();
         cfg.gateway.host_gateway_pk = gateway_pk.clone();
-        service_capability_for_gateway(cfg, &gateway_pk, &gateway_sk, "nonce-1")
-    }
-
-    fn service_capability_for_gateway(
-        cfg: &Config,
-        gateway_pk: &str,
-        gateway_sk: &str,
-        nonce: &str,
-    ) -> String {
-        let payload = ServiceAccessTokenPayload {
+        StreamAuthorityClaims {
             capability_id: "cap-test".to_string(),
             gateway_pk: gateway_pk.to_string(),
             service_pk: cfg.nostr_pubkey.clone(),
             service: "nvr".to_string(),
             identity_id: cfg.api.identity_id.clone(),
-            device_pk: "device-pk".to_string(),
+            device_pk,
             capability: "nvr.view".to_string(),
             owner: true,
             view_sources: vec!["cam-1".to_string()],
@@ -915,18 +1291,7 @@ mod tests {
             nonce: nonce.to_string(),
             issued_at: crate::util::now_ms(),
             expires_at: crate::util::now_ms() + 60_000,
-        };
-        let claims = serde_json::to_value(&payload).expect("claims");
-        let envelope = constitute_protocol::seal_envelope(
-            constitute_protocol::CAAC_KIND_SERVICE_ACCESS_CAPABILITY,
-            &claims,
-            gateway_sk,
-            &[gateway_pk.to_string(), cfg.nostr_pubkey.clone()],
-            payload.issued_at,
-            payload.expires_at,
-        )
-        .expect("seal");
-        serde_json::to_string(&envelope).expect("envelope")
+        }
     }
 
     #[test]
@@ -941,13 +1306,14 @@ mod tests {
     #[test]
     fn select_sources_defaults_to_enabled() {
         let cfg = sample_config();
-        let token = ServiceAccessTokenPayload {
+        let (device_pk, _) = constitute_protocol::generate_keypair();
+        let token = StreamAuthorityClaims {
             capability_id: "cap-test".to_string(),
             gateway_pk: "gateway".to_string(),
             service_pk: cfg.nostr_pubkey.clone(),
             service: "nvr".to_string(),
             identity_id: cfg.api.identity_id.clone(),
-            device_pk: "device".to_string(),
+            device_pk,
             capability: "nvr.view".to_string(),
             owner: true,
             view_sources: vec!["cam-1".to_string()],
@@ -977,8 +1343,9 @@ mod tests {
 
     #[test]
     fn request_candidates_accept_top_level_and_nested_offer_candidates() {
+        let mut cfg = sample_config();
         let request = ManagedOfferRequest {
-            service_capability: "token".to_string(),
+            authority: stream_authority(&mut cfg, "nonce-1"),
             offer: json!({
                 "description": {
                     "type": "offer",
@@ -1001,7 +1368,7 @@ mod tests {
             }],
         };
 
-        let out = request_candidates(&request);
+        let out = request_candidates(&request).expect("candidates");
         assert_eq!(out.len(), 2);
         assert!(
             out.iter()
@@ -1011,6 +1378,66 @@ mod tests {
             out.iter()
                 .any(|candidate| candidate.candidate.contains("54548"))
         );
+    }
+
+    #[test]
+    fn request_candidates_reject_missing_actionable_endpoint() {
+        let mut cfg = sample_config();
+        let request = ManagedOfferRequest {
+            authority: stream_authority(&mut cfg, "nonce-1"),
+            offer: json!({
+                "description": {
+                    "type": "offer",
+                    "sdp": "v=0\r\n"
+                }
+            }),
+            ice_servers: ManagedIceServerHints::default(),
+            candidates: vec![RTCIceCandidateInit {
+                candidate: "candidate:1 1 udp 2122260223 10.0.229.73 typ host".to_string(),
+                sdp_mid: Some("0".to_string()),
+                sdp_mline_index: Some(0),
+                username_fragment: None,
+            }],
+        };
+
+        let err = request_candidates(&request).expect_err("invalid endpoint");
+        assert!(
+            err.to_string()
+                .contains("stream candidate missing actionable endpoint evidence")
+        );
+    }
+
+    #[test]
+    fn close_session_id_prefers_explicit_payload_session() {
+        let mut cfg = sample_config();
+        let authority = stream_authority(&mut cfg, "new-close-nonce");
+        let request = ManagedCloseRequest {
+            authority: authority.clone(),
+            session_id: String::new(),
+            payload: json!({ "sessionId": "nvr-preview-original-nonce" }),
+        };
+
+        assert_eq!(
+            requested_close_session_id(&request, &authority),
+            "nvr-preview-original-nonce"
+        );
+    }
+
+    #[test]
+    fn media_transport_leases_overlap_by_source_and_bound_capacity() {
+        let mut cfg = sample_config();
+        cfg.live_preview.udp_port_min = 41000;
+        cfg.live_preview.udp_port_max = 41031;
+
+        assert!(preview_sources_overlap(
+            &["cam-1".to_string()],
+            &["cam-1".to_string(), "cam-2".to_string()]
+        ));
+        assert!(!preview_sources_overlap(
+            &["cam-1".to_string()],
+            &["cam-2".to_string()]
+        ));
+        assert_eq!(max_preview_sessions(&cfg), 8);
     }
 
     #[test]
@@ -1077,6 +1504,27 @@ mod tests {
     }
 
     #[test]
+    fn preview_refresh_matches_previous_or_current_source() {
+        let sources = vec!["reolink-ec-71-db-32-0a-8f".to_string()];
+
+        assert!(preview_source_ids_match_refresh(
+            &sources,
+            "reolink-192-168-250-97",
+            "reolink-ec-71-db-32-0a-8f"
+        ));
+        assert!(preview_source_ids_match_refresh(
+            &sources,
+            "reolink-ec-71-db-32-0a-8f",
+            "reolink-ec-71-db-32-0a-8f"
+        ));
+        assert!(!preview_source_ids_match_refresh(
+            &sources,
+            "xm-192-168-0-201",
+            "xm-192-168-0-201"
+        ));
+    }
+
+    #[test]
     fn preview_rtsp_url_uses_xm_substream() {
         let mut cfg = sample_config();
         let mut camera = cfg.camera_devices.remove(0);
@@ -1119,57 +1567,89 @@ mod tests {
     }
 
     #[test]
-    fn validate_service_capability_accepts_matching_gateway_and_service() {
+    fn validate_stream_authority_accepts_matching_gateway_and_service() {
         let mut cfg = sample_config();
-        let token = service_capability(&mut cfg);
-        let payload = validate_service_capability(&cfg, &token).expect("token");
+        let authority = stream_authority(&mut cfg, "nonce-1");
+        let payload = validate_stream_authority(&cfg, &authority).expect("authority");
         assert_eq!(payload.gateway_pk, cfg.gateway.host_gateway_pk);
         assert_eq!(payload.service_pk, cfg.nostr_pubkey);
     }
 
     #[test]
-    fn sealed_service_invocation_decrypts_once_for_expected_signal_type() {
-        let mut cfg = sample_config();
-        let (gateway_pk, gateway_sk) = constitute_protocol::generate_keypair();
-        cfg.gateway.host_gateway_pk = gateway_pk.clone();
-        let service_capability =
-            service_capability_for_gateway(&cfg, &gateway_pk, &gateway_sk, "nonce-invocation");
-        let issued_at = crate::util::now_ms();
-        let claims = json!({
-            "signalType": "admin",
-            "serviceCapability": service_capability,
-            "action": "list_camera_device_inventory",
-            "payload": {},
+    fn ice_lite_service_ignores_browser_stun_hints() {
+        let config = build_rtc_configuration(&ManagedIceServerHints {
+            stun: vec!["stun:stun.l.google.com:19302".to_string()],
+            turn: vec![],
         });
-        let envelope = constitute_protocol::seal_envelope(
-            constitute_protocol::CAAC_KIND_SERVICE_ACCESS_INVOCATION,
-            &claims,
-            &gateway_sk,
-            &[cfg.nostr_pubkey.clone()],
-            issued_at,
-            issued_at + 60_000,
-        )
-        .expect("seal invocation");
-        let request = SealedServiceAccessRequest {
-            service_request_envelope: envelope.clone(),
-        };
-        let mut replay = ReplayCache::default();
-        let opened: ManagedAdminRequest =
-            open_sealed_service_access_request(&cfg, &mut replay, request, "admin")
-                .expect("open invocation");
-        assert_eq!(opened.action, "list_camera_device_inventory");
-        let replayed = SealedServiceAccessRequest {
-            service_request_envelope: envelope,
-        };
         assert!(
-            open_sealed_service_access_request::<ManagedAdminRequest>(
-                &cfg,
-                &mut replay,
-                replayed,
-                "admin"
-            )
-            .is_err()
+            config.ice_servers.is_empty(),
+            "ICE-lite NVR service should advertise host candidates only"
         );
+    }
+
+    #[tokio::test]
+    async fn answerer_advertises_ice_lite() {
+        let cfg = sample_config();
+        let mut media_engine = MediaEngine::default();
+        media_engine
+            .register_default_codecs()
+            .expect("register codecs");
+        let offer_api = APIBuilder::new().with_media_engine(media_engine).build();
+        let offerer = Arc::new(
+            offer_api
+                .new_peer_connection(RTCConfiguration::default())
+                .await
+                .expect("offerer"),
+        );
+        offerer
+            .add_transceiver_from_kind(
+                RTPCodecType::Video,
+                Some(RTCRtpTransceiverInit {
+                    direction: RTCRtpTransceiverDirection::Recvonly,
+                    send_encodings: vec![],
+                }),
+            )
+            .await
+            .expect("recvonly video transceiver");
+        let offer = offerer.create_offer(None).await.expect("offer");
+        offerer
+            .set_local_description(offer)
+            .await
+            .expect("set local offer");
+
+        let mut answer_media_engine = MediaEngine::default();
+        answer_media_engine
+            .register_default_codecs()
+            .expect("register codecs");
+        let answer_api = APIBuilder::new()
+            .with_media_engine(answer_media_engine)
+            .with_setting_engine(
+                build_setting_engine(&cfg.live_preview, cfg.camera_network.interface.trim())
+                    .expect("setting engine"),
+            )
+            .build();
+        let answerer = Arc::new(
+            answer_api
+                .new_peer_connection(RTCConfiguration::default())
+                .await
+                .expect("answerer"),
+        );
+        answerer
+            .set_remote_description(offerer.local_description().await.expect("local offer"))
+            .await
+            .expect("set remote offer");
+        let answer = answerer.create_answer(None).await.expect("answer");
+        answerer
+            .set_local_description(answer)
+            .await
+            .expect("set local answer");
+
+        let sdp = answerer
+            .local_description()
+            .await
+            .expect("local answer")
+            .sdp;
+        assert!(sdp.contains("ice-lite"), "{sdp}");
     }
 
     #[tokio::test]

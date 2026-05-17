@@ -1,6 +1,6 @@
-use crate::nostr;
 use crate::util;
 use anyhow::{Context, Result};
+use constitute_protocol::{generate_keypair, pubkey_from_sk_hex};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -31,8 +31,6 @@ pub struct SwarmConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApiConfig {
     pub bind: String,
-    #[serde(default)]
-    pub public_ws_url: String,
     pub identity_id: String,
     #[serde(default)]
     pub authorized_device_pks: Vec<String>,
@@ -318,6 +316,8 @@ impl Default for UiModuleConfig {
 pub struct GatewayConfig {
     #[serde(default)]
     pub host_gateway_pk: String,
+    #[serde(default = "default_gateway_edge_stream_endpoint")]
+    pub edge_stream_endpoint: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -407,12 +407,12 @@ impl Config {
         }
 
         if self.nostr_sk_hex.trim().is_empty() {
-            let (pk, sk) = nostr::generate_keypair();
+            let (pk, sk) = generate_keypair();
             self.nostr_pubkey = pk;
             self.nostr_sk_hex = sk;
             changed = true;
         } else if self.nostr_pubkey.trim().is_empty()
-            && let Ok(pk) = nostr::pubkey_from_sk_hex(&self.nostr_sk_hex)
+            && let Ok(pk) = pubkey_from_sk_hex(&self.nostr_sk_hex)
         {
             self.nostr_pubkey = pk;
             changed = true;
@@ -463,6 +463,11 @@ impl Config {
             changed = true;
         }
 
+        if self.gateway.edge_stream_endpoint.trim().is_empty() {
+            self.gateway.edge_stream_endpoint = default_gateway_edge_stream_endpoint();
+            changed = true;
+        }
+
         if self.autoprovision.reolink_username.trim().is_empty() {
             self.autoprovision.reolink_username = default_reolink_username();
             changed = true;
@@ -506,7 +511,7 @@ impl Config {
     }
 
     fn default_generated() -> Self {
-        let (pk, sk) = nostr::generate_keypair();
+        let (pk, sk) = generate_keypair();
         Self {
             node_id: format!("nvr-{}", short_hex(4)),
             node_role: default_node_role(),
@@ -526,7 +531,6 @@ impl Config {
             },
             api: ApiConfig {
                 bind: "0.0.0.0:8456".to_string(),
-                public_ws_url: String::new(),
                 identity_id: "REPLACE_WITH_IDENTITY_ID".to_string(),
                 authorized_device_pks: Vec::new(),
                 allow_unsigned_debug_hello: false,
@@ -564,6 +568,10 @@ impl Config {
 
 fn default_node_role() -> String {
     "native".to_string()
+}
+
+fn default_gateway_edge_stream_endpoint() -> String {
+    "ws://127.0.0.1:7448".to_string()
 }
 
 fn default_device_label() -> String {

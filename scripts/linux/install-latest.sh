@@ -42,7 +42,7 @@ Pass-through (install context):
   --authorized-device-pk <pk>  (repeatable)
   --zone-key <key>             (repeatable)
   --swarm-peer <host:port>     (repeatable)
-  --public-ws-url <url>
+  --swarm-edge-endpoint <endpoint>
   --allow-unsigned-debug-hello | --require-signed-hello
   --pair-identity <label>
   --pair-code <code>
@@ -128,7 +128,7 @@ parse_passthrough_flag() {
   local flag="$1"
   shift
   case "$flag" in
-    --identity-id|--authorized-device-pk|--zone-key|--swarm-peer|--public-ws-url|--pair-identity|--pair-code|--pair-code-hash|--reolink-username|--reolink-password|--reolink-desired-password|--reolink-hint-ip|--storage-root|--camera-iface|--camera-cidr|--onvif-ports|--rtsp-ports)
+    --identity-id|--authorized-device-pk|--zone-key|--swarm-peer|--swarm-edge-endpoint|--pair-identity|--pair-code|--pair-code-hash|--reolink-username|--reolink-password|--reolink-desired-password|--reolink-hint-ip|--storage-root|--camera-iface|--camera-cidr|--onvif-ports|--rtsp-ports)
       local value="${1:-}"
       if [[ -z "$value" ]]; then
         echo "missing value for ${flag}" >&2

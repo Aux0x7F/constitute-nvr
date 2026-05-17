@@ -1,5 +1,6 @@
 use super::*;
 use anyhow::{Result, anyhow};
+use std::process::Command;
 
 #[derive(Clone, Debug)]
 pub struct CameraDriftReconcileOutcome {
@@ -50,6 +51,14 @@ pub async fn reconcile_camera_identity_and_endpoint(
         .into_iter()
         .filter(|candidate| candidate.driver_match.driver_id.trim() == DRIVER_ID_REOLINK)
         .collect::<Vec<_>>();
+    if !host_is_reachable
+        && let Some(candidate) = reolink_neighbor_identity_candidate(cfg, camera).await?
+        && !candidates
+            .iter()
+            .any(|existing| existing.ip.trim() == candidate.ip.trim())
+    {
+        candidates.push(candidate);
+    }
     if let Some(current) = current_host_reolink_candidate(camera).await? {
         if !candidates
             .iter()
@@ -393,6 +402,107 @@ fn identity_match(
     }
 }
 
+async fn reolink_neighbor_identity_candidate(
+    cfg: &Config,
+    camera: &CameraDeviceConfig,
+) -> Result<Option<DiscoveredCameraCandidate>> {
+    let iface = cfg.camera_network.interface.trim();
+    if iface.is_empty() {
+        return Ok(None);
+    }
+    let known_macs = configured_reolink_identity_macs(camera);
+    if known_macs.is_empty() {
+        return Ok(None);
+    }
+    let client = http_client()?;
+    for (ip, mac) in interface_neighbor_entries(iface) {
+        let normalized = normalize_mac(&mac).unwrap_or_default();
+        if !known_macs.iter().any(|known| known == &normalized) {
+            continue;
+        }
+        let ports = probe_common_ports(&ip).await;
+        if !(ports.http || ports.https || ports.rtsp || ports.onvif || ports.proprietary_9000) {
+            continue;
+        }
+        let mut candidate = blank_candidate(&ip);
+        candidate.mac = normalized;
+        candidate.signatures.vendor = "Reolink".to_string();
+        candidate.transports.http = ports.http;
+        candidate.transports.https = ports.https;
+        candidate.transports.rtsp = ports.rtsp;
+        candidate.transports.onvif = ports.onvif;
+        candidate.transports.proprietary_9000 = ports.proprietary_9000;
+        push_unique_string(&mut candidate.discovered_via, "interface_neighbor_mac");
+        hydrate_candidate(&mut candidate, &client).await?;
+        candidate.driver_match = match_candidate(&candidate);
+        if candidate.driver_match.driver_id.trim() == DRIVER_ID_REOLINK {
+            candidate.candidate_id = candidate_id(&candidate);
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn configured_reolink_identity_macs(camera: &CameraDeviceConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in [
+        camera.mac_address.as_str(),
+        camera
+            .source_id
+            .trim()
+            .strip_prefix("reolink-")
+            .unwrap_or_default(),
+    ] {
+        if let Some(mac) = normalize_mac(value)
+            && !out.contains(&mac)
+        {
+            out.push(mac);
+        }
+    }
+    out
+}
+
+fn interface_neighbor_entries(iface: &str) -> Vec<(String, String)> {
+    let output = match Command::new("ip")
+        .args(["neigh", "show", "dev", iface.trim()])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    parse_neighbor_entries(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_neighbor_entries(raw: &str) -> Vec<(String, String)> {
+    raw.lines()
+        .filter_map(|line| {
+            let parts = line.split_whitespace().collect::<Vec<_>>();
+            let ip = parts.first()?.trim();
+            let mac = parts
+                .windows(2)
+                .find_map(|window| (window[0] == "lladdr").then(|| window[1].trim()))?;
+            Some((ip.to_string(), mac.to_string()))
+        })
+        .collect()
+}
+
+fn normalize_mac(value: &str) -> Option<String> {
+    let hex = value
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect::<String>();
+    if hex.len() != 12 {
+        return None;
+    }
+    Some(
+        (0..6)
+            .map(|idx| &hex[idx * 2..idx * 2 + 2])
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
+}
+
 fn reolink_config_resolved_to_candidate(
     cfg: &Config,
     camera: &CameraDeviceConfig,
@@ -596,5 +706,33 @@ mod tests {
 
         assert_eq!(matched.confidence, 96);
         assert_eq!(matched.match_kind, "reolink_mac_source_id");
+    }
+
+    #[test]
+    fn reolink_identity_macs_include_source_id_suffix() {
+        let mut camera = legacy_reolink_camera();
+        camera.source_id = "reolink-ec-71-db-32-0a-8f".to_string();
+        camera.mac_address.clear();
+
+        assert_eq!(
+            configured_reolink_identity_macs(&camera),
+            vec!["ec:71:db:32:0a:8f".to_string()]
+        );
+    }
+
+    #[test]
+    fn neighbor_entries_parse_lladdr_rows() {
+        let entries = parse_neighbor_entries(
+            "192.168.250.97 dev enp21s0f0u5 lladdr ec:71:db:32:0a:8f STALE\n\
+             192.168.250.98 dev enp21s0f0u5 INCOMPLETE\n",
+        );
+
+        assert_eq!(
+            entries,
+            vec![(
+                "192.168.250.97".to_string(),
+                "ec:71:db:32:0a:8f".to_string()
+            )]
+        );
     }
 }
