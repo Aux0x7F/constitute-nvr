@@ -22,7 +22,9 @@ use constitute_protocol::validate_resolved_member_ref;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
+use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use tokio::sync::{Mutex, watch};
 use tokio::time::{Duration, timeout};
@@ -32,7 +34,8 @@ use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_VP8, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::ice::mdns::MulticastDnsMode;
 use webrtc::ice::network_type::NetworkType;
-use webrtc::ice::udp_network::{EphemeralUDP, UDPNetwork};
+use webrtc::ice::udp_mux::{UDPMux, UDPMuxDefault, UDPMuxParams};
+use webrtc::ice::udp_network::UDPNetwork;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -154,6 +157,11 @@ fn push_unique_ice_candidate(into: &mut Vec<RTCIceCandidateInit>, candidate: &RT
 }
 
 type ValidatedStreamAuthority = StreamAuthorityClaims;
+
+struct PreviewUdpMux {
+    network: UDPNetwork,
+    local_addr: SocketAddr,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreviewCodec {
@@ -751,11 +759,14 @@ pub fn resolve_control_camera(
 
 fn build_setting_engine(cfg: &LivePreviewConfig, camera_iface: &str) -> Result<SettingEngine> {
     let mut setting_engine = SettingEngine::default();
-    let udp_network = UDPNetwork::Ephemeral(
-        EphemeralUDP::new(cfg.udp_port_min, cfg.udp_port_max)
-            .map_err(|err| anyhow!("invalid live preview udp port range: {err}"))?,
+    let preview_mux = bind_preview_udp_mux(cfg)?;
+    info!(
+        port = preview_mux.local_addr.port(),
+        configured_min = cfg.udp_port_min,
+        configured_max = cfg.udp_port_max,
+        "live preview media transport mux bound"
     );
-    setting_engine.set_udp_network(udp_network);
+    setting_engine.set_udp_network(preview_mux.network);
     setting_engine.set_lite(true);
     setting_engine.set_network_types(vec![NetworkType::Udp4]);
     let blocked_iface = camera_iface.trim().to_string();
@@ -764,6 +775,52 @@ fn build_setting_engine(cfg: &LivePreviewConfig, camera_iface: &str) -> Result<S
         !trimmed.eq_ignore_ascii_case("lo") && trimmed != blocked_iface
     }));
     Ok(setting_engine)
+}
+
+fn bind_preview_udp_mux(cfg: &LivePreviewConfig) -> Result<PreviewUdpMux> {
+    if cfg.udp_port_max < cfg.udp_port_min {
+        return Err(anyhow!(
+            "invalid live preview udp port range: {}-{}",
+            cfg.udp_port_min,
+            cfg.udp_port_max
+        ));
+    }
+
+    let mut last_err = None;
+    for port in cfg.udp_port_min..=cfg.udp_port_max {
+        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+        match StdUdpSocket::bind(bind_addr) {
+            Ok(socket) => {
+                socket
+                    .set_nonblocking(true)
+                    .context("live preview udp mux socket nonblocking")?;
+                let socket = UdpSocket::from_std(socket)
+                    .context("live preview udp mux socket adoption")?;
+                let local_addr = socket
+                    .local_addr()
+                    .context("live preview udp mux local address")?;
+                let mux = UDPMuxDefault::new(UDPMuxParams::new(socket));
+                let mux = mux as Arc<dyn UDPMux + Send + Sync>;
+                return Ok(PreviewUdpMux {
+                    network: UDPNetwork::Muxed(mux),
+                    local_addr,
+                });
+            }
+            Err(err) => {
+                last_err = Some(err);
+            }
+        }
+    }
+
+    let detail = last_err
+        .map(|err| err.to_string())
+        .unwrap_or_else(|| "no ports attempted".to_string());
+    Err(anyhow!(
+        "no live preview udp mux port available in {}-{}: {}",
+        cfg.udp_port_min,
+        cfg.udp_port_max,
+        detail
+    ))
 }
 
 fn build_rtc_configuration(_hints: &ManagedIceServerHints) -> RTCConfiguration {
@@ -1466,6 +1523,40 @@ mod tests {
             &["cam-2".to_string()]
         ));
         assert_eq!(max_preview_sessions(&cfg), 8);
+    }
+
+    #[tokio::test]
+    async fn live_preview_udp_mux_binds_one_owned_transport_port() {
+        let mut cfg = sample_config();
+        cfg.live_preview.udp_port_min = 0;
+        cfg.live_preview.udp_port_max = 0;
+
+        let mux = bind_preview_udp_mux(&cfg.live_preview).expect("preview udp mux");
+        assert!(mux.local_addr.port() > 0);
+        match mux.network {
+            UDPNetwork::Muxed(udp_mux) => {
+                udp_mux.close().await.expect("close mux");
+            }
+            UDPNetwork::Ephemeral(_) => panic!("preview should use muxed media transport"),
+        }
+    }
+
+    #[tokio::test]
+    async fn live_preview_udp_mux_skips_busy_port_in_range() {
+        let busy = StdUdpSocket::bind("0.0.0.0:0").expect("busy socket");
+        let busy_port = busy.local_addr().expect("busy addr").port();
+        let mut cfg = sample_config();
+        cfg.live_preview.udp_port_min = busy_port;
+        cfg.live_preview.udp_port_max = busy_port + 1;
+
+        let mux = bind_preview_udp_mux(&cfg.live_preview).expect("preview udp mux");
+        assert_eq!(mux.local_addr.port(), busy_port + 1);
+        match mux.network {
+            UDPNetwork::Muxed(udp_mux) => {
+                udp_mux.close().await.expect("close mux");
+            }
+            UDPNetwork::Ephemeral(_) => panic!("preview should use muxed media transport"),
+        }
     }
 
     #[test]
