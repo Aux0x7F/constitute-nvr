@@ -64,6 +64,7 @@ pub async fn submit_safe_event(
         tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
         safe_facts,
         detail_ref: None,
+        encrypted_detail_refs: Vec::new(),
         redaction: vec![LogRedactionClass::Safe],
     };
     event.event_id = match log_event_id(&event) {
