@@ -1,6 +1,9 @@
 use crate::crypto;
 use anyhow::{Context, Result, anyhow};
+use constitute_protocol::{StoragePinIntent, validate_storage_pin_intent};
 use serde::Serialize;
+use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -130,6 +133,72 @@ impl StorageManager {
     }
 }
 
+pub fn storage_pin_intent_for_segment(
+    service_pk: &str,
+    source_id: &str,
+    segment: &SegmentEntry,
+    desired_replicas: u32,
+    retention: &str,
+    issued_at: u64,
+) -> Result<StoragePinIntent> {
+    let object_ref = segment_object_ref(source_id, &segment.name);
+    let metadata = json!({
+        "kind": "nvr.media.segment",
+        "sourceId": source_id,
+        "name": segment.name,
+        "bytes": segment.bytes,
+        "modifiedUnix": segment.modified_unix,
+    });
+    let intent = StoragePinIntent {
+        intent_id: format!(
+            "pin-nvr-segment-{}-{}-{issued_at}",
+            record_token(source_id),
+            record_token(&segment.name)
+        ),
+        object_refs: vec![object_ref],
+        manifest_hash: metadata_manifest_hash(&metadata),
+        desired_replicas: desired_replicas.max(1),
+        retention: retention_class(retention),
+        authority_refs: vec![authority_ref(service_pk)],
+        expires_at: None,
+    };
+    validate_storage_pin_intent(&intent)?;
+    Ok(intent)
+}
+
+pub fn storage_pin_intent_for_history(
+    service_pk: &str,
+    source_id: &str,
+    segments: &[SegmentEntry],
+    desired_replicas: u32,
+    retention: &str,
+    issued_at: u64,
+) -> Result<StoragePinIntent> {
+    let mut object_refs = segments
+        .iter()
+        .map(|segment| segment_object_ref(source_id, &segment.name))
+        .collect::<Vec<_>>();
+    if object_refs.is_empty() {
+        object_refs.push(format!("nvr.media.history:{}", record_token(source_id)));
+    }
+    let metadata = json!({
+        "kind": "nvr.media.history",
+        "sourceId": source_id,
+        "segments": segments,
+    });
+    let intent = StoragePinIntent {
+        intent_id: format!("pin-nvr-history-{}-{issued_at}", record_token(source_id)),
+        object_refs,
+        manifest_hash: metadata_manifest_hash(&metadata),
+        desired_replicas: desired_replicas.max(1),
+        retention: retention_class(retention),
+        authority_refs: vec![authority_ref(service_pk)],
+        expires_at: None,
+    };
+    validate_storage_pin_intent(&intent)?;
+    Ok(intent)
+}
+
 fn encrypt_pass(root: &Path, key: &[u8]) -> Result<()> {
     if !root.exists() {
         return Ok(());
@@ -187,6 +256,59 @@ fn decrypt_blob(key: &[u8], blob: &[u8]) -> Result<Vec<u8>> {
     crypto::decrypt_payload(key, &nonce, cipher)
 }
 
+fn segment_object_ref(source_id: &str, name: &str) -> String {
+    format!(
+        "nvr.media.segment:{}:{}",
+        record_token(source_id),
+        record_token(name)
+    )
+}
+
+fn metadata_manifest_hash(value: &serde_json::Value) -> String {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn record_token(value: &str) -> String {
+    let token = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let token = token.trim_matches('-');
+    if token.is_empty() {
+        "unknown".to_string()
+    } else {
+        token.to_string()
+    }
+}
+
+fn authority_ref(service_pk: &str) -> String {
+    let service_pk = service_pk.trim();
+    if service_pk.is_empty() {
+        "service:nvr".to_string()
+    } else {
+        format!("service:{service_pk}")
+    }
+}
+
+fn retention_class(retention: &str) -> String {
+    let retention = retention.trim();
+    if retention.is_empty() {
+        "nvr-history".to_string()
+    } else {
+        retention.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +326,43 @@ mod tests {
 
         let dec = decrypt_blob(&key, &blob).unwrap();
         assert_eq!(dec, plain);
+    }
+
+    #[test]
+    fn segment_and_history_outputs_create_valid_storage_pin_intents_without_media_bytes() {
+        let segment = SegmentEntry {
+            name: "20260508T010203.cnv".to_string(),
+            bytes: 4096,
+            modified_unix: 1_767_316_923,
+        };
+
+        let segment_intent = storage_pin_intent_for_segment(
+            "service-pk",
+            "cam-1",
+            &segment,
+            2,
+            "nvr-retained-media",
+            1_767_316_924,
+        )
+        .expect("segment intent");
+        validate_storage_pin_intent(&segment_intent).expect("valid segment intent");
+        assert_eq!(segment_intent.desired_replicas, 2);
+        assert_eq!(segment_intent.object_refs.len(), 1);
+
+        let history_intent = storage_pin_intent_for_history(
+            "service-pk",
+            "cam-1",
+            &[segment],
+            1,
+            "nvr-history",
+            1_767_316_925,
+        )
+        .expect("history intent");
+        validate_storage_pin_intent(&history_intent).expect("valid history intent");
+
+        let rendered = serde_json::to_string(&history_intent).expect("json");
+        assert!(!rendered.contains("mediaBytes"));
+        assert!(!rendered.contains("payloadBytes"));
+        assert!(!rendered.contains("data:"));
     }
 }

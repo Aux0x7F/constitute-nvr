@@ -1,37 +1,23 @@
 use crate::camera_device;
-use crate::camera_device::drivers::reolink::driver as reolink;
 use crate::config::{CameraDeviceConfig, CameraDeviceDesiredConfig, Config};
-use crate::crypto;
 use crate::hosted_registry;
-use crate::live::{
-    ManagedAdminRequest, ManagedCloseRequest, ManagedControlRequest, ManagedOfferRequest,
-    PreviewManager, SealedServiceAccessRequest, open_sealed_service_access_request,
-    resolve_admin_token, resolve_control_camera,
-};
+use crate::live::PreviewManager;
 use crate::recording::RecorderManager;
 use crate::storage::StorageManager;
-use crate::util;
-use anyhow::{Result, anyhow};
-use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Query, State, WebSocketUpgrade};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use anyhow::Result;
+use axum::extract::{Query, State};
+use axum::routing::get;
 use axum::{Json, Router};
-use base64::Engine;
-use constitute_protocol::{LogCategory, LogOutcome, LogSeverity, LogSubjectRef, ReplayCache};
-use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use constitute_protocol::{LogCategory, LogOutcome, LogSeverity, LogSubjectRef};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, MissedTickBehavior, interval};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
-const INSECURE_HELLO_SECRET_HEX: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
 const CAMERA_RECONCILE_INITIAL_DELAY_SECS: u64 = 5;
 const CAMERA_RECONCILE_INTERVAL_SECS: u64 = 20;
 
@@ -42,7 +28,6 @@ pub struct ApiState {
     pub storage: StorageManager,
     pub recorder: RecorderManager,
     pub preview: PreviewManager,
-    pub service_replay: Arc<Mutex<ReplayCache>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,36 +63,39 @@ struct HealthCameraNetworkView {
 }
 
 pub async fn run(
-    cfg: Config,
+    cfg: Arc<Mutex<Config>>,
     cfg_path: PathBuf,
     storage: StorageManager,
     recorder: RecorderManager,
+    preview: PreviewManager,
 ) -> Result<()> {
-    let bind = cfg.api.bind.clone();
+    let bind = cfg.lock().await.api.bind.clone();
     let state = Arc::new(ApiState {
-        preview: PreviewManager::new(&cfg)?,
-        service_replay: Arc::new(Mutex::new(ReplayCache::default())),
-        cfg: Arc::new(Mutex::new(cfg)),
+        preview,
+        cfg,
         cfg_path,
         storage,
         recorder,
     });
     spawn_camera_reconcile_loop(Arc::clone(&state));
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/session", get(ws_session))
-        .route("/service-access/offer", post(managed_offer))
-        .route("/service-access/control", post(managed_control))
-        .route("/service-access/admin", post(managed_admin))
-        .route("/service-access/close", post(managed_close))
-        .route("/v1/logging/events", get(logging_events))
-        .with_state(state);
+    let app = api_router(state);
 
     let listener = TcpListener::bind(&bind).await?;
     info!(bind = %bind, "api listener ready");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn api_router(state: Arc<ApiState>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/v1/logging/events", get(logging_events))
+        .with_state(state)
+}
+
+pub(crate) fn api_route_manifest() -> &'static [&'static str] {
+    &["/health", "/v1/logging/events"]
 }
 
 fn spawn_camera_reconcile_loop(state: Arc<ApiState>) {
@@ -286,7 +274,7 @@ fn camera_drift_reconcile_safe_facts(
     })
 }
 
-async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
+async fn nvr_health_body(state: &ApiState) -> Value {
     let retained_sources = state.storage.list_sources().await.unwrap_or_default();
     let runtime = state.recorder.list_states().await;
     let cfg = state.cfg.lock().await.clone();
@@ -326,7 +314,7 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
         timezone: cfg.camera_network.timezone.clone(),
         dns_server: cfg.camera_network.dns_server.clone(),
     };
-    Json(json!({
+    json!({
         "ok": true,
         "service": "nvr",
         "deviceKind": "service",
@@ -342,1056 +330,17 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
         "mediaProjection": media_projection,
         "sourceRuntime": runtime,
         "configuredSources": cfg.camera_devices.len(),
-    }))
+    })
 }
 
-async fn ws_session(ws: WebSocketUpgrade, State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws(socket, state))
-}
-
-async fn managed_offer(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<SealedServiceAccessRequest>,
-) -> impl IntoResponse {
-    let cfg = state.cfg.lock().await.clone();
-    let request: ManagedOfferRequest = match {
-        let mut replay = state.service_replay.lock().await;
-        open_sealed_service_access_request(&cfg, &mut replay, request, "offer")
-    } {
-        Ok(request) => request,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json::<Value>(json!({
-                    "error": err.to_string(),
-                })),
-            )
-                .into_response();
-        }
-    };
-    crate::logging_surface::submit_safe_event(
-        "live",
-        LogCategory::ServiceAccess,
-        LogSeverity::Info,
-        LogOutcome::Observed,
-        LogSubjectRef {
-            kind: "service".to_string(),
-            id: Some("nvr".to_string()),
-            display: Some("Security Cameras".to_string()),
-        },
-        &["nvr", "service_access", "offer"],
-        json!({
-            "signalType": "offer",
-            "candidateCount": request.candidates.len(),
-        }),
-    )
-    .await;
-    match state.preview.handle_offer(&cfg, request).await {
-        Ok(response) => Json::<Value>(json!({
-            "signalType": response.signal_type,
-            "payload": response.answer,
-            "answer": response.answer,
-            "sessionId": response.session_id,
-            "sources": response.sources,
-        }))
-        .into_response(),
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json::<Value>(json!({
-                "error": err.to_string(),
-            })),
-        )
-            .into_response(),
-    }
-}
-
-async fn managed_close(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<SealedServiceAccessRequest>,
-) -> impl IntoResponse {
-    let cfg = state.cfg.lock().await.clone();
-    let request: ManagedCloseRequest = match {
-        let mut replay = state.service_replay.lock().await;
-        open_sealed_service_access_request(&cfg, &mut replay, request, "session_close")
-    } {
-        Ok(request) => request,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json::<Value>(json!({
-                    "error": err.to_string(),
-                })),
-            )
-                .into_response();
-        }
-    };
-    crate::logging_surface::submit_safe_event(
-        "live",
-        LogCategory::ServiceAccess,
-        LogSeverity::Info,
-        LogOutcome::Observed,
-        LogSubjectRef {
-            kind: "service".to_string(),
-            id: Some("nvr".to_string()),
-            display: Some("Security Cameras".to_string()),
-        },
-        &["nvr", "service_access", "close"],
-        json!({
-            "signalType": "session_close",
-        }),
-    )
-    .await;
-    match state.preview.handle_close(&cfg, request).await {
-        Ok(response) => Json::<Value>(response).into_response(),
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json::<Value>(json!({
-                "error": err.to_string(),
-            })),
-        )
-            .into_response(),
-    }
-}
-
-async fn managed_control(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<SealedServiceAccessRequest>,
-) -> impl IntoResponse {
-    let cfg = state.cfg.lock().await.clone();
-    let request: ManagedControlRequest = match {
-        let mut replay = state.service_replay.lock().await;
-        open_sealed_service_access_request(&cfg, &mut replay, request, "control")
-    } {
-        Ok(request) => request,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json::<Value>(json!({
-                    "error": err.to_string(),
-                })),
-            )
-                .into_response();
-        }
-    };
-    crate::logging_surface::submit_safe_event(
-        "live",
-        LogCategory::ServiceAccess,
-        LogSeverity::Info,
-        LogOutcome::Observed,
-        LogSubjectRef {
-            kind: "service".to_string(),
-            id: Some("nvr".to_string()),
-            display: Some("Security Cameras".to_string()),
-        },
-        &["nvr", "service_access", "control"],
-        json!({
-            "signalType": "control",
-            "ptzRequested": request.payload.get("ptz").is_some(),
-        }),
-    )
-    .await;
-    let camera = match resolve_control_camera(&cfg, &request) {
-        Ok(camera) => camera,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json::<Value>(json!({
-                    "error": err.to_string(),
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    let ptz_payload = request
-        .payload
-        .get("ptz")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let ptz_capable = camera.ptz_capable;
-    if !ptz_capable {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json::<Value>(json!({
-                "error": "camera does not advertise PTZ control",
-            })),
-        )
-            .into_response();
-    }
-
-    match camera_device::control_camera_device(&camera, &ptz_payload).await {
-        Ok(result) => Json::<Value>(json!({
-            "signalType": "control_ack",
-            "sourceId": camera.source_id,
-            "preempted": request.preempted,
-            "controlLease": request.control_lease,
-            "ptz": ptz_payload,
-            "currentPose": result.current_pose,
-            "desiredPose": result.desired_pose,
-            "poseStatus": result.pose_status,
-            "managementPlane": result.management_plane,
-            "ptzDiagnostics": result.ptz_diagnostics,
-            "ok": true,
-        }))
-        .into_response(),
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json::<Value>(json!({
-                "error": err.to_string(),
-            })),
-        )
-            .into_response(),
-    }
-}
-
-async fn managed_admin(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<SealedServiceAccessRequest>,
-) -> impl IntoResponse {
-    let cfg = state.cfg.lock().await.clone();
-    let request: ManagedAdminRequest = match {
-        let mut replay = state.service_replay.lock().await;
-        open_sealed_service_access_request(&cfg, &mut replay, request, "admin")
-    } {
-        Ok(request) => request,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json::<Value>(json!({
-                    "error": err.to_string(),
-                })),
-            )
-                .into_response();
-        }
-    };
-    if let Err(err) = resolve_admin_token(&cfg, &request.service_capability) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json::<Value>(json!({ "error": err.to_string() })),
-        )
-            .into_response();
-    }
-
-    let action = request.action.trim().to_ascii_lowercase();
-    crate::logging_surface::submit_safe_event(
-        "admin",
-        LogCategory::ServiceAccess,
-        LogSeverity::Info,
-        LogOutcome::Observed,
-        LogSubjectRef {
-            kind: "service".to_string(),
-            id: Some("nvr".to_string()),
-            display: Some("Security Cameras".to_string()),
-        },
-        &["nvr", "service_access", "admin"],
-        json!({
-            "signalType": "admin",
-            "action": action.clone(),
-        }),
-    )
-    .await;
-    let response = match action.as_str() {
-        "list_camera_device_inventory" => {
-            let inventory = match camera_device::inventory::list_camera_device_inventory(&cfg).await
-            {
-                Ok(inventory) => inventory,
-                Err(err) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json::<Value>(json!({ "error": err.to_string() })),
-                    )
-                        .into_response();
-                }
-            };
-            json!({ "action": action, "inventory": inventory })
-        }
-        "mount_camera_device" => {
-            let mount_request: camera_device::MountCameraRequest =
-                match serde_json::from_value(request.payload.clone()) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json::<Value>(
-                                json!({ "error": format!("invalid mount request: {err}") }),
-                            ),
-                        )
-                            .into_response();
-                    }
-                };
-            let mounted = match camera_device::mount_camera_device(&cfg, mount_request).await {
-                Ok(result) => result,
-                Err(err) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json::<Value>(json!({ "error": err.to_string() })),
-                    )
-                        .into_response();
-                }
-            };
-            if let Err(err) =
-                persist_camera_source(state.as_ref(), mounted.configured.clone()).await
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json::<Value>(json!({ "error": err.to_string() })),
-                )
-                    .into_response();
-            }
-            json!({ "action": action, "mounted": mounted.mounted })
-        }
-        "apply_camera_device_config" => {
-            let apply_request: camera_device::ApplyMountedCameraRequest =
-                match serde_json::from_value(request.payload.clone()) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json::<Value>(
-                                json!({ "error": format!("invalid apply request: {err}") }),
-                            ),
-                        )
-                            .into_response();
-                    }
-                };
-            let applied =
-                match camera_device::apply::apply_camera_device_config(&cfg, apply_request).await {
-                    Ok(result) => result,
-                    Err(err) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json::<Value>(json!({ "error": err.to_string() })),
-                        )
-                            .into_response();
-                    }
-                };
-            if let Err(err) =
-                persist_camera_source(state.as_ref(), applied.configured.clone()).await
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json::<Value>(json!({ "error": err.to_string() })),
-                )
-                    .into_response();
-            }
-            json!({ "action": action, "mounted": applied.mounted })
-        }
-        "read_camera_device" => {
-            let source_id = request
-                .payload
-                .get("sourceId")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let mounted = match camera_device::inventory::read_camera_device(&cfg, &source_id).await
-            {
-                Ok(result) => result,
-                Err(err) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json::<Value>(json!({ "error": err.to_string() })),
-                    )
-                        .into_response();
-                }
-            };
-            json!({ "action": action, "mounted": mounted })
-        }
-        "probe_camera_device" => {
-            let probe_request: camera_device::ProbeCameraRequest =
-                match serde_json::from_value(request.payload.clone()) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json::<Value>(
-                                json!({ "error": format!("invalid probe request: {err}") }),
-                            ),
-                        )
-                            .into_response();
-                    }
-                };
-            let result = match camera_device::probe_camera_device(&cfg, probe_request).await {
-                Ok(result) => result,
-                Err(err) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json::<Value>(json!({ "error": err.to_string() })),
-                    )
-                        .into_response();
-                }
-            };
-            json!({ "action": action, "result": result })
-        }
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json::<Value>(json!({ "error": "unsupported admin action" })),
-            )
-                .into_response();
-        }
-    };
-    Json::<Value>(response).into_response()
+async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
+    Json(nvr_health_body(&state).await)
 }
 
 async fn logging_events(
     Query(query): Query<crate::logging_surface::LoggingEventsQuery>,
-) -> impl IntoResponse {
+) -> Json<crate::logging_surface::ProducerEventsResponse> {
     Json(crate::logging_surface::read_events(query))
-}
-
-#[derive(Debug, Deserialize)]
-struct HelloReq {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(rename = "identityId")]
-    identity_id: String,
-    #[serde(rename = "devicePk")]
-    device_pk: String,
-    #[serde(rename = "clientKey")]
-    client_key: String,
-    ts: u64,
-    proof: String,
-}
-
-#[derive(Debug, Serialize)]
-struct HelloAck {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    #[serde(rename = "sessionId")]
-    session_id: String,
-    #[serde(rename = "serverKey")]
-    server_key: String,
-    ts: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct CipherEnvelope {
-    #[serde(rename = "type")]
-    kind: String,
-    nonce: String,
-    data: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "cmd", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
-enum ClientCommand {
-    ListSources,
-    ListSourceStates,
-    DiscoverOnvif,
-    DiscoverReolink,
-    ProbeReolink {
-        ip: String,
-    },
-    ReadReolinkState {
-        request: reolink::ReolinkConnectRequest,
-    },
-    ApplyReolinkState {
-        request: reolink::ReolinkStateApplyRequest,
-    },
-    SetupReolink {
-        request: reolink::ReolinkSetupRequest,
-    },
-    BootstrapReolink {
-        request: reolink::ReolinkBootstrapRequest,
-    },
-    UpsertSource {
-        source: SourceUpsert,
-    },
-    RemoveSource {
-        #[serde(rename = "sourceId")]
-        source_id: String,
-    },
-    ListSegments {
-        #[serde(rename = "sourceId")]
-        source_id: String,
-        limit: Option<usize>,
-    },
-    GetSegment {
-        #[serde(rename = "sourceId")]
-        source_id: String,
-        name: String,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SourceUpsert {
-    source_id: String,
-    name: String,
-    onvif_host: String,
-    #[serde(default = "default_onvif_port")]
-    onvif_port: u16,
-    rtsp_url: String,
-    #[serde(default)]
-    username: String,
-    #[serde(default)]
-    password: String,
-    #[serde(default = "default_enabled")]
-    enabled: bool,
-    #[serde(default = "default_segment_secs")]
-    segment_secs: u64,
-}
-
-impl SourceUpsert {
-    fn into_camera(self) -> Result<CameraDeviceConfig> {
-        if self.source_id.trim().is_empty() {
-            return Err(anyhow!("sourceId is required"));
-        }
-        if self.rtsp_url.trim().is_empty() {
-            return Err(anyhow!("rtsp_url is required"));
-        }
-        if self.onvif_host.trim().is_empty() {
-            return Err(anyhow!("onvif_host is required"));
-        }
-        Ok(CameraDeviceConfig {
-            source_id: self.source_id.trim().to_string(),
-            name: if self.name.trim().is_empty() {
-                self.source_id.trim().to_string()
-            } else {
-                self.name.trim().to_string()
-            },
-            onvif_host: self.onvif_host.trim().to_string(),
-            onvif_port: self.onvif_port,
-            rtsp_url: self.rtsp_url.trim().to_string(),
-            username: self.username,
-            password: self.password,
-            driver_id: if self.source_id.trim().starts_with("reolink-") {
-                camera_device::registry::DRIVER_ID_REOLINK.to_string()
-            } else {
-                camera_device::registry::DRIVER_ID_GENERIC_ONVIF_RTSP.to_string()
-            },
-            vendor: String::new(),
-            model: String::new(),
-            mac_address: String::new(),
-            rtsp_port: 554,
-            ptz_capable: self.source_id.trim().starts_with("reolink-"),
-            enabled: self.enabled,
-            segment_secs: self.segment_secs.max(2),
-            desired: CameraDeviceDesiredConfig {
-                display_name: if self.name.trim().is_empty() {
-                    self.source_id.trim().to_string()
-                } else {
-                    self.name.trim().to_string()
-                },
-                ..Default::default()
-            },
-            credentials: Default::default(),
-        })
-    }
-}
-
-async fn handle_ws(mut socket: WebSocket, state: Arc<ApiState>) {
-    let hello_msg = match socket.next().await {
-        Some(Ok(Message::Text(text))) => text,
-        _ => {
-            let _ = socket.close().await;
-            return;
-        }
-    };
-
-    let hello: HelloReq = match serde_json::from_str(&hello_msg) {
-        Ok(v) => v,
-        Err(_) => {
-            let _ = socket
-                .send(Message::Text(error_json("invalid hello payload").into()))
-                .await;
-            let _ = socket.close().await;
-            return;
-        }
-    };
-
-    if hello.kind != "hello" {
-        let _ = socket
-            .send(Message::Text(error_json("expected hello frame").into()))
-            .await;
-        let _ = socket.close().await;
-        return;
-    }
-
-    let cfg_snapshot = state.cfg.lock().await.clone();
-
-    if let Err(err) = validate_hello(&cfg_snapshot, &hello) {
-        let _ = socket
-            .send(Message::Text(error_json(&err.to_string()).into()))
-            .await;
-        let _ = socket.close().await;
-        return;
-    }
-
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let context = format!(
-        "constitute-nvr:{}:{}",
-        cfg_snapshot.api.identity_id, session_id
-    );
-
-    let (session_key, server_key) = match crypto::derive_session_key(
-        &cfg_snapshot.api.server_secret_hex,
-        session_identity_secret_hex(&cfg_snapshot),
-        &hello.client_key,
-        &context,
-    ) {
-        Ok(v) => v,
-        Err(err) => {
-            let _ = socket
-                .send(Message::Text(
-                    error_json(&format!("key derivation failed: {}", err)).into(),
-                ))
-                .await;
-            let _ = socket.close().await;
-            return;
-        }
-    };
-
-    let ack = HelloAck {
-        kind: "hello_ack",
-        session_id: session_id.clone(),
-        server_key,
-        ts: util::now_ms(),
-    };
-    let _ = socket
-        .send(Message::Text(
-            serde_json::to_string(&ack)
-                .unwrap_or_else(|_| "{}".to_string())
-                .into(),
-        ))
-        .await;
-
-    debug!(session_id = %session_id, device = %hello.device_pk, "session established");
-
-    while let Some(frame) = socket.next().await {
-        let text = match frame {
-            Ok(Message::Text(t)) => t,
-            Ok(Message::Close(_)) => break,
-            Ok(_) => continue,
-            Err(_) => break,
-        };
-
-        let env: CipherEnvelope = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(_) => {
-                let _ =
-                    send_cipher_error(&mut socket, &session_key, "invalid cipher envelope").await;
-                continue;
-            }
-        };
-
-        if env.kind != "cipher" {
-            let _ = send_cipher_error(&mut socket, &session_key, "expected cipher envelope").await;
-            continue;
-        }
-
-        let nonce_bytes = match base64::engine::general_purpose::STANDARD.decode(&env.nonce) {
-            Ok(v) => v,
-            Err(_) => {
-                let _ =
-                    send_cipher_error(&mut socket, &session_key, "invalid nonce encoding").await;
-                continue;
-            }
-        };
-
-        let nonce: [u8; 24] = match nonce_bytes.try_into() {
-            Ok(v) => v,
-            Err(_) => {
-                let _ = send_cipher_error(&mut socket, &session_key, "invalid nonce length").await;
-                continue;
-            }
-        };
-
-        let cipher = match base64::engine::general_purpose::STANDARD.decode(&env.data) {
-            Ok(v) => v,
-            Err(_) => {
-                let _ = send_cipher_error(&mut socket, &session_key, "invalid cipher data").await;
-                continue;
-            }
-        };
-
-        let plain = match crypto::decrypt_payload(&session_key, &nonce, &cipher) {
-            Ok(v) => v,
-            Err(_) => {
-                let _ = send_cipher_error(&mut socket, &session_key, "decrypt failed").await;
-                continue;
-            }
-        };
-
-        let cmd: ClientCommand = match serde_json::from_slice(&plain) {
-            Ok(v) => v,
-            Err(_) => {
-                let _ =
-                    send_cipher_error(&mut socket, &session_key, "invalid command payload").await;
-                continue;
-            }
-        };
-
-        if let Err(err) = handle_command(cmd, &mut socket, &session_key, &state).await {
-            warn!(session_id = %session_id, error = %err, "command handling failed");
-            let _ = send_cipher_error(&mut socket, &session_key, &err.to_string()).await;
-        }
-    }
-}
-
-fn validate_hello(cfg: &Config, hello: &HelloReq) -> Result<()> {
-    if hello.identity_id != cfg.api.identity_id {
-        return Err(anyhow!("identity mismatch"));
-    }
-
-    if !cfg.api.authorized_device_pks.is_empty()
-        && !cfg
-            .api
-            .authorized_device_pks
-            .iter()
-            .any(|pk| pk == &hello.device_pk)
-    {
-        return Err(anyhow!("device is not authorized for this identity"));
-    }
-
-    let now = util::now_unix_seconds();
-    let ts = hello.ts;
-    let skew = now.abs_diff(ts);
-    if skew > 300 {
-        return Err(anyhow!("hello timestamp outside allowed skew"));
-    }
-
-    if cfg.api.allow_unsigned_debug_hello {
-        return Ok(());
-    }
-
-    let proof_ok = crypto::verify_hello_proof(
-        &cfg.api.identity_secret_hex,
-        &hello.identity_id,
-        &hello.device_pk,
-        &hello.client_key,
-        hello.ts,
-        &hello.proof,
-    )?;
-
-    if !proof_ok {
-        return Err(anyhow!("invalid hello proof"));
-    }
-
-    Ok(())
-}
-
-fn session_identity_secret_hex(cfg: &Config) -> &str {
-    if cfg.api.allow_unsigned_debug_hello {
-        INSECURE_HELLO_SECRET_HEX
-    } else {
-        &cfg.api.identity_secret_hex
-    }
-}
-
-async fn handle_command(
-    cmd: ClientCommand,
-    socket: &mut WebSocket,
-    key: &[u8],
-    state: &ApiState,
-) -> Result<()> {
-    match cmd {
-        ClientCommand::ListSources => {
-            let sources = state.storage.list_sources().await?;
-            send_cipher_json(
-                socket,
-                key,
-                &json!({
-                    "ok": true,
-                    "cmd": "list_sources",
-                    "sources": sources,
-                }),
-            )
-            .await?;
-        }
-        ClientCommand::ListSourceStates => {
-            let runtime = state.recorder.list_states().await;
-            send_cipher_json(
-                socket,
-                key,
-                &json!({
-                    "ok": true,
-                    "cmd": "list_source_states",
-                    "states": runtime,
-                }),
-            )
-            .await?;
-        }
-        ClientCommand::DiscoverOnvif => {
-            let found = crate::recording::discover_onvif(3).await?;
-            send_cipher_json(
-                socket,
-                key,
-                &json!({
-                    "ok": true,
-                    "cmd": "discover_onvif",
-                    "cameraDevices": found,
-                }),
-            )
-            .await?;
-        }
-        ClientCommand::DiscoverReolink => {
-            let found = reolink::discover(3).await?;
-            send_cipher_json(
-                socket,
-                key,
-                &json!({
-                    "ok": true,
-                    "cmd": "discover_reolink",
-                    "devices": found,
-                }),
-            )
-            .await?;
-        }
-        ClientCommand::ProbeReolink { ip } => {
-            let result = reolink::probe(&ip, 3).await?;
-            send_cipher_json(
-                socket,
-                key,
-                &json!({
-                    "ok": true,
-                    "cmd": "probe_reolink",
-                    "result": result,
-                }),
-            )
-            .await?;
-        }
-        ClientCommand::ReadReolinkState { request } => {
-            let result = reolink::read_state(request).await?;
-            send_cipher_json(
-                socket,
-                key,
-                &json!({
-                    "ok": true,
-                    "cmd": "read_reolink_state",
-                    "result": result,
-                }),
-            )
-            .await?;
-        }
-        ClientCommand::ApplyReolinkState { request } => {
-            let result = reolink::apply_state(request).await?;
-            send_cipher_json(
-                socket,
-                key,
-                &json!({
-                    "ok": true,
-                    "cmd": "apply_reolink_state",
-                    "result": result,
-                }),
-            )
-            .await?;
-        }
-        ClientCommand::SetupReolink { request } => {
-            let request = request.normalized()?;
-            let result = reolink::setup(request.clone()).await?;
-
-            let effective_password = if !result.generated_password.trim().is_empty() {
-                result.generated_password.clone()
-            } else if !request.desired_password.trim().is_empty() {
-                request.desired_password.clone()
-            } else {
-                request.password.clone()
-            };
-
-            let onvif_port = if result.bridge.after_advanced.i_onvif_port_enable != 0 {
-                result.bridge.after_advanced.i_onvif_port.max(1) as u16
-            } else {
-                8000
-            };
-
-            let rtsp_port = if result.bridge.after_advanced.i_rtsp_port_enable != 0 {
-                result.bridge.after_advanced.i_rtsp_port.max(1) as u16
-            } else {
-                554
-            };
-
-            let discovered = reolink::discover_with_hint(&request.ip, 2)
-                .await
-                .unwrap_or_default();
-            let discovered_entry = discovered
-                .into_iter()
-                .find(|d| d.ip.trim() == request.ip.trim());
-            let uid = discovered_entry
-                .as_ref()
-                .map(|d| d.uid.clone())
-                .unwrap_or_default();
-            let mac = discovered_entry
-                .as_ref()
-                .map(|d| d.mac.clone())
-                .unwrap_or_default();
-            let model = discovered_entry
-                .as_ref()
-                .map(|d| d.model.clone())
-                .unwrap_or_default();
-
-            let source_id =
-                camera_device::reolink_stable_source_id(&uid, &mac).ok_or_else(|| {
-                    anyhow!(
-                        "Reolink setup did not discover a stable UID or MAC for source identity"
-                    )
-                })?;
-            let source_name = if model.trim().is_empty() {
-                format!("Reolink {}", request.ip)
-            } else {
-                model
-            };
-            let camera_cfg = CameraDeviceConfig {
-                source_id: source_id.clone(),
-                name: source_name.clone(),
-                onvif_host: request.ip.clone(),
-                onvif_port,
-                rtsp_url: format!(
-                    "rtsp://{}:{}@{}:{}/h264Preview_01_main",
-                    request.username, effective_password, request.ip, rtsp_port
-                ),
-                username: request.username.clone(),
-                password: effective_password,
-                driver_id: camera_device::registry::DRIVER_ID_REOLINK.to_string(),
-                vendor: "Reolink".to_string(),
-                model: discovered_entry
-                    .as_ref()
-                    .map(|entry| entry.model.clone())
-                    .unwrap_or_default(),
-                mac_address: mac,
-                rtsp_port,
-                ptz_capable: source_id.contains("e1") || source_id.contains("ptz"),
-                enabled: true,
-                segment_secs: 10,
-                desired: CameraDeviceDesiredConfig {
-                    display_name: source_name.clone(),
-                    overlay_text: source_name.clone(),
-                    overlay_timestamp: true,
-                    ..Default::default()
-                },
-                credentials: Default::default(),
-            };
-
-            persist_camera_source(state, camera_cfg.clone()).await?;
-
-            send_cipher_json(
-                socket,
-                key,
-                &json!({
-                    "ok": true,
-                    "cmd": "setup_reolink",
-                    "result": result,
-                    "source": camera_cfg,
-                }),
-            )
-            .await?;
-        }
-        ClientCommand::BootstrapReolink { request } => {
-            let result = reolink::bootstrap(request).await?;
-            send_cipher_json(
-                socket,
-                key,
-                &json!({
-                    "ok": true,
-                    "cmd": "bootstrap_reolink",
-                    "result": result,
-                }),
-            )
-            .await?;
-        }
-        ClientCommand::UpsertSource { source } => {
-            let camera_cfg = source.into_camera()?;
-            persist_camera_source(state, camera_cfg.clone()).await?;
-
-            send_cipher_json(
-                socket,
-                key,
-                &json!({
-                    "ok": true,
-                    "cmd": "upsert_source",
-                    "source": camera_cfg,
-                }),
-            )
-            .await?;
-        }
-        ClientCommand::RemoveSource { source_id } => {
-            let removed = {
-                let mut guard = state.cfg.lock().await;
-                let before = guard.camera_devices.len();
-                guard.camera_devices.retain(|c| c.source_id != source_id);
-                let changed = guard.camera_devices.len() != before;
-                if changed {
-                    let snapshot = guard.clone();
-                    snapshot.persist(&state.cfg_path)?;
-                }
-                changed
-            };
-
-            let runtime_removed = state.recorder.remove_camera(&source_id).await;
-
-            send_cipher_json(
-                socket,
-                key,
-                &json!({
-                    "ok": true,
-                    "cmd": "remove_source",
-                    "sourceId": source_id,
-                    "removed": removed || runtime_removed,
-                }),
-            )
-            .await?;
-        }
-        ClientCommand::ListSegments { source_id, limit } => {
-            let segments = state
-                .storage
-                .list_segments(&source_id, limit.unwrap_or(30))
-                .await?;
-            send_cipher_json(
-                socket,
-                key,
-                &json!({
-                    "ok": true,
-                    "cmd": "list_segments",
-                    "sourceId": source_id,
-                    "segments": segments,
-                }),
-            )
-            .await?;
-        }
-        ClientCommand::GetSegment { source_id, name } => {
-            let data = state.storage.read_segment(&source_id, &name).await?;
-            send_cipher_json(
-                socket,
-                key,
-                &json!({
-                    "ok": true,
-                    "cmd": "segment_start",
-                    "sourceId": source_id,
-                    "name": name,
-                    "bytes": data.len(),
-                }),
-            )
-            .await?;
-
-            for (idx, chunk) in data.chunks(48 * 1024).enumerate() {
-                send_cipher_json(
-                    socket,
-                    key,
-                    &json!({
-                        "ok": true,
-                        "cmd": "segment_chunk",
-                        "seq": idx,
-                        "data": base64::engine::general_purpose::STANDARD.encode(chunk),
-                    }),
-                )
-                .await?;
-            }
-
-            send_cipher_json(
-                socket,
-                key,
-                &json!({
-                    "ok": true,
-                    "cmd": "segment_end",
-                    "name": name,
-                }),
-            )
-            .await?;
-        }
-    }
-    Ok(())
 }
 
 async fn persist_camera_source(state: &ApiState, camera_cfg: CameraDeviceConfig) -> Result<()> {
@@ -1432,42 +381,17 @@ async fn persist_camera_source_replacing(
             .remove_camera(previous_source_id.trim())
             .await;
     }
-    state.recorder.upsert_camera(storage_root, camera_cfg).await;
+    state
+        .recorder
+        .upsert_camera(storage_root, camera_cfg.clone())
+        .await;
+
+    state
+        .preview
+        .refresh_camera_source(previous_source_id, camera_cfg)
+        .await;
 
     Ok(())
-}
-
-async fn send_cipher_error(socket: &mut WebSocket, key: &[u8], message: &str) -> Result<()> {
-    send_cipher_json(socket, key, &json!({"ok": false, "error": message})).await
-}
-
-async fn send_cipher_json(socket: &mut WebSocket, key: &[u8], value: &Value) -> Result<()> {
-    let plain = serde_json::to_vec(value)?;
-    let nonce = crypto::random_nonce_24();
-    let cipher = crypto::encrypt_payload(key, &nonce, &plain)?;
-    let frame = json!({
-        "type": "cipher",
-        "nonce": base64::engine::general_purpose::STANDARD.encode(nonce),
-        "data": base64::engine::general_purpose::STANDARD.encode(cipher),
-    });
-    socket.send(Message::Text(frame.to_string().into())).await?;
-    Ok(())
-}
-
-fn error_json(message: &str) -> String {
-    json!({"ok": false, "error": message}).to_string()
-}
-
-fn default_onvif_port() -> u16 {
-    80
-}
-
-fn default_enabled() -> bool {
-    true
-}
-
-fn default_segment_secs() -> u64 {
-    10
 }
 
 #[cfg(test)]
@@ -1528,5 +452,24 @@ mod tests {
         assert!(facts.get("username").is_none());
         assert!(facts.get("onvifHost").is_none());
         assert!(facts.get("macAddress").is_none());
+    }
+
+    #[test]
+    fn api_route_manifest_omits_retired_product_routes() {
+        let routes = api_route_manifest();
+        let retired_access_prefix = format!("/{}-{}", "service", "access");
+        let retired_exchange_route = format!("/{}-{}", "service", "exchange");
+        let retired_swarm_edge_route = format!("/{}{}", "swarm", "/edge");
+
+        assert!(routes.contains(&"/health"));
+        assert!(routes.contains(&"/v1/logging/events"));
+        assert!(
+            !routes
+                .iter()
+                .any(|route| route.starts_with(&retired_access_prefix))
+        );
+        assert!(!routes.contains(&retired_exchange_route.as_str()));
+        assert!(!routes.contains(&format!("/sess{}", "ion").as_str()));
+        assert!(!routes.contains(&retired_swarm_edge_route.as_str()));
     }
 }

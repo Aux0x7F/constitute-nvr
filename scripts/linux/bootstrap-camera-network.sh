@@ -11,6 +11,9 @@ DHCP_RANGE_START=""
 DHCP_RANGE_END=""
 declare -a ONBOARDING_ALIASES=()
 DNSMASQ_CONF="/etc/dnsmasq.d/constitute-nvr-camera.conf"
+DNSMASQ_SYSTEMD_DROPIN="/etc/systemd/system/dnsmasq.service.d/20-constitute-nvr-camera-network.conf"
+DNSMASQ_WAIT_SCRIPT="/usr/local/libexec/constitute-nvr-wait-camera-interface"
+DNSMASQ_HEAL_UNIT="/etc/systemd/system/constitute-nvr-camera-network-heal@.service"
 CHRONY_DROPIN=""
 
 usage() {
@@ -406,8 +409,66 @@ dhcp-range=${DHCP_RANGE_START},${DHCP_RANGE_END},255.255.255.0,12h
 dhcp-option=option:dns-server,${HOST_IP}
 dhcp-option=option:ntp-server,${HOST_IP}
 EOF
+  write_dnsmasq_self_heal
   run_sudo systemctl enable --now dnsmasq >/dev/null
   run_sudo systemctl restart dnsmasq >/dev/null
+}
+
+write_dnsmasq_self_heal() {
+  run_sudo mkdir -p "$(dirname "$DNSMASQ_WAIT_SCRIPT")"
+  cat <<'EOF' | run_sudo tee "$DNSMASQ_WAIT_SCRIPT" >/dev/null
+#!/usr/bin/env bash
+set -euo pipefail
+
+iface="${1:?camera interface name required}"
+timeout_secs="${2:-120}"
+deadline=$((SECONDS + timeout_secs))
+
+while true; do
+  if ip link show dev "$iface" >/dev/null 2>&1; then
+    exit 0
+  fi
+  if (( SECONDS >= deadline )); then
+    echo "camera interface ${iface} not present after ${timeout_secs}s" >&2
+    exit 1
+  fi
+  sleep 2
+done
+EOF
+  run_sudo chmod 0755 "$DNSMASQ_WAIT_SCRIPT"
+
+  run_sudo mkdir -p "$(dirname "$DNSMASQ_SYSTEMD_DROPIN")"
+  cat <<EOF | run_sudo tee "$DNSMASQ_SYSTEMD_DROPIN" >/dev/null
+[Unit]
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+ExecStartPre=${DNSMASQ_WAIT_SCRIPT} ${CAMERA_IFACE} 120
+Restart=on-failure
+RestartSec=5s
+EOF
+
+  run_sudo systemctl unmask "$(basename "$DNSMASQ_HEAL_UNIT")" >/dev/null 2>&1 || true
+  run_sudo rm -f "$DNSMASQ_HEAL_UNIT"
+  cat <<'EOF' | run_sudo tee "$DNSMASQ_HEAL_UNIT" >/dev/null
+[Unit]
+Description=Restart dnsmasq when Constitute NVR camera interface %i appears
+BindsTo=sys-subsystem-net-devices-%i.device
+After=sys-subsystem-net-devices-%i.device
+ConditionPathExists=/etc/dnsmasq.d/constitute-nvr-camera.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart dnsmasq.service
+
+[Install]
+WantedBy=sys-subsystem-net-devices-%i.device
+EOF
+
+  run_sudo systemctl daemon-reload
+  run_sudo systemctl enable "constitute-nvr-camera-network-heal@${CAMERA_IFACE}.service" >/dev/null
 }
 
 chrony_allow_networks() {

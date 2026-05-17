@@ -11,6 +11,8 @@ mod nostr;
 mod recording;
 mod storage;
 mod swarm;
+mod swarm_edge;
+mod swarm_edge_client;
 mod update;
 mod util;
 
@@ -18,10 +20,13 @@ use anyhow::Result;
 use camera_device::drivers::reolink::driver as reolink;
 use clap::Parser;
 use config::{CameraDeviceConfig, CameraDeviceDesiredConfig, Config};
+use live::PreviewManager;
 use recording::RecorderManager;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -284,7 +289,11 @@ async fn main() -> Result<()> {
     let recorder = RecorderManager::new();
     recorder.ensure_started(&cfg).await;
 
-    let swarm_handle = swarm::start(cfg.clone()).await?;
+    let preview = PreviewManager::new(&cfg)?;
+    let runtime_cfg = Arc::new(Mutex::new(cfg.clone()));
+    let swarm_edge = swarm_edge::SwarmEdge::new(Arc::clone(&runtime_cfg), preview.clone());
+    let _edge_stream = swarm_edge_client::start(Arc::clone(&runtime_cfg), swarm_edge);
+    let swarm_handle = swarm::start(Arc::clone(&runtime_cfg)).await?;
 
     if args.once {
         let sources = storage.list_sources().await.unwrap_or_default();
@@ -312,7 +321,7 @@ async fn main() -> Result<()> {
         "constitute-nvr starting"
     );
 
-    api::run(cfg, cfg_path, storage, recorder).await
+    api::run(runtime_cfg, cfg_path, storage, recorder, preview).await
 }
 
 fn warn_if_camera_network_not_ready(cfg: &Config) {

@@ -1,7 +1,18 @@
+//! UDP bootstrap/fallback presence lane.
+//!
+//! This module intentionally carries Nostr-shaped discovery records only for
+//! bootstrap, pairing, and fallback presence. Normal NVR stream control runs
+//! through `swarm_edge` frames and route/stream records.
+
 use crate::config::Config;
 use crate::nostr::{self, NostrEvent};
 use crate::util;
 use anyhow::{Context, Result};
+use constitute_protocol::{
+    CAPABILITY_MEDIA_STREAM_PREVIEW, CAPABILITY_PROJECTION_DELTA_APPLY,
+    CAPABILITY_PROJECTION_OBSERVE, CAPABILITY_STORAGE_PIN, CAPABILITY_STREAM_SESSION_CONTROL,
+    CAPABILITY_STREAM_SESSION_OFFER,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -69,8 +80,6 @@ struct DeviceRecordPayload {
     #[serde(skip_serializing_if = "String::is_empty")]
     ui_manifest_url: String,
     ui_entry: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    session_ws_url: String,
     #[serde(default)]
     allow_unsigned_debug_hello: bool,
     metrics: DeviceMetricsPayload,
@@ -113,21 +122,22 @@ impl SwarmHandle {
     }
 }
 
-pub async fn start(cfg: Config) -> Result<SwarmHandle> {
-    let bind: SocketAddr = cfg
+pub async fn start(cfg: Arc<Mutex<Config>>) -> Result<SwarmHandle> {
+    let cfg_snapshot = cfg.lock().await.clone();
+    let bind: SocketAddr = cfg_snapshot
         .swarm
         .bind
         .parse()
-        .with_context(|| format!("invalid swarm.bind: {}", cfg.swarm.bind))?;
+        .with_context(|| format!("invalid swarm.bind: {}", cfg_snapshot.swarm.bind))?;
 
     let socket = Arc::new(UdpSocket::bind(bind).await?);
-    let peers = Arc::new(Mutex::new(resolve_peers(&cfg.swarm.peers).await));
+    let peers = Arc::new(Mutex::new(resolve_peers(&cfg_snapshot.swarm.peers).await));
     let table = Arc::new(Mutex::new(HashMap::<SocketAddr, PeerState>::new()));
 
     let recv_socket = Arc::clone(&socket);
     let recv_peers = Arc::clone(&peers);
     let recv_table = Arc::clone(&table);
-    let recv_cfg = cfg.clone();
+    let recv_cfg = Arc::clone(&cfg);
 
     tokio::spawn(async move {
         if let Err(err) = recv_loop(recv_socket, recv_peers, recv_table, recv_cfg).await {
@@ -138,7 +148,7 @@ pub async fn start(cfg: Config) -> Result<SwarmHandle> {
     let tx_socket = Arc::clone(&socket);
     let tx_peers = Arc::clone(&peers);
     let tx_table = Arc::clone(&table);
-    let tx_cfg = cfg.clone();
+    let tx_cfg = Arc::clone(&cfg);
 
     tokio::spawn(async move {
         if let Err(err) = announce_loop(tx_socket, tx_peers, tx_table, tx_cfg).await {
@@ -168,22 +178,25 @@ async fn announce_loop(
     socket: Arc<UdpSocket>,
     peers: Arc<Mutex<Vec<SocketAddr>>>,
     table: Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
-    cfg: Config,
+    cfg: Arc<Mutex<Config>>,
 ) -> Result<()> {
     let started_at = Instant::now();
+    let initial_cfg = cfg.lock().await.clone();
     let mut hello_tick = interval(Duration::from_secs(5));
-    let mut announce_tick = interval(Duration::from_secs(cfg.swarm.announce_interval_secs.max(5)));
-    let zones = cfg
+    let mut announce_tick = interval(Duration::from_secs(
+        initial_cfg.swarm.announce_interval_secs.max(5),
+    ));
+    let zones = initial_cfg
         .swarm
         .zones
         .iter()
         .map(|z| z.key.clone())
         .collect::<Vec<_>>();
 
-    let pair_identity_label = cfg.pair_identity_label.trim().to_string();
-    let pair_code = cfg.pair_code.trim().to_string();
-    let pair_code_hash = if !cfg.pair_code_hash.trim().is_empty() {
-        cfg.pair_code_hash.trim().to_string()
+    let pair_identity_label = initial_cfg.pair_identity_label.trim().to_string();
+    let pair_code = initial_cfg.pair_code.trim().to_string();
+    let pair_code_hash = if !initial_cfg.pair_code_hash.trim().is_empty() {
+        initial_cfg.pair_code_hash.trim().to_string()
     } else if !pair_identity_label.is_empty() && !pair_code.is_empty() {
         util::sha256_b64url(&format!("{}|{}", pair_identity_label, pair_code))
     } else {
@@ -197,9 +210,11 @@ async fn announce_loop(
     }
 
     let pair_enabled = !pair_identity_label.is_empty() && !pair_code_hash.is_empty();
-    let mut pair_tick = interval(Duration::from_secs(cfg.pair_request_interval_secs.max(5)));
+    let mut pair_tick = interval(Duration::from_secs(
+        initial_cfg.pair_request_interval_secs.max(5),
+    ));
     let mut pair_attempts_remaining = if pair_enabled {
-        cfg.pair_request_attempts.max(1)
+        initial_cfg.pair_request_attempts.max(1)
     } else {
         0
     };
@@ -209,14 +224,15 @@ async fn announce_loop(
             _ = hello_tick.tick() => {
                 let hello = UdpMessage::Hello {
                     v: PROTOCOL_VERSION,
-                    node_id: cfg.node_id.clone(),
-                    device_pk: cfg.nostr_pubkey.clone(),
+                    node_id: initial_cfg.node_id.clone(),
+                    device_pk: initial_cfg.nostr_pubkey.clone(),
                     zones: zones.clone(),
                     ts: util::now_ms(),
                 };
                 broadcast_json(&socket, &peers, &hello).await;
             }
             _ = announce_tick.tick() => {
+                let cfg = cfg.lock().await.clone();
                 let peers_known = peers.lock().await.len() as u64;
                 let peers_confirmed = table.lock().await.values().filter(|p| p.confirmed).count() as u64;
                 let cameras_total = cfg.camera_devices.len() as u64;
@@ -253,6 +269,7 @@ async fn announce_loop(
                 }
             }
             _ = pair_tick.tick(), if pair_enabled && pair_attempts_remaining > 0 => {
+                let cfg = cfg.lock().await.clone();
                 for zone in &zones {
                     match build_pair_request_event(&cfg, zone, &pair_identity_label, &pair_code, &pair_code_hash) {
                         Ok(ev) => {
@@ -282,7 +299,7 @@ async fn recv_loop(
     socket: Arc<UdpSocket>,
     peers: Arc<Mutex<Vec<SocketAddr>>>,
     table: Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
-    cfg: Config,
+    cfg: Arc<Mutex<Config>>,
 ) -> Result<()> {
     let mut buf = vec![0u8; 65_535];
     loop {
@@ -315,11 +332,17 @@ async fn recv_loop(
                     );
                 }
 
+                let cfg_snapshot = cfg.lock().await.clone();
                 let ack = UdpMessage::Ack {
                     v: PROTOCOL_VERSION,
-                    node_id: cfg.node_id.clone(),
-                    device_pk: cfg.nostr_pubkey.clone(),
-                    zones: cfg.swarm.zones.iter().map(|z| z.key.clone()).collect(),
+                    node_id: cfg_snapshot.node_id.clone(),
+                    device_pk: cfg_snapshot.nostr_pubkey.clone(),
+                    zones: cfg_snapshot
+                        .swarm
+                        .zones
+                        .iter()
+                        .map(|z| z.key.clone())
+                        .collect(),
                     ts: util::now_ms(),
                 };
                 send_json(&socket, from, &ack).await;
@@ -417,22 +440,23 @@ fn build_device_record(cfg: &Config, metrics: &DeviceMetricsPayload) -> Result<N
         host_gateway_pk: cfg.gateway.host_gateway_pk.clone(),
         service_version: cfg.service_version.clone(),
         ingest_protocols: vec!["onvif".to_string(), "rtsp".to_string()],
-        capabilities: vec!["camera".to_string()],
+        capabilities: nvr_swarm_capabilities()
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect(),
         ui_repo: cfg.ui.repo.clone(),
         ui_ref: cfg.ui.repo_ref.clone(),
         ui_manifest_url: cfg.ui.manifest_url.clone(),
         ui_entry: cfg.ui.entry.clone(),
-        session_ws_url: cfg.api.public_ws_url.clone(),
         allow_unsigned_debug_hello: cfg.api.allow_unsigned_debug_hello,
         metrics: metrics.clone(),
     };
     let content = serde_json::to_string(&payload)?;
-    let tags = vec![
+    let mut tags = vec![
         vec!["t".to_string(), "swarm_discovery".to_string()],
         vec!["type".to_string(), "device".to_string()],
         vec!["role".to_string(), cfg.node_role.clone()],
         vec!["service".to_string(), "nvr".to_string()],
-        vec!["cap".to_string(), "camera".to_string()],
         vec![
             "hello".to_string(),
             if cfg.api.allow_unsigned_debug_hello {
@@ -442,6 +466,9 @@ fn build_device_record(cfg: &Config, metrics: &DeviceMetricsPayload) -> Result<N
             },
         ],
     ];
+    for capability in nvr_swarm_capabilities() {
+        tags.push(vec!["cap".to_string(), capability.to_string()]);
+    }
     let unsigned = nostr::build_unsigned_event(
         &cfg.nostr_pubkey,
         RECORD_KIND,
@@ -450,6 +477,18 @@ fn build_device_record(cfg: &Config, metrics: &DeviceMetricsPayload) -> Result<N
         util::now_unix_seconds(),
     );
     nostr::sign_event(&unsigned, &cfg.nostr_sk_hex)
+}
+
+fn nvr_swarm_capabilities() -> Vec<&'static str> {
+    vec![
+        "camera",
+        CAPABILITY_MEDIA_STREAM_PREVIEW,
+        CAPABILITY_STREAM_SESSION_OFFER,
+        CAPABILITY_STREAM_SESSION_CONTROL,
+        CAPABILITY_PROJECTION_OBSERVE,
+        CAPABILITY_PROJECTION_DELTA_APPLY,
+        CAPABILITY_STORAGE_PIN,
+    ]
 }
 
 fn build_zone_presence(cfg: &Config, zone: &str) -> Result<NostrEvent> {
@@ -565,5 +604,42 @@ mod tests {
             payload.get("codeHash").and_then(|v| v.as_str()),
             Some("hash123")
         );
+    }
+
+    #[test]
+    fn device_record_advertises_swarm_edge_capabilities_without_session_route() {
+        let path = std::env::temp_dir().join(format!(
+            "constitute-nvr-swarm-device-test-{}-{}.json",
+            std::process::id(),
+            crate::util::now_ms()
+        ));
+        let (cfg, _) = crate::config::Config::load_or_create(&path).expect("config");
+        let _ = std::fs::remove_file(&path);
+        let metrics = DeviceMetricsPayload {
+            uptime_sec: 1,
+            peers_known: 0,
+            peers_confirmed: 0,
+            cameras_total: 0,
+            cameras_enabled: 0,
+        };
+
+        let ev = build_device_record(&cfg, &metrics).expect("device record");
+        let payload: serde_json::Value = serde_json::from_str(&ev.content).expect("payload");
+        let capabilities = payload
+            .get("capabilities")
+            .and_then(serde_json::Value::as_array)
+            .expect("capabilities");
+
+        for capability in [
+            CAPABILITY_MEDIA_STREAM_PREVIEW,
+            CAPABILITY_STREAM_SESSION_OFFER,
+            CAPABILITY_STREAM_SESSION_CONTROL,
+            CAPABILITY_PROJECTION_OBSERVE,
+            CAPABILITY_PROJECTION_DELTA_APPLY,
+            CAPABILITY_STORAGE_PIN,
+        ] {
+            assert!(capabilities.iter().any(|entry| entry == capability));
+        }
+        assert!(payload.get("sessionWsUrl").is_none());
     }
 }

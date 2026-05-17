@@ -30,6 +30,8 @@ mkdir -p "$STAGE_DIR"
 install -m 0755 "$BIN_PATH" "$STAGE_DIR/constitute-nvr"
 install -m 0644 "$REPO_ROOT/config.example.json" "$STAGE_DIR/config.example.json"
 install -m 0644 "$REPO_ROOT/README.md" "$STAGE_DIR/README.md"
+install -m 0644 "$REPO_ROOT/ARCHITECTURE.md" "$STAGE_DIR/ARCHITECTURE.md"
+install -m 0644 "$REPO_ROOT/REFACTOR.md" "$STAGE_DIR/REFACTOR.md"
 cp -R "$REPO_ROOT/scripts" "$STAGE_DIR/scripts"
 find "$STAGE_DIR/scripts" -type f -name "*.sh" -exec chmod 0755 {} \;
 
