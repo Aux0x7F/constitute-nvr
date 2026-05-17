@@ -203,6 +203,11 @@ pub struct PreviewTransportObservationEvent {
     pub participant_role: String,
     pub state: String,
     pub connection_state: String,
+    pub ice_connection_state: Option<String>,
+    pub selected_pair_state: Option<String>,
+    pub inbound_rtp_state: Option<String>,
+    pub render_state: Option<String>,
+    pub blocked_reason: Option<String>,
     pub reason: Option<String>,
     pub source_ids: Vec<String>,
     pub grace_ms: Option<u64>,
@@ -399,6 +404,7 @@ impl PreviewManager {
             let source_ids = event_source_ids.clone();
             Box::pin(async move {
                 *state_ref.lock().await = state;
+                let reason = media_observation_reason_for_peer_state(state).map(str::to_string);
                 let _ = transport_events.send(PreviewTransportObservationEvent {
                     path_id: path_id.clone(),
                     session_id: session_id.clone(),
@@ -409,7 +415,12 @@ impl PreviewManager {
                     participant_role: "service".to_string(),
                     state: media_observation_state_for_peer_state(state).to_string(),
                     connection_state: peer_connection_state_label(state).to_string(),
-                    reason: media_observation_reason_for_peer_state(state).map(str::to_string),
+                    ice_connection_state: None,
+                    selected_pair_state: selected_pair_state_for_peer_state(state).map(str::to_string),
+                    inbound_rtp_state: None,
+                    render_state: None,
+                    blocked_reason: reason.clone(),
+                    reason,
                     source_ids: source_ids.clone(),
                     grace_ms: matches!(state, RTCPeerConnectionState::Disconnected)
                         .then_some(DISCONNECTED_RELEASE_GRACE_MS),
@@ -440,6 +451,11 @@ impl PreviewManager {
                                         participant_role: "service".to_string(),
                                         state: "released".to_string(),
                                         connection_state: "disconnected".to_string(),
+                                        ice_connection_state: None,
+                                        selected_pair_state: Some("none".to_string()),
+                                        inbound_rtp_state: None,
+                                        render_state: None,
+                                        blocked_reason: Some("disconnectedGraceExpired".to_string()),
                                         reason: Some("disconnectedGraceExpired".to_string()),
                                         source_ids,
                                         grace_ms: Some(DISCONNECTED_RELEASE_GRACE_MS),
@@ -1057,6 +1073,18 @@ fn media_observation_reason_for_peer_state(state: RTCPeerConnectionState) -> Opt
     }
 }
 
+fn selected_pair_state_for_peer_state(state: RTCPeerConnectionState) -> Option<&'static str> {
+    match state {
+        RTCPeerConnectionState::Unspecified => None,
+        RTCPeerConnectionState::New | RTCPeerConnectionState::Connecting => Some("pending"),
+        RTCPeerConnectionState::Connected | RTCPeerConnectionState::Disconnected => {
+            Some("selected")
+        }
+        RTCPeerConnectionState::Failed => Some("failed"),
+        RTCPeerConnectionState::Closed => Some("none"),
+    }
+}
+
 fn requested_close_session_id(
     request: &ManagedCloseRequest,
     authority: &ValidatedStreamAuthority,
@@ -1438,6 +1466,34 @@ mod tests {
             &["cam-2".to_string()]
         ));
         assert_eq!(max_preview_sessions(&cfg), 8);
+    }
+
+    #[test]
+    fn peer_state_maps_to_media_transport_witness_posture() {
+        assert_eq!(
+            selected_pair_state_for_peer_state(RTCPeerConnectionState::New),
+            Some("pending")
+        );
+        assert_eq!(
+            selected_pair_state_for_peer_state(RTCPeerConnectionState::Connecting),
+            Some("pending")
+        );
+        assert_eq!(
+            selected_pair_state_for_peer_state(RTCPeerConnectionState::Connected),
+            Some("selected")
+        );
+        assert_eq!(
+            selected_pair_state_for_peer_state(RTCPeerConnectionState::Disconnected),
+            Some("selected")
+        );
+        assert_eq!(
+            selected_pair_state_for_peer_state(RTCPeerConnectionState::Failed),
+            Some("failed")
+        );
+        assert_eq!(
+            selected_pair_state_for_peer_state(RTCPeerConnectionState::Closed),
+            Some("none")
+        );
     }
 
     #[test]
