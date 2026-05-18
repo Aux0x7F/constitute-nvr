@@ -786,16 +786,31 @@ fn bind_preview_udp_mux(cfg: &LivePreviewConfig) -> Result<PreviewUdpMux> {
         ));
     }
 
+    bind_preview_udp_mux_candidates(
+        cfg.udp_port_min..=cfg.udp_port_max,
+        cfg.udp_port_min,
+        cfg.udp_port_max,
+    )
+}
+
+fn bind_preview_udp_mux_candidates<I>(
+    ports: I,
+    configured_min: u16,
+    configured_max: u16,
+) -> Result<PreviewUdpMux>
+where
+    I: IntoIterator<Item = u16>,
+{
     let mut last_err = None;
-    for port in cfg.udp_port_min..=cfg.udp_port_max {
+    for port in ports {
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
         match StdUdpSocket::bind(bind_addr) {
             Ok(socket) => {
                 socket
                     .set_nonblocking(true)
                     .context("live preview udp mux socket nonblocking")?;
-                let socket = UdpSocket::from_std(socket)
-                    .context("live preview udp mux socket adoption")?;
+                let socket =
+                    UdpSocket::from_std(socket).context("live preview udp mux socket adoption")?;
                 let local_addr = socket
                     .local_addr()
                     .context("live preview udp mux local address")?;
@@ -817,8 +832,8 @@ fn bind_preview_udp_mux(cfg: &LivePreviewConfig) -> Result<PreviewUdpMux> {
         .unwrap_or_else(|| "no ports attempted".to_string());
     Err(anyhow!(
         "no live preview udp mux port available in {}-{}: {}",
-        cfg.udp_port_min,
-        cfg.udp_port_max,
+        configured_min,
+        configured_max,
         detail
     ))
 }
@@ -1545,12 +1560,11 @@ mod tests {
     async fn live_preview_udp_mux_skips_busy_port_in_range() {
         let busy = StdUdpSocket::bind("0.0.0.0:0").expect("busy socket");
         let busy_port = busy.local_addr().expect("busy addr").port();
-        let mut cfg = sample_config();
-        cfg.live_preview.udp_port_min = busy_port;
-        cfg.live_preview.udp_port_max = busy_port + 1;
 
-        let mux = bind_preview_udp_mux(&cfg.live_preview).expect("preview udp mux");
-        assert_eq!(mux.local_addr.port(), busy_port + 1);
+        let mux =
+            bind_preview_udp_mux_candidates([busy_port, 0], busy_port, 0).expect("preview udp mux");
+        assert_ne!(mux.local_addr.port(), busy_port);
+        assert!(mux.local_addr.port() > 0);
         match mux.network {
             UDPNetwork::Muxed(udp_mux) => {
                 udp_mux.close().await.expect("close mux");
