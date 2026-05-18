@@ -12,18 +12,22 @@ use crate::util;
 use anyhow::{Context, Result, anyhow};
 use constitute_protocol::{
     CAPABILITY_MEDIA_STREAM_PREVIEW, CAPABILITY_PROJECTION_DELTA_APPLY,
-    CAPABILITY_ROUTE_PROMISE_RESOLVE, CAPABILITY_STREAM_SESSION_CONTROL,
-    CAPABILITY_STREAM_SESSION_OFFER, CaacEnvelope, MediaTransportObservation, ProjectionDeltaOp,
-    ProjectionDeltaOpKind, ProjectionPathSegment, RECORD_CONTRIBUTION_LIFECYCLE,
-    RECORD_MEDIA_TRANSPORT_OBSERVATION, RECORD_MEDIA_TRANSPORT_PATH, RECORD_ROUTE_OBSERVATION,
-    RECORD_ROUTE_PROMISE, RECORD_STREAM_ROUTE_PLAN, ReplayCache, RouteObservation,
-    RouteObservationState, STREAM_CANDIDATE_ACTIONABILITY_USABLE, STREAM_CANDIDATE_ROLE_BROWSER,
-    StreamSessionClose, StreamSessionControl, StreamSessionHealth, SwarmAck, SwarmFrame,
-    SwarmFrameBody, SwarmFrameKind, SwarmProjectionDelta, SwarmProjectionSnapshot, SwarmRecordRef,
-    ZoneScope, open_envelope, seal_envelope, swarm_frame_id, validate_media_transport_observation,
+    CAPABILITY_ROUTE_PROMISE_RESOLVE, CAPABILITY_SERVICE_EDGE_POSTURE_PUBLISH,
+    CAPABILITY_STREAM_SESSION_CONTROL, CAPABILITY_STREAM_SESSION_OFFER, CaacEnvelope,
+    MediaTransportObservation, ProjectionDeltaOp, ProjectionDeltaOpKind, ProjectionPathSegment,
+    RECORD_CONTRIBUTION_LIFECYCLE, RECORD_MEDIA_TRANSPORT_OBSERVATION, RECORD_MEDIA_TRANSPORT_PATH,
+    RECORD_ROUTE_OBSERVATION, RECORD_ROUTE_PROMISE, RECORD_SERVICE_EDGE_ADAPTER_POSTURE,
+    RECORD_STREAM_ROUTE_PLAN, ReplayCache, RouteObservation, RouteObservationState,
+    SERVICE_EDGE_ADAPTER_READY, SERVICE_EDGE_ADMISSION_AVAILABLE, SERVICE_EDGE_BACKPRESSURE_CLEAR,
+    SERVICE_EDGE_OUTPUT_AVAILABLE, SERVICE_EDGE_RELEASE_HELD,
+    STREAM_CANDIDATE_ACTIONABILITY_USABLE, STREAM_CANDIDATE_ROLE_BROWSER,
+    SURFACE_PARTICIPANT_SIDE_SERVICE, ServiceEdgeAdapterPostureRecord, StreamSessionClose,
+    StreamSessionControl, StreamSessionHealth, SwarmAck, SwarmFrame, SwarmFrameBody,
+    SwarmFrameKind, SwarmProjectionDelta, SwarmProjectionSnapshot, SwarmRecordRef, ZoneScope,
+    open_envelope, seal_envelope, swarm_frame_id, validate_media_transport_observation,
     validate_projection_delta, validate_projection_snapshot, validate_route_observation,
-    validate_stream_session_close, validate_stream_session_control, validate_stream_session_health,
-    validate_swarm_frame,
+    validate_service_edge_adapter_posture, validate_stream_session_close,
+    validate_stream_session_control, validate_stream_session_health, validate_swarm_frame,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -35,6 +39,7 @@ const STREAM_CHANNEL_ID: &str = "nvr.streams";
 const STREAM_PROJECTION_ID: &str = "nvr.streams";
 const STREAM_PROJECTION_POLICY_ID: &str = "nvr.streams.delta";
 const RESPONSE_TTL_MS: u64 = 90_000;
+const SERVICE_EDGE_QUEUE_CAPACITY: u64 = 32;
 const OFFER_FRAME_CAPABILITIES: &[&str] = &[
     CAPABILITY_MEDIA_STREAM_PREVIEW,
     CAPABILITY_STREAM_SESSION_OFFER,
@@ -408,8 +413,89 @@ fn offer_projection_value(response: &ManagedOfferResponse) -> Result<Value> {
         "status": "answer_ready",
         "sourceIds": response.sources.iter().map(|source| source.source_id.clone()).collect::<Vec<_>>(),
         "routePromiseId": &stream_session.offer.route_promise.promise_id,
-        "recordKinds": [RECORD_ROUTE_PROMISE, RECORD_STREAM_ROUTE_PLAN, "stream.session.admission", RECORD_CONTRIBUTION_LIFECYCLE, "stream.session.answer", "stream.session.candidate", RECORD_MEDIA_TRANSPORT_PATH, "stream.session.health"],
+        "recordKinds": [RECORD_ROUTE_PROMISE, RECORD_STREAM_ROUTE_PLAN, "stream.session.admission", RECORD_SERVICE_EDGE_ADAPTER_POSTURE, RECORD_CONTRIBUTION_LIFECYCLE, "stream.session.answer", "stream.session.candidate", RECORD_MEDIA_TRANSPORT_PATH, "stream.session.health"],
     }))
+}
+
+fn service_edge_adapter_posture_record(
+    cfg: &Config,
+    session_id: &str,
+    route_promise_id: &str,
+    now: u64,
+) -> Result<ServiceEdgeAdapterPostureRecord> {
+    let gateway_pk = cfg.gateway.host_gateway_pk.trim();
+    let gateway_ref = if gateway_pk.is_empty() {
+        None
+    } else {
+        Some(format!("gateway:{gateway_pk}"))
+    };
+    let record = ServiceEdgeAdapterPostureRecord {
+        kind: Some(RECORD_SERVICE_EDGE_ADAPTER_POSTURE.to_string()),
+        posture_id: format!("service-edge:nvr:{session_id}"),
+        module_ref: "constitute-nvr/service-edge-adapter@0.1.0".to_string(),
+        service_ref: service_ref(cfg),
+        service_member_ref: cfg.nostr_pubkey.trim().to_string(),
+        gateway_ref,
+        edge_session_ref: session_id.to_string(),
+        participant_side: SURFACE_PARTICIPANT_SIDE_SERVICE.to_string(),
+        state: SERVICE_EDGE_ADAPTER_READY.to_string(),
+        admission_state: SERVICE_EDGE_ADMISSION_AVAILABLE.to_string(),
+        backpressure_state: SERVICE_EDGE_BACKPRESSURE_CLEAR.to_string(),
+        response_state: SERVICE_EDGE_OUTPUT_AVAILABLE.to_string(),
+        projection_state: SERVICE_EDGE_OUTPUT_AVAILABLE.to_string(),
+        release_state: SERVICE_EDGE_RELEASE_HELD.to_string(),
+        capability_refs: vec![
+            CAPABILITY_SERVICE_EDGE_POSTURE_PUBLISH.to_string(),
+            CAPABILITY_MEDIA_STREAM_PREVIEW.to_string(),
+        ],
+        input_record_kinds: vec![
+            "stream.session.intent".to_string(),
+            "stream.session.offer".to_string(),
+            "stream.session.control".to_string(),
+            "stream.session.candidate".to_string(),
+            "stream.session.close".to_string(),
+        ],
+        output_record_kinds: vec![
+            "stream.session.admission".to_string(),
+            "stream.session.answer".to_string(),
+            "stream.session.candidate".to_string(),
+            "stream.session.health".to_string(),
+            RECORD_MEDIA_TRANSPORT_PATH.to_string(),
+            "projection.delta".to_string(),
+        ],
+        evidence_channels: vec![
+            "service.admission".to_string(),
+            "service.response".to_string(),
+            "projection.delta".to_string(),
+            "media.transport.observation".to_string(),
+        ],
+        queue: json!({
+            "pending": 0,
+            "capacity": SERVICE_EDGE_QUEUE_CAPACITY,
+            "accepted": 1,
+            "rejected": 0,
+            "dropped": 0
+        }),
+        route_promise_ref: Some(route_promise_id.to_string()),
+        resource_posture_ref: Some("resource:nvr-edge".to_string()),
+        resource_posture: json!({
+            "state": "withinBudget",
+            "queueCapacity": SERVICE_EDGE_QUEUE_CAPACITY,
+            "queuePending": 0
+        }),
+        release_ref: Some(format!("release:nvr-edge:{session_id}")),
+        safe_facts: json!({
+            "service": "nvr",
+            "sessionId": session_id,
+            "queuePending": 0
+        }),
+        evidence_refs: vec![route_promise_id.to_string()],
+        blocked_reasons: vec![],
+        observed_at: now,
+        expires_at: Some(now.saturating_add(RESPONSE_TTL_MS)),
+    };
+    validate_service_edge_adapter_posture(&record)?;
+    Ok(record)
 }
 
 fn control_projection_value(control: &StreamSessionControl, camera: &CameraDeviceConfig) -> Value {
@@ -454,6 +540,12 @@ fn build_offer_admission_frames(
     now: u64,
     response_zone_scope: Option<ZoneScope>,
 ) -> Result<Vec<SwarmFrame>> {
+    let service_edge_posture = service_edge_adapter_posture_record(
+        cfg,
+        &offer_records.admission.session_id,
+        &offer_records.route_promise.promise_id,
+        now,
+    )?;
     let mut frames = vec![
         seal_record_frame(
             cfg,
@@ -495,6 +587,21 @@ fn build_offer_admission_frames(
             json!({
                 "recordKind": "stream.session.admission",
                 "record": &offer_records.admission,
+            }),
+            now,
+            None,
+            response_zone_scope.as_ref(),
+        )?,
+        seal_record_frame(
+            cfg,
+            request_frame,
+            SwarmFrameKind::SwarmService,
+            RECORD_SERVICE_EDGE_ADAPTER_POSTURE,
+            &service_edge_posture.posture_id,
+            CAPABILITY_SERVICE_EDGE_POSTURE_PUBLISH,
+            json!({
+                "recordKind": RECORD_SERVICE_EDGE_ADAPTER_POSTURE,
+                "record": &service_edge_posture,
             }),
             now,
             None,
@@ -575,6 +682,27 @@ fn build_offer_response_frames(
         json!({
             "recordKind": "stream.session.admission",
             "record": &stream_session.offer.admission,
+        }),
+        now,
+        None,
+        response_zone_scope.as_ref(),
+    )?);
+    let service_edge_posture = service_edge_adapter_posture_record(
+        cfg,
+        &stream_session.offer.admission.session_id,
+        &stream_session.offer.route_promise.promise_id,
+        now,
+    )?;
+    frames.push(seal_record_frame(
+        cfg,
+        request_frame,
+        SwarmFrameKind::SwarmService,
+        RECORD_SERVICE_EDGE_ADAPTER_POSTURE,
+        &service_edge_posture.posture_id,
+        CAPABILITY_SERVICE_EDGE_POSTURE_PUBLISH,
+        json!({
+            "recordKind": RECORD_SERVICE_EDGE_ADAPTER_POSTURE,
+            "record": &service_edge_posture,
         }),
         now,
         None,
@@ -2040,11 +2168,13 @@ mod tests {
                 RECORD_ROUTE_PROMISE,
                 RECORD_STREAM_ROUTE_PLAN,
                 "stream.session.admission",
+                RECORD_SERVICE_EDGE_ADAPTER_POSTURE,
                 RECORD_CONTRIBUTION_LIFECYCLE,
                 RECORD_CONTRIBUTION_LIFECYCLE,
             ]
         );
         assert!(!record_kinds.contains(&"stream.session.answer"));
+        assert!(record_kinds.contains(&RECORD_SERVICE_EDGE_ADAPTER_POSTURE));
         for frame in frames {
             validate_swarm_frame(&frame, now).expect("valid admission frame");
         }
