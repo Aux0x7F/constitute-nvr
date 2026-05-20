@@ -51,6 +51,9 @@ use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 
 const ANSWER_GATHER_WAIT_MS: u64 = 750;
 const DISCONNECTED_RELEASE_GRACE_MS: u64 = 12_000;
+const SOURCE_RTP_WAITING_GRACE_MS: u64 = 5_000;
+const SOURCE_RTP_BLOCKED_GRACE_MS: u64 = 10_000;
+const SOURCE_RTP_OBSERVATION_INTERVAL_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ManagedIceServerHints {
@@ -221,6 +224,19 @@ pub struct PreviewTransportObservationEvent {
     pub grace_ms: Option<u64>,
     pub observed_at: u64,
     pub expires_at: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct PreviewTransportObservationContext {
+    path_id: String,
+    session_id: String,
+    activation_id: String,
+    route_promise_id: String,
+    requester_ref: String,
+    participant_ref: String,
+    source_ids: Vec<String>,
+    expires_at: Option<u64>,
+    transport_events: broadcast::Sender<PreviewTransportObservationEvent>,
 }
 
 impl Clone for PreviewSessionHandle {
@@ -522,7 +538,22 @@ impl PreviewManager {
                 .media_projection
                 .subscribe_preview(camera.clone(), projection_codec_for_preview(preview_codec))
                 .await;
-            tokio::spawn(run_projection_subscriber(subscription, track, stop_rx));
+            tokio::spawn(run_projection_subscriber(
+                subscription,
+                track,
+                stop_rx,
+                PreviewTransportObservationContext {
+                    path_id: path_id.clone(),
+                    session_id: session_id.clone(),
+                    activation_id: activation_id.clone(),
+                    route_promise_id: route_promise_id.clone(),
+                    requester_ref: requester_ref.clone(),
+                    participant_ref: participant_ref.clone(),
+                    source_ids: vec![camera.source_id.clone()],
+                    expires_at: event_expires_at,
+                    transport_events: self.transport_events.clone(),
+                },
+            ));
             response_sources.push(ManagedSourceInfo {
                 source_id: camera.source_id.clone(),
                 name: camera.name.clone(),
@@ -1287,29 +1318,112 @@ fn projection_codec_for_preview(codec: PreviewCodec) -> ProjectionCodec {
     }
 }
 
+fn service_media_transport_observation(
+    context: &PreviewTransportObservationContext,
+    state: &str,
+    connection_state: &str,
+    selected_pair_state: Option<&str>,
+    inbound_rtp_state: Option<&str>,
+    render_state: Option<&str>,
+    blocked_reason: Option<&str>,
+    reason: Option<&str>,
+    grace_ms: Option<u64>,
+) -> PreviewTransportObservationEvent {
+    PreviewTransportObservationEvent {
+        path_id: context.path_id.clone(),
+        session_id: context.session_id.clone(),
+        activation_id: context.activation_id.clone(),
+        route_promise_id: context.route_promise_id.clone(),
+        requester_ref: context.requester_ref.clone(),
+        participant_ref: context.participant_ref.clone(),
+        participant_role: "service".to_string(),
+        state: state.to_string(),
+        connection_state: connection_state.to_string(),
+        ice_connection_state: None,
+        selected_pair_state: selected_pair_state.map(str::to_string),
+        inbound_rtp_state: inbound_rtp_state.map(str::to_string),
+        render_state: render_state.map(str::to_string),
+        blocked_reason: blocked_reason.map(str::to_string),
+        reason: reason.map(str::to_string),
+        source_ids: context.source_ids.clone(),
+        grace_ms,
+        observed_at: crate::util::now_ms(),
+        expires_at: context.expires_at,
+    }
+}
+
+fn emit_service_media_transport_observation(
+    context: &PreviewTransportObservationContext,
+    event: PreviewTransportObservationEvent,
+) {
+    let _ = context.transport_events.send(event);
+}
+
 async fn run_projection_subscriber(
     mut subscription: MediaProjectionSubscription,
     track: Arc<TrackLocalStaticRTP>,
     mut stop_rx: watch::Receiver<bool>,
+    observation_context: PreviewTransportObservationContext,
 ) {
+    let started_at = crate::util::now_ms();
+    let mut first_packet_observed = false;
+    let mut waiting_observed_at = 0;
+    let mut blocked_observed = false;
     loop {
         tokio::select! {
             _ = stop_rx.changed() => {
                 break;
             }
-            packet = subscription.receiver.recv() => {
+            packet = timeout(
+                Duration::from_millis(SOURCE_RTP_OBSERVATION_INTERVAL_MS),
+                subscription.receiver.recv()
+            ) => {
                 match packet {
-                    Ok(packet) => {
+                    Ok(Ok(packet)) => {
                         if let Err(err) = track.write_rtp(&packet).await {
+                            emit_service_media_transport_observation(
+                                &observation_context,
+                                service_media_transport_observation(
+                                    &observation_context,
+                                    "blocked",
+                                    "connected",
+                                    Some("selected"),
+                                    Some("blocked"),
+                                    Some("pending"),
+                                    Some("serviceTrackWriteFailed"),
+                                    Some("serviceTrackWriteFailed"),
+                                    Some(SOURCE_RTP_BLOCKED_GRACE_MS),
+                                ),
+                            );
                             warn!(
                                 source = %subscription.source_id,
                                 codec = subscription.codec.label(),
                                 error = %err,
                                 "media projection RTP write failed"
                             );
+                            blocked_observed = true;
+                            continue;
+                        }
+                        if !first_packet_observed {
+                            first_packet_observed = true;
+                            blocked_observed = false;
+                            emit_service_media_transport_observation(
+                                &observation_context,
+                                service_media_transport_observation(
+                                    &observation_context,
+                                    "connected",
+                                    "connected",
+                                    Some("selected"),
+                                    Some("flowing"),
+                                    Some("pending"),
+                                    None,
+                                    Some("sourceRtpFlowing"),
+                                    None,
+                                ),
+                            );
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
                         warn!(
                             source = %subscription.source_id,
                             codec = subscription.codec.label(),
@@ -1317,7 +1431,49 @@ async fn run_projection_subscriber(
                             "media projection subscriber lagged"
                         );
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                    Err(_) => {
+                        if first_packet_observed {
+                            continue;
+                        }
+                        let now = crate::util::now_ms();
+                        let waiting_ms = now.saturating_sub(started_at);
+                        if waiting_ms >= SOURCE_RTP_BLOCKED_GRACE_MS && !blocked_observed {
+                            blocked_observed = true;
+                            emit_service_media_transport_observation(
+                                &observation_context,
+                                service_media_transport_observation(
+                                    &observation_context,
+                                    "blocked",
+                                    "connected",
+                                    Some("selected"),
+                                    Some("blocked"),
+                                    Some("pending"),
+                                    Some("sourceRtpUnavailable"),
+                                    Some("sourceRtpUnavailable"),
+                                    Some(SOURCE_RTP_BLOCKED_GRACE_MS),
+                                ),
+                            );
+                        } else if waiting_ms >= SOURCE_RTP_WAITING_GRACE_MS
+                            && now.saturating_sub(waiting_observed_at) >= SOURCE_RTP_OBSERVATION_INTERVAL_MS
+                        {
+                            waiting_observed_at = now;
+                            emit_service_media_transport_observation(
+                                &observation_context,
+                                service_media_transport_observation(
+                                    &observation_context,
+                                    "pending",
+                                    "connected",
+                                    Some("selected"),
+                                    Some("pending"),
+                                    Some("pending"),
+                                    None,
+                                    Some("sourceRtpWaiting"),
+                                    Some(SOURCE_RTP_BLOCKED_GRACE_MS),
+                                ),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1614,6 +1770,58 @@ mod tests {
             select_preview_codec_for_camera(&offer, &cfg.camera_devices[0]).expect("codec"),
             PreviewCodec::H264
         );
+    }
+
+    #[test]
+    fn service_source_rtp_wait_observations_use_media_transport_contract() {
+        let (transport_events, _rx) = broadcast::channel(4);
+        let context = PreviewTransportObservationContext {
+            path_id: "nvr-preview-1:path:browserWebRtc".to_string(),
+            session_id: "nvr-preview-1".to_string(),
+            activation_id: "activation-1".to_string(),
+            route_promise_id: "route-promise-1".to_string(),
+            requester_ref: "device:aux".to_string(),
+            participant_ref: "service:nvr".to_string(),
+            source_ids: vec!["camera-1".to_string()],
+            expires_at: Some(1_700_060_000),
+            transport_events,
+        };
+
+        let pending = service_media_transport_observation(
+            &context,
+            "pending",
+            "connected",
+            Some("selected"),
+            Some("pending"),
+            Some("pending"),
+            None,
+            Some("sourceRtpWaiting"),
+            Some(SOURCE_RTP_BLOCKED_GRACE_MS),
+        );
+        assert_eq!(pending.session_id, "nvr-preview-1");
+        assert_eq!(pending.participant_role, "service");
+        assert_eq!(pending.state, "pending");
+        assert_eq!(pending.inbound_rtp_state.as_deref(), Some("pending"));
+        assert_eq!(pending.blocked_reason, None);
+
+        let blocked = service_media_transport_observation(
+            &context,
+            "blocked",
+            "connected",
+            Some("selected"),
+            Some("blocked"),
+            Some("pending"),
+            Some("sourceRtpUnavailable"),
+            Some("sourceRtpUnavailable"),
+            Some(SOURCE_RTP_BLOCKED_GRACE_MS),
+        );
+        assert_eq!(blocked.state, "blocked");
+        assert_eq!(blocked.inbound_rtp_state.as_deref(), Some("blocked"));
+        assert_eq!(
+            blocked.blocked_reason.as_deref(),
+            Some("sourceRtpUnavailable")
+        );
+        assert_eq!(blocked.grace_ms, Some(SOURCE_RTP_BLOCKED_GRACE_MS));
     }
 
     #[test]
