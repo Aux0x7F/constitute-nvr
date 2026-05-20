@@ -413,7 +413,7 @@ fn offer_projection_value(response: &ManagedOfferResponse) -> Result<Value> {
         "status": "answer_ready",
         "sourceIds": response.sources.iter().map(|source| source.source_id.clone()).collect::<Vec<_>>(),
         "routePromiseId": &stream_session.offer.route_promise.promise_id,
-        "recordKinds": [RECORD_ROUTE_PROMISE, RECORD_STREAM_ROUTE_PLAN, "stream.session.admission", RECORD_SERVICE_EDGE_ADAPTER_POSTURE, RECORD_CONTRIBUTION_LIFECYCLE, "stream.session.answer", "stream.session.candidate", RECORD_MEDIA_TRANSPORT_PATH, "stream.session.health"],
+        "recordKinds": [RECORD_ROUTE_PROMISE, RECORD_STREAM_ROUTE_PLAN, constitute_protocol::RECORD_STREAM_SESSION_ADMISSION, RECORD_SERVICE_EDGE_ADAPTER_POSTURE, RECORD_CONTRIBUTION_LIFECYCLE, constitute_protocol::RECORD_STREAM_SESSION_ANSWER, constitute_protocol::RECORD_STREAM_SESSION_CANDIDATE, RECORD_MEDIA_TRANSPORT_PATH, constitute_protocol::RECORD_STREAM_SESSION_HEALTH],
     }))
 }
 
@@ -449,25 +449,25 @@ fn service_edge_adapter_posture_record(
             CAPABILITY_MEDIA_STREAM_PREVIEW.to_string(),
         ],
         input_record_kinds: vec![
-            "stream.session.intent".to_string(),
-            "stream.session.offer".to_string(),
-            "stream.session.control".to_string(),
-            "stream.session.candidate".to_string(),
-            "stream.session.close".to_string(),
+            constitute_protocol::RECORD_STREAM_SESSION_INTENT.to_string(),
+            constitute_protocol::RECORD_STREAM_SESSION_OFFER.to_string(),
+            constitute_protocol::RECORD_STREAM_SESSION_CONTROL.to_string(),
+            constitute_protocol::RECORD_STREAM_SESSION_CANDIDATE.to_string(),
+            constitute_protocol::RECORD_STREAM_SESSION_CLOSE.to_string(),
         ],
         output_record_kinds: vec![
-            "stream.session.admission".to_string(),
-            "stream.session.answer".to_string(),
-            "stream.session.candidate".to_string(),
-            "stream.session.health".to_string(),
+            constitute_protocol::RECORD_STREAM_SESSION_ADMISSION.to_string(),
+            constitute_protocol::RECORD_STREAM_SESSION_ANSWER.to_string(),
+            constitute_protocol::RECORD_STREAM_SESSION_CANDIDATE.to_string(),
+            constitute_protocol::RECORD_STREAM_SESSION_HEALTH.to_string(),
             RECORD_MEDIA_TRANSPORT_PATH.to_string(),
-            "projection.delta".to_string(),
+            constitute_protocol::RECORD_PROJECTION_DELTA.to_string(),
         ],
         evidence_channels: vec![
-            "service.admission".to_string(),
-            "service.response".to_string(),
-            "projection.delta".to_string(),
-            "media.transport.observation".to_string(),
+            constitute_protocol::RECORD_SERVICE_ADMISSION.to_string(),
+            constitute_protocol::RECORD_SERVICE_RESPONSE.to_string(),
+            constitute_protocol::RECORD_PROJECTION_DELTA.to_string(),
+            constitute_protocol::RECORD_MEDIA_TRANSPORT_OBSERVATION.to_string(),
         ],
         queue: json!({
             "pending": 0,
@@ -503,7 +503,7 @@ fn control_projection_value(control: &StreamSessionControl, camera: &CameraDevic
         "sessionId": control.session_id,
         "status": "control_applied",
         "sourceId": camera.source_id,
-        "recordKinds": ["stream.session.control", "stream.session.health"],
+        "recordKinds": [constitute_protocol::RECORD_STREAM_SESSION_CONTROL, constitute_protocol::RECORD_STREAM_SESSION_HEALTH],
     })
 }
 
@@ -520,7 +520,7 @@ fn candidate_projection_value(result: &Value) -> Result<(String, Value)> {
         json!({
             "sessionId": session_id,
             "status": "candidate_applied",
-            "recordKinds": ["stream.session.candidate", "stream.session.health"],
+            "recordKinds": [constitute_protocol::RECORD_STREAM_SESSION_CANDIDATE, constitute_protocol::RECORD_STREAM_SESSION_HEALTH],
         }),
     ))
 }
@@ -529,7 +529,7 @@ fn close_projection_value(close: &StreamSessionClose) -> Value {
     json!({
         "sessionId": close.session_id,
         "status": "closed",
-        "recordKinds": ["stream.session.close", "stream.session.health"],
+        "recordKinds": [constitute_protocol::RECORD_STREAM_SESSION_CLOSE, constitute_protocol::RECORD_STREAM_SESSION_HEALTH],
     })
 }
 
@@ -581,11 +581,11 @@ fn build_offer_admission_frames(
             cfg,
             request_frame,
             SwarmFrameKind::StreamStatus,
-            "stream.session.admission",
+            constitute_protocol::RECORD_STREAM_SESSION_ADMISSION,
             &offer_records.admission.admission_id,
             CAPABILITY_STREAM_SESSION_OFFER,
             json!({
-                "recordKind": "stream.session.admission",
+                "recordKind": constitute_protocol::RECORD_STREAM_SESSION_ADMISSION,
                 "record": &offer_records.admission,
             }),
             now,
@@ -676,11 +676,11 @@ fn build_offer_response_frames(
         cfg,
         request_frame,
         SwarmFrameKind::StreamStatus,
-        "stream.session.admission",
+        constitute_protocol::RECORD_STREAM_SESSION_ADMISSION,
         &stream_session.offer.admission.admission_id,
         CAPABILITY_STREAM_SESSION_OFFER,
         json!({
-            "recordKind": "stream.session.admission",
+            "recordKind": constitute_protocol::RECORD_STREAM_SESSION_ADMISSION,
             "record": &stream_session.offer.admission,
         }),
         now,
@@ -729,11 +729,11 @@ fn build_offer_response_frames(
         cfg,
         request_frame,
         SwarmFrameKind::StreamStatus,
-        "stream.session.answer",
+        constitute_protocol::RECORD_STREAM_SESSION_ANSWER,
         &stream_session.answer.answer.answer_id,
         CAPABILITY_STREAM_SESSION_OFFER,
         json!({
-            "recordKind": "stream.session.answer",
+            "recordKind": constitute_protocol::RECORD_STREAM_SESSION_ANSWER,
             "record": stream_session.answer.answer,
         }),
         now,
@@ -745,11 +745,11 @@ fn build_offer_response_frames(
             cfg,
             request_frame,
             SwarmFrameKind::StreamStatus,
-            "stream.session.candidate",
+            constitute_protocol::RECORD_STREAM_SESSION_CANDIDATE,
             &candidate.candidate_id,
             CAPABILITY_STREAM_SESSION_OFFER,
             json!({
-                "recordKind": "stream.session.candidate",
+                "recordKind": constitute_protocol::RECORD_STREAM_SESSION_CANDIDATE,
                 "record": candidate,
             }),
             now,
@@ -794,11 +794,11 @@ fn build_offer_response_frames(
         cfg,
         request_frame,
         SwarmFrameKind::StreamStatus,
-        "stream.session.health",
+        constitute_protocol::RECORD_STREAM_SESSION_HEALTH,
         &health.health_id,
         CAPABILITY_MEDIA_STREAM_PREVIEW,
         json!({
-            "recordKind": "stream.session.health",
+            "recordKind": constitute_protocol::RECORD_STREAM_SESSION_HEALTH,
             "record": health,
         }),
         now,
@@ -906,11 +906,11 @@ fn build_control_response_frames(
             cfg,
             request_frame,
             SwarmFrameKind::StreamStatus,
-            "stream.session.control",
+            constitute_protocol::RECORD_STREAM_SESSION_CONTROL,
             &control.control_id,
             CAPABILITY_STREAM_SESSION_CONTROL,
             json!({
-                "recordKind": "stream.session.control",
+                "recordKind": constitute_protocol::RECORD_STREAM_SESSION_CONTROL,
                 "record": control,
                 "result": result,
             }),
@@ -922,11 +922,11 @@ fn build_control_response_frames(
             cfg,
             request_frame,
             SwarmFrameKind::StreamStatus,
-            "stream.session.health",
+            constitute_protocol::RECORD_STREAM_SESSION_HEALTH,
             &health.health_id,
             CAPABILITY_STREAM_SESSION_CONTROL,
             json!({
-                "recordKind": "stream.session.health",
+                "recordKind": constitute_protocol::RECORD_STREAM_SESSION_HEALTH,
                 "record": health,
             }),
             now,
@@ -976,11 +976,11 @@ fn build_candidate_response_frames(
             cfg,
             request_frame,
             SwarmFrameKind::StreamStatus,
-            "stream.session.candidate",
+            constitute_protocol::RECORD_STREAM_SESSION_CANDIDATE,
             &format!("candidate-applied-{session_id}-{now}"),
             CAPABILITY_STREAM_SESSION_CONTROL,
             json!({
-                "recordKind": "stream.session.candidate",
+                "recordKind": constitute_protocol::RECORD_STREAM_SESSION_CANDIDATE,
                 "record": {
                     "candidateId": format!("candidate-applied-{session_id}-{now}"),
                     "sessionId": session_id,
@@ -1004,11 +1004,11 @@ fn build_candidate_response_frames(
             cfg,
             request_frame,
             SwarmFrameKind::StreamStatus,
-            "stream.session.health",
+            constitute_protocol::RECORD_STREAM_SESSION_HEALTH,
             &health.health_id,
             CAPABILITY_STREAM_SESSION_CONTROL,
             json!({
-                "recordKind": "stream.session.health",
+                "recordKind": constitute_protocol::RECORD_STREAM_SESSION_HEALTH,
                 "record": health,
             }),
             now,
@@ -1052,11 +1052,11 @@ fn build_close_response_frames(
             cfg,
             request_frame,
             SwarmFrameKind::StreamStatus,
-            "stream.session.close",
+            constitute_protocol::RECORD_STREAM_SESSION_CLOSE,
             &close.close_id,
             CAPABILITY_STREAM_SESSION_CONTROL,
             json!({
-                "recordKind": "stream.session.close",
+                "recordKind": constitute_protocol::RECORD_STREAM_SESSION_CLOSE,
                 "record": close,
                 "result": response,
             }),
@@ -1068,11 +1068,11 @@ fn build_close_response_frames(
             cfg,
             request_frame,
             SwarmFrameKind::StreamStatus,
-            "stream.session.health",
+            constitute_protocol::RECORD_STREAM_SESSION_HEALTH,
             &health.health_id,
             CAPABILITY_STREAM_SESSION_CONTROL,
             json!({
-                "recordKind": "stream.session.health",
+                "recordKind": constitute_protocol::RECORD_STREAM_SESSION_HEALTH,
                 "record": health,
             }),
             now,
@@ -1124,11 +1124,11 @@ fn stream_projection_snapshot_frame(
         cfg,
         request_frame,
         SwarmFrameKind::ProjectionSnapshot,
-        "projection.snapshot",
+        constitute_protocol::RECORD_PROJECTION_SNAPSHOT,
         &format!("nvr.streams.snapshot.{}", snapshot.revision),
         CAPABILITY_PROJECTION_DELTA_APPLY,
         json!({
-            "recordKind": "projection.snapshot",
+            "recordKind": constitute_protocol::RECORD_PROJECTION_SNAPSHOT,
             "snapshot": snapshot,
         }),
         now,
@@ -1186,11 +1186,11 @@ fn stream_projection_delta_frame(
         cfg,
         request_frame,
         SwarmFrameKind::ProjectionDelta,
-        "projection.delta",
+        constitute_protocol::RECORD_PROJECTION_DELTA,
         &format!("nvr.streams.delta.{}", delta.revision),
         CAPABILITY_PROJECTION_DELTA_APPLY,
         json!({
-            "recordKind": "projection.delta",
+            "recordKind": constitute_protocol::RECORD_PROJECTION_DELTA,
             "delta": delta,
         }),
         now,
@@ -1221,7 +1221,7 @@ fn stream_projection_delta(
             value: Some(value),
         }],
         affected_records: vec![json!({
-            "kind": "stream.session.health",
+            "kind": constitute_protocol::RECORD_STREAM_SESSION_HEALTH,
             "id": format!("health-{session_id}-{now}"),
             "status": status,
         })],
@@ -1383,7 +1383,7 @@ fn build_reject_response_frame(
 ) -> Result<SwarmFrame> {
     let recipients = response_recipients(cfg, request_frame)?;
     let envelope = seal_envelope(
-        "stream.session.reject",
+        constitute_protocol::RECORD_STREAM_SESSION_REJECT,
         &json!({
             "reasonCode": reason_code,
             "detail": detail,
@@ -1458,7 +1458,7 @@ fn build_member_read_observation_frame(
         SwarmFrameKind::RouteObservation,
         RECORD_ROUTE_OBSERVATION,
         &observation.observation_id,
-        "route.observation.publish",
+        constitute_protocol::CAPABILITY_ROUTE_OBSERVATION_PUBLISH,
         json!({
             "recordKind": RECORD_ROUTE_OBSERVATION,
             "record": observation,
@@ -1578,12 +1578,20 @@ fn classify_stream_frame(cfg: &Config, frame: &SwarmFrame) -> Result<Option<Stre
         return Ok(None);
     };
     let action = match (frame.kind.clone(), kind) {
-        (SwarmFrameKind::StreamIntent, "stream.session.intent" | "stream.session.offer") => {
-            StreamFrameAction::Offer
+        (
+            SwarmFrameKind::StreamIntent,
+            constitute_protocol::RECORD_STREAM_SESSION_INTENT
+            | constitute_protocol::RECORD_STREAM_SESSION_OFFER,
+        ) => StreamFrameAction::Offer,
+        (SwarmFrameKind::StreamControl, constitute_protocol::RECORD_STREAM_SESSION_CANDIDATE) => {
+            StreamFrameAction::Candidate
         }
-        (SwarmFrameKind::StreamControl, "stream.session.candidate") => StreamFrameAction::Candidate,
-        (SwarmFrameKind::StreamControl, "stream.session.close") => StreamFrameAction::Close,
-        (SwarmFrameKind::StreamControl, "stream.session.control") => StreamFrameAction::Control,
+        (SwarmFrameKind::StreamControl, constitute_protocol::RECORD_STREAM_SESSION_CLOSE) => {
+            StreamFrameAction::Close
+        }
+        (SwarmFrameKind::StreamControl, constitute_protocol::RECORD_STREAM_SESSION_CONTROL) => {
+            StreamFrameAction::Control
+        }
         _ => return Ok(None),
     };
     ensure_stream_route_headers(cfg, frame, action)?;
@@ -1665,28 +1673,31 @@ fn service_ref(cfg: &Config) -> String {
 fn is_stream_offer_frame(frame: &SwarmFrame) -> bool {
     matches!(frame.kind, SwarmFrameKind::StreamIntent)
         && record_kind(frame)
-            .map(|kind| kind == "stream.session.intent" || kind == "stream.session.offer")
+            .map(|kind| {
+                kind == constitute_protocol::RECORD_STREAM_SESSION_INTENT
+                    || kind == constitute_protocol::RECORD_STREAM_SESSION_OFFER
+            })
             .unwrap_or(false)
 }
 
 fn is_stream_control_frame(frame: &SwarmFrame) -> bool {
     matches!(frame.kind, SwarmFrameKind::StreamControl)
         && record_kind(frame)
-            .map(|kind| kind == "stream.session.control")
+            .map(|kind| kind == constitute_protocol::RECORD_STREAM_SESSION_CONTROL)
             .unwrap_or(false)
 }
 
 fn is_stream_candidate_frame(frame: &SwarmFrame) -> bool {
     matches!(frame.kind, SwarmFrameKind::StreamControl)
         && record_kind(frame)
-            .map(|kind| kind == "stream.session.candidate")
+            .map(|kind| kind == constitute_protocol::RECORD_STREAM_SESSION_CANDIDATE)
             .unwrap_or(false)
 }
 
 fn is_stream_close_frame(frame: &SwarmFrame) -> bool {
     matches!(frame.kind, SwarmFrameKind::StreamControl)
         && record_kind(frame)
-            .map(|kind| kind == "stream.session.close")
+            .map(|kind| kind == constitute_protocol::RECORD_STREAM_SESSION_CLOSE)
             .unwrap_or(false)
 }
 
@@ -2083,7 +2094,7 @@ mod tests {
         let request = request_frame(
             &cfg,
             SwarmFrameKind::StreamIntent,
-            "stream.session.offer",
+            constitute_protocol::RECORD_STREAM_SESSION_OFFER,
             now,
         );
 
@@ -2106,21 +2117,21 @@ mod tests {
 
         assert!(record_kinds.contains(&RECORD_ROUTE_PROMISE));
         assert!(record_kinds.contains(&RECORD_STREAM_ROUTE_PLAN));
-        assert!(record_kinds.contains(&"stream.session.admission"));
+        assert!(record_kinds.contains(&constitute_protocol::RECORD_STREAM_SESSION_ADMISSION));
         assert!(record_kinds.contains(&RECORD_CONTRIBUTION_LIFECYCLE));
-        assert!(record_kinds.contains(&"stream.session.answer"));
-        assert!(record_kinds.contains(&"stream.session.candidate"));
+        assert!(record_kinds.contains(&constitute_protocol::RECORD_STREAM_SESSION_ANSWER));
+        assert!(record_kinds.contains(&constitute_protocol::RECORD_STREAM_SESSION_CANDIDATE));
         assert!(record_kinds.contains(&RECORD_MEDIA_TRANSPORT_PATH));
-        assert!(record_kinds.contains(&"stream.session.health"));
-        assert!(record_kinds.contains(&"projection.snapshot"));
-        assert!(record_kinds.contains(&"projection.delta"));
+        assert!(record_kinds.contains(&constitute_protocol::RECORD_STREAM_SESSION_HEALTH));
+        assert!(record_kinds.contains(&constitute_protocol::RECORD_PROJECTION_SNAPSHOT));
+        assert!(record_kinds.contains(&constitute_protocol::RECORD_PROJECTION_DELTA));
         let snapshot_index = record_kinds
             .iter()
-            .position(|kind| *kind == "projection.snapshot")
+            .position(|kind| *kind == constitute_protocol::RECORD_PROJECTION_SNAPSHOT)
             .expect("snapshot frame");
         let delta_index = record_kinds
             .iter()
-            .position(|kind| *kind == "projection.delta")
+            .position(|kind| *kind == constitute_protocol::RECORD_PROJECTION_DELTA)
             .expect("delta frame");
         assert!(snapshot_index < delta_index);
         assert!(
@@ -2145,7 +2156,7 @@ mod tests {
         let request = request_frame(
             &cfg,
             SwarmFrameKind::StreamIntent,
-            "stream.session.offer",
+            constitute_protocol::RECORD_STREAM_SESSION_OFFER,
             now,
         );
 
@@ -2167,13 +2178,13 @@ mod tests {
             vec![
                 RECORD_ROUTE_PROMISE,
                 RECORD_STREAM_ROUTE_PLAN,
-                "stream.session.admission",
+                constitute_protocol::RECORD_STREAM_SESSION_ADMISSION,
                 RECORD_SERVICE_EDGE_ADAPTER_POSTURE,
                 RECORD_CONTRIBUTION_LIFECYCLE,
                 RECORD_CONTRIBUTION_LIFECYCLE,
             ]
         );
-        assert!(!record_kinds.contains(&"stream.session.answer"));
+        assert!(!record_kinds.contains(&constitute_protocol::RECORD_STREAM_SESSION_ANSWER));
         assert!(record_kinds.contains(&RECORD_SERVICE_EDGE_ADAPTER_POSTURE));
         for frame in frames {
             validate_swarm_frame(&frame, now).expect("valid admission frame");
@@ -2187,7 +2198,7 @@ mod tests {
         let request = request_frame(
             &cfg,
             SwarmFrameKind::StreamIntent,
-            "stream.session.offer",
+            constitute_protocol::RECORD_STREAM_SESSION_OFFER,
             now,
         );
 
@@ -2216,7 +2227,8 @@ mod tests {
             now,
         );
         frame.zone_scope = None;
-        frame.capability = Some("route.observation.publish".to_string());
+        frame.capability =
+            Some(constitute_protocol::CAPABILITY_ROUTE_OBSERVATION_PUBLISH.to_string());
 
         assert_eq!(
             gateway_frame_admission(&cfg, &frame),
@@ -2231,7 +2243,7 @@ mod tests {
         let mut frame = request_frame(
             &cfg,
             SwarmFrameKind::StreamIntent,
-            "stream.session.offer",
+            constitute_protocol::RECORD_STREAM_SESSION_OFFER,
             now,
         );
         frame.zone_scope = None;
@@ -2335,7 +2347,7 @@ mod tests {
         let request = request_frame(
             &cfg,
             SwarmFrameKind::StreamIntent,
-            "stream.session.offer",
+            constitute_protocol::RECORD_STREAM_SESSION_OFFER,
             now,
         );
         let runtime_zone = ZoneScope {
@@ -2372,13 +2384,13 @@ mod tests {
         let control_request = request_frame(
             &cfg,
             SwarmFrameKind::StreamControl,
-            "stream.session.control",
+            constitute_protocol::RECORD_STREAM_SESSION_CONTROL,
             now,
         );
         let close_request = request_frame(
             &cfg,
             SwarmFrameKind::StreamControl,
-            "stream.session.close",
+            constitute_protocol::RECORD_STREAM_SESSION_CLOSE,
             now,
         );
         let control = StreamSessionControl {
@@ -2419,40 +2431,36 @@ mod tests {
         .expect("close frames");
 
         assert!(control_frames.iter().any(|frame| {
-            frame
-                .record_ref
-                .as_ref()
-                .is_some_and(|record| record.kind == "stream.session.control")
+            frame.record_ref.as_ref().is_some_and(|record| {
+                record.kind == constitute_protocol::RECORD_STREAM_SESSION_CONTROL
+            })
         }));
         assert!(close_frames.iter().any(|frame| {
-            frame
-                .record_ref
-                .as_ref()
-                .is_some_and(|record| record.kind == "stream.session.close")
+            frame.record_ref.as_ref().is_some_and(|record| {
+                record.kind == constitute_protocol::RECORD_STREAM_SESSION_CLOSE
+            })
+        }));
+        assert!(control_frames.iter().any(|frame| {
+            frame.record_ref.as_ref().is_some_and(|record| {
+                record.kind == constitute_protocol::RECORD_PROJECTION_SNAPSHOT
+            })
         }));
         assert!(control_frames.iter().any(|frame| {
             frame
                 .record_ref
                 .as_ref()
-                .is_some_and(|record| record.kind == "projection.snapshot")
+                .is_some_and(|record| record.kind == constitute_protocol::RECORD_PROJECTION_DELTA)
         }));
-        assert!(control_frames.iter().any(|frame| {
-            frame
-                .record_ref
-                .as_ref()
-                .is_some_and(|record| record.kind == "projection.delta")
+        assert!(close_frames.iter().any(|frame| {
+            frame.record_ref.as_ref().is_some_and(|record| {
+                record.kind == constitute_protocol::RECORD_PROJECTION_SNAPSHOT
+            })
         }));
         assert!(close_frames.iter().any(|frame| {
             frame
                 .record_ref
                 .as_ref()
-                .is_some_and(|record| record.kind == "projection.snapshot")
-        }));
-        assert!(close_frames.iter().any(|frame| {
-            frame
-                .record_ref
-                .as_ref()
-                .is_some_and(|record| record.kind == "projection.delta")
+                .is_some_and(|record| record.kind == constitute_protocol::RECORD_PROJECTION_DELTA)
         }));
     }
 
@@ -2463,13 +2471,13 @@ mod tests {
         let candidate = request_frame(
             &cfg,
             SwarmFrameKind::StreamControl,
-            "stream.session.candidate",
+            constitute_protocol::RECORD_STREAM_SESSION_CANDIDATE,
             now,
         );
         let control = request_frame(
             &cfg,
             SwarmFrameKind::StreamControl,
-            "stream.session.control",
+            constitute_protocol::RECORD_STREAM_SESSION_CONTROL,
             now,
         );
 
@@ -2486,7 +2494,7 @@ mod tests {
         let request = request_frame(
             &cfg,
             SwarmFrameKind::StreamControl,
-            "stream.session.candidate",
+            constitute_protocol::RECORD_STREAM_SESSION_CANDIDATE,
             now,
         );
 
@@ -2516,10 +2524,10 @@ mod tests {
             .filter_map(|frame| frame.record_ref.as_ref().map(|record| record.kind.as_str()))
             .collect::<Vec<_>>();
 
-        assert!(record_kinds.contains(&"stream.session.candidate"));
-        assert!(record_kinds.contains(&"stream.session.health"));
-        assert!(record_kinds.contains(&"projection.snapshot"));
-        assert!(record_kinds.contains(&"projection.delta"));
+        assert!(record_kinds.contains(&constitute_protocol::RECORD_STREAM_SESSION_CANDIDATE));
+        assert!(record_kinds.contains(&constitute_protocol::RECORD_STREAM_SESSION_HEALTH));
+        assert!(record_kinds.contains(&constitute_protocol::RECORD_PROJECTION_SNAPSHOT));
+        assert!(record_kinds.contains(&constitute_protocol::RECORD_PROJECTION_DELTA));
         for frame in frames {
             validate_swarm_frame(&frame, now).expect("valid candidate response frame");
         }
@@ -2553,7 +2561,7 @@ mod tests {
         let mut frame = request_frame(
             &cfg,
             SwarmFrameKind::StreamIntent,
-            "stream.session.offer",
+            constitute_protocol::RECORD_STREAM_SESSION_OFFER,
             now,
         );
         frame.audience = json!({ "servicePk": other_pk });
@@ -2572,7 +2580,7 @@ mod tests {
         let frame = request_frame(
             &cfg,
             SwarmFrameKind::StreamIntent,
-            "stream.session.offer",
+            constitute_protocol::RECORD_STREAM_SESSION_OFFER,
             now,
         );
         assert_eq!(
@@ -2603,7 +2611,7 @@ mod tests {
         let frame = request_frame(
             &cfg,
             SwarmFrameKind::StreamIntent,
-            "stream.session.offer",
+            constitute_protocol::RECORD_STREAM_SESSION_OFFER,
             now,
         );
 
@@ -2677,7 +2685,7 @@ mod tests {
             }
         });
         let envelope = seal_envelope(
-            "stream.session.offer",
+            constitute_protocol::RECORD_STREAM_SESSION_OFFER,
             &claims,
             &device_sk,
             &[cfg.nostr_pubkey.clone()],
@@ -2688,7 +2696,7 @@ mod tests {
         let mut frame = request_frame(
             &cfg,
             SwarmFrameKind::StreamIntent,
-            "stream.session.offer",
+            constitute_protocol::RECORD_STREAM_SESSION_OFFER,
             now,
         );
         frame.issuer = device_pk.clone();
@@ -2703,7 +2711,7 @@ mod tests {
 
         let (other_pk, other_sk) = constitute_protocol::generate_keypair();
         let envelope = seal_envelope(
-            "stream.session.offer",
+            constitute_protocol::RECORD_STREAM_SESSION_OFFER,
             &claims,
             &other_sk,
             &[cfg.nostr_pubkey.clone()],

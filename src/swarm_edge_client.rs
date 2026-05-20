@@ -633,7 +633,7 @@ fn parse_edge_wire_text(text: &str) -> Result<EdgeWireRecord> {
                 .ok_or_else(|| anyhow!("swarm.frame wire message missing frame"))?;
             Ok(EdgeWireRecord::Frame(serde_json::from_value(frame)?))
         }
-        "swarm.edge.reject" => Ok(EdgeWireRecord::Reject(value)),
+        constitute_protocol::SWARM_EDGE_WIRE_REJECT => Ok(EdgeWireRecord::Reject(value)),
         other => Err(anyhow!(
             "gateway edge stream accepts swarm.edge.* control and swarm.frame records only, got {other}"
         )),
@@ -677,7 +677,10 @@ mod tests {
         let rendered = serde_json::to_string(&wire).expect("wire json");
 
         validate_swarm_edge_hello(&hello).expect("valid hello");
-        assert_eq!(wire["type"], json!("swarm.edge.hello"));
+        assert_eq!(
+            wire["type"],
+            json!(constitute_protocol::SWARM_EDGE_WIRE_HELLO)
+        );
         assert_eq!(hello.member_kind, "service");
         assert_eq!(hello.member_ref, cfg.nostr_pubkey);
         assert!(
@@ -706,7 +709,7 @@ mod tests {
             correlation_id: None,
             channel_id: Some(STREAM_CHANNEL_ID.to_string()),
             record_ref: Some(SwarmRecordRef {
-                kind: "stream.session.offer".to_string(),
+                kind: constitute_protocol::RECORD_STREAM_SESSION_OFFER.to_string(),
                 id: "offer-1".to_string(),
                 revision: None,
             }),
