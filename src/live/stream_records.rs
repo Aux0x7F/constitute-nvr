@@ -1,4 +1,5 @@
 //! Route-plan and stream-record adapters for managed NVR live preview.
+// domain-owned-vocabulary: runtime.media.browser-webrtc.default
 
 use crate::config::Config;
 use anyhow::{Result, anyhow};
