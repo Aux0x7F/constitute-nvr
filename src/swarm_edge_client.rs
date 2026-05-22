@@ -7,14 +7,15 @@ use crate::config::Config;
 use crate::swarm_edge::{GatewayFrameAdmission, SwarmEdge};
 use crate::util;
 use anyhow::{Context, Result, anyhow};
+use constitute_fabric::{HostFabricMemberContributionSpec, build_host_fabric_member_contribution};
 use constitute_protocol::{
     CAPABILITY_MEDIA_STREAM_PREVIEW, CAPABILITY_PROJECTION_DELTA_APPLY,
     CAPABILITY_PROJECTION_OBSERVE, CAPABILITY_STORAGE_PIN, CAPABILITY_STREAM_SESSION_CONTROL,
-    CAPABILITY_STREAM_SESSION_OFFER, CAPABILITY_SWARM_EDGE_ATTACH, SWARM_EDGE_WIRE_ACCEPT,
-    SWARM_EDGE_WIRE_HELLO, SWARM_EDGE_WIRE_RESUME, SWARM_FRAME_VERSION, SWARM_WIRE_FRAME,
+    CAPABILITY_STREAM_SESSION_OFFER, CAPABILITY_SWARM_EDGE_ATTACH,
     FABRIC_MEMBER_CONTRIBUTION_RUNNING, FABRIC_MEMBER_ROLE_DOMAIN_SERVICE,
-    HostFabricMemberContribution, RECORD_HOST_FABRIC_MEMBER_CONTRIBUTION, SwarmEdgeAccept,
-    SwarmEdgeHello, SwarmEdgeResume, SwarmFrame, SwarmFrameBody, ZoneScope, seal_envelope,
+    HostFabricMemberContribution, SWARM_EDGE_WIRE_ACCEPT, SWARM_EDGE_WIRE_HELLO,
+    SWARM_EDGE_WIRE_RESUME, SWARM_FRAME_VERSION, SWARM_WIRE_FRAME, SwarmEdgeAccept, SwarmEdgeHello,
+    SwarmEdgeResume, SwarmFrame, SwarmFrameBody, ZoneScope, seal_envelope,
     validate_host_fabric_member_contribution, validate_swarm_edge_hello,
     validate_swarm_edge_resume,
 };
@@ -444,7 +445,7 @@ fn build_edge_hello(cfg: &Config, now: u64) -> Result<SwarmEdgeHello> {
         STREAM_CHANNEL_ID.to_string(),
         SURFACE_CHANNEL_ID.to_string(),
     ];
-    let fabric_contribution = nvr_host_fabric_contribution(cfg, &member_ref, &service_ref, now);
+    let fabric_contribution = nvr_host_fabric_contribution(cfg, &member_ref, &service_ref, now)?;
     let fabric_contribution_ref = fabric_contribution.contribution_id.clone();
     validate_host_fabric_member_contribution(&fabric_contribution)?;
     let promise_refs = vec![
@@ -508,15 +509,14 @@ fn nvr_host_fabric_contribution(
     member_ref: &str,
     service_ref: &str,
     now: u64,
-) -> HostFabricMemberContribution {
+) -> Result<HostFabricMemberContribution> {
     let host_ref = if cfg.gateway.host_gateway_pk.trim().is_empty() {
         format!("discovery:{}", first_zone_scope(cfg).zone_id)
     } else {
         format!("gateway:{}", cfg.gateway.host_gateway_pk.trim())
     };
     let fabric_ref = format!("host-fabric:{host_ref}");
-    HostFabricMemberContribution {
-        kind: Some(RECORD_HOST_FABRIC_MEMBER_CONTRIBUTION.to_string()),
+    let contribution = build_host_fabric_member_contribution(HostFabricMemberContributionSpec {
         contribution_id: format!("hostFabric:nvr:{}", cfg.nostr_pubkey.trim()),
         fabric_ref,
         host_ref,
@@ -530,7 +530,10 @@ fn nvr_host_fabric_contribution(
             .map(ToOwned::to_owned)
             .collect(),
         grant_refs: Vec::new(),
-        input_refs: vec![STREAM_CHANNEL_ID.to_string(), SURFACE_CHANNEL_ID.to_string()],
+        input_refs: vec![
+            STREAM_CHANNEL_ID.to_string(),
+            SURFACE_CHANNEL_ID.to_string(),
+        ],
         output_refs: vec![
             "projection:nvr.streams".to_string(),
             "projection:nvr.surface".to_string(),
@@ -549,7 +552,9 @@ fn nvr_host_fabric_contribution(
         }),
         observed_at: now,
         expires_at: Some(now.saturating_add(HELLO_TTL_MS)),
-    }
+    })?;
+    validate_host_fabric_member_contribution(&contribution)?;
+    Ok(contribution)
 }
 
 fn build_edge_resume(cfg: &Config, accept: &SwarmEdgeAccept, now: u64) -> Result<SwarmEdgeResume> {
