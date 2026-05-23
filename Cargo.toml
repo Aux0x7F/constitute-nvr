@@ -13,8 +13,8 @@ chacha20poly1305 = { version = "0.10", features = ["std"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10"
 clap = { version = "4.5", features = ["derive"] }
-constitute-fabric = { git = "https://github.com/Aux0x7F/constitute-fabric", branch = "0x/fabric-transition/carrier-edge" }
-constitute-protocol = { git = "https://github.com/Aux0x7F/constitute-protocol", branch = "0x/fabric-transition/carrier-edge" }
+constitute-fabric = { git = "https://github.com/Aux0x7F/constitute-fabric", branch = "0x/fabric-transition/topology-execution" }
+constitute-protocol = { git = "https://github.com/Aux0x7F/constitute-protocol", branch = "0x/fabric-transition/topology-execution" }
 des = "0.8"
 futures-util = "0.3"
 hex = "0.4"
