@@ -7,19 +7,21 @@ use crate::config::Config;
 use crate::swarm_edge::{GatewayFrameAdmission, SwarmEdge};
 use crate::util;
 use anyhow::{Context, Result, anyhow};
-use constitute_fabric::{HostFabricMemberContributionSpec, build_host_fabric_member_contribution};
+use constitute_fabric::{
+    GatewayWebSocketCarrierSessionEvidenceInput, HostFabricMemberContributionSpec,
+    build_gateway_websocket_carrier_session_evidence, build_host_fabric_member_contribution,
+};
 use constitute_protocol::{
     CAPABILITY_MEDIA_STREAM_PREVIEW, CAPABILITY_PROJECTION_DELTA_APPLY,
     CAPABILITY_PROJECTION_OBSERVE, CAPABILITY_STORAGE_PIN, CAPABILITY_STREAM_SESSION_CONTROL,
-    CAPABILITY_STREAM_SESSION_OFFER, CAPABILITY_SWARM_EDGE_ATTACH, CARRIER_EDGE_ADAPTER_WEB_SOCKET,
-    CARRIER_EDGE_BACKPRESSURE_CLEAR, CARRIER_EDGE_NETWORK_LOCAL_NETWORK, CARRIER_EDGE_SESSION_OPEN,
+    CAPABILITY_STREAM_SESSION_OFFER, CAPABILITY_SWARM_EDGE_ATTACH, CARRIER_EDGE_SESSION_OPEN,
     CarrierEdgeSessionEvidence, FABRIC_MEMBER_CONTRIBUTION_RUNNING,
-    FABRIC_MEMBER_ROLE_DOMAIN_SERVICE, HostFabricMemberContribution,
-    RECORD_CARRIER_EDGE_SESSION_EVIDENCE, SWARM_EDGE_WIRE_ACCEPT, SWARM_EDGE_WIRE_HELLO,
-    SWARM_EDGE_WIRE_RESUME, SWARM_FRAME_VERSION, SWARM_WIRE_FRAME, SwarmEdgeAccept, SwarmEdgeHello,
-    SwarmEdgeResume, SwarmFrame, SwarmFrameBody, ZoneScope, seal_envelope,
-    validate_carrier_edge_session_evidence, validate_host_fabric_member_contribution,
-    validate_swarm_edge_hello, validate_swarm_edge_resume,
+    FABRIC_MEMBER_ROLE_DOMAIN_SERVICE, HostFabricMemberContribution, SWARM_EDGE_WIRE_ACCEPT,
+    SWARM_EDGE_WIRE_HELLO, SWARM_EDGE_WIRE_RESUME, SWARM_FRAME_VERSION, SWARM_WIRE_FRAME,
+    SwarmEdgeAccept, SwarmEdgeHello, SwarmEdgeResume, SwarmFrame, SwarmFrameBody, ZoneScope,
+    seal_envelope, validate_carrier_edge_session_evidence,
+    validate_host_fabric_member_contribution, validate_swarm_edge_hello,
+    validate_swarm_edge_resume,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -675,8 +677,7 @@ fn nvr_carrier_edge_session_evidence(
         .find(|reference| reference.starts_with("service:"))
         .map(ToString::to_string)
         .unwrap_or_else(|| format!("service:nvr:{member_ref}"));
-    let record = CarrierEdgeSessionEvidence {
-        kind: Some(RECORD_CARRIER_EDGE_SESSION_EVIDENCE.to_string()),
+    build_gateway_websocket_carrier_session_evidence(GatewayWebSocketCarrierSessionEvidenceInput {
         evidence_id: format!(
             "carrier-edge-evidence:nvr:{}:{}",
             slug(&service_ref),
@@ -684,19 +685,9 @@ fn nvr_carrier_edge_session_evidence(
         ),
         selection_ref: format!("carrier-select:{}:gateway-edge", slug(&service_ref)),
         edge_session_ref: format!("edge-session:{session_id}"),
-        adapter_ref: "adapter:gateway-association:websocket".to_string(),
-        adapter_kind: CARRIER_EDGE_ADAPTER_WEB_SOCKET.to_string(),
         participant_ref: service_ref.clone(),
         peer_ref: None,
-        session_binding_ref: Some(format!("binding:gateway-edge:{session_id}")),
-        network_sensitivity: Some(CARRIER_EDGE_NETWORK_LOCAL_NETWORK.to_string()),
-        state: CARRIER_EDGE_SESSION_OPEN.to_string(),
-        connection_state: Some("connected".to_string()),
-        backpressure_state: Some(CARRIER_EDGE_BACKPRESSURE_CLEAR.to_string()),
-        retry_posture: json!({ "state": "notRequired", "retryAfterMs": null }),
-        reconnect_posture: json!({ "state": "idle", "retryAfterMs": null }),
-        close_posture: json!({ "state": "held", "reason": "" }),
-        release_posture: json!({ "state": "held", "expiresAt": accept.expires_at }),
+        session_binding_ref: format!("binding:gateway-edge:{session_id}"),
         safe_facts: json!({
             "service": "nvr",
             "memberKind": accept.member_kind,
@@ -708,12 +699,9 @@ fn nvr_carrier_edge_session_evidence(
         evidence_refs: vec![format!("session:{session_id}"), service_ref],
         proof_substrate_refs: vec![],
         resource_posture_refs: vec![],
-        blocked_reasons: vec![],
         observed_at: now,
         expires_at: accept.expires_at,
-    };
-    validate_carrier_edge_session_evidence(&record)?;
-    Ok(record)
+    })
 }
 
 fn slug(value: &str) -> String {
