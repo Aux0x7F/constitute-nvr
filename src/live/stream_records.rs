@@ -4,21 +4,24 @@
 use crate::config::Config;
 use anyhow::{Result, anyhow};
 use constitute_protocol::{
-    CAPABILITY_MEDIA_STREAM_PREVIEW, ContributionLifecycle, MediaTransportPath,
-    RECORD_CONTRIBUTION_LIFECYCLE, RECORD_MEDIA_TRANSPORT_PATH, RECORD_ROUTE_PROMISE,
+    CAPABILITY_MEDIA_STREAM_PREVIEW, ContributionLifecycle, FULFILLMENT_SESSION_ACTIONABLE,
+    FULFILLMENT_SESSION_BLOCKED, FULFILLMENT_SESSION_PENDING, FulfillmentSession,
+    FulfillmentSessionNodePosture, MediaTransportPath, RECORD_CONTRIBUTION_LIFECYCLE,
+    RECORD_FULFILLMENT_SESSION, RECORD_MEDIA_TRANSPORT_PATH, RECORD_ROUTE_PROMISE,
     RECORD_STREAM_ROUTE_PLAN, ReachabilityState, RoutePromise,
     STREAM_CANDIDATE_ACTIONABILITY_BLOCKED, STREAM_CANDIDATE_ACTIONABILITY_USABLE,
     STREAM_CANDIDATE_ROLE_BROWSER, STREAM_CANDIDATE_ROLE_SERVICE, StreamPathKind, StreamPathState,
     StreamRoutePath, StreamRoutePlan, StreamSessionAdmission, StreamSessionAnswer,
     StreamSessionCandidate, StreamSessionClose, StreamSessionControl, StreamSessionIntent,
-    StreamSessionOffer, ZoneScope, validate_contribution_lifecycle, validate_media_transport_path,
-    validate_route_promise, validate_stream_route_plan, validate_stream_session_admission,
-    validate_stream_session_candidate, validate_stream_session_control,
-    validate_stream_session_intent, validate_stream_session_offer,
+    StreamSessionOffer, ZoneScope, validate_contribution_lifecycle, validate_fulfillment_session,
+    validate_media_transport_path, validate_route_promise, validate_stream_route_plan,
+    validate_stream_session_admission, validate_stream_session_candidate,
+    validate_stream_session_control, validate_stream_session_intent, validate_stream_session_offer,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+#[cfg(test)]
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 use super::preview::{
@@ -47,6 +50,8 @@ pub struct StreamSessionOfferRecords {
 pub struct StreamSessionAnswerRecords {
     pub answer: StreamSessionAnswer,
     pub candidates: Vec<StreamSessionCandidate>,
+    #[serde(rename = "fulfillmentSession")]
+    pub fulfillment_session: FulfillmentSession,
     #[serde(rename = "mediaTransportPath")]
     pub media_transport_path: MediaTransportPath,
     #[serde(rename = "contributionLifecycles")]
@@ -60,8 +65,67 @@ pub struct StreamSessionExchangeRecords {
     pub answer: StreamSessionAnswerRecords,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamOperationBinding {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operation_ref: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operation_class_ref: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub method_ref: String,
+}
+
+impl StreamOperationBinding {
+    pub fn is_bound(&self) -> bool {
+        !self.operation_ref.trim().is_empty()
+            || !self.operation_class_ref.trim().is_empty()
+            || !self.method_ref.trim().is_empty()
+    }
+
+    pub fn from_value(value: &Value) -> Self {
+        let mut binding = Self::default();
+        if let Some(operation_ref) = string_field(value, &["operationRef", "operation_ref"]) {
+            binding.operation_ref = operation_ref;
+        }
+        if let Some(operation_class_ref) =
+            string_field(value, &["operationClassRef", "operation_class_ref"])
+        {
+            binding.operation_class_ref = operation_class_ref;
+        }
+        if let Some(method_ref) = string_field(value, &["methodRef", "method_ref"]) {
+            binding.method_ref = method_ref;
+        }
+        binding
+    }
+
+    pub fn merge_missing_from(&mut self, other: &Self) {
+        if self.operation_ref.trim().is_empty() && !other.operation_ref.trim().is_empty() {
+            self.operation_ref = other.operation_ref.clone();
+        }
+        if self.operation_class_ref.trim().is_empty()
+            && !other.operation_class_ref.trim().is_empty()
+        {
+            self.operation_class_ref = other.operation_class_ref.clone();
+        }
+        if self.method_ref.trim().is_empty() && !other.method_ref.trim().is_empty() {
+            self.method_ref = other.method_ref.clone();
+        }
+    }
+
+    fn insert_into_map(&self, map: &mut Map<String, Value>) {
+        insert_trimmed(map, "operationRef", &self.operation_ref);
+        insert_trimmed(map, "operationClassRef", &self.operation_class_ref);
+        insert_trimmed(map, "methodRef", &self.method_ref);
+    }
+}
+
 pub fn session_id_for_claims(claims: &StreamAuthorityClaims) -> String {
     stream_session_id(&claims.nonce)
+}
+
+pub fn fulfillment_session_id_for_session(session_id: &str) -> String {
+    format!("fulfillment:preview:{session_id}")
 }
 
 pub fn stream_session_records_for_offer(
@@ -71,6 +135,7 @@ pub fn stream_session_records_for_offer(
     issued_at: u64,
 ) -> Result<StreamSessionOfferRecords> {
     let session_id = session_id_for_claims(claims);
+    let fulfillment_session_id = fulfillment_session_id_for_session(&session_id);
     let service_ref = service_ref(cfg);
     let service_member_ref = service_member_ref(cfg);
     let source_ids = offer_source_ids(&request.offer);
@@ -96,6 +161,7 @@ pub fn stream_session_records_for_offer(
     )?;
     let intent = StreamSessionIntent {
         session_id: session_id.clone(),
+        fulfillment_session_id: Some(fulfillment_session_id.clone()),
         capability_ref: CAPABILITY_MEDIA_STREAM_PREVIEW.to_string(),
         requester_ref,
         channel_id: STREAM_CHANNEL_ID.to_string(),
@@ -105,18 +171,24 @@ pub fn stream_session_records_for_offer(
     };
     validate_stream_session_intent(&intent)?;
 
-    let admission = StreamSessionAdmission {
-        admission_id: format!("admission-{session_id}"),
-        session_id: session_id.clone(),
-        capability_ref: CAPABILITY_MEDIA_STREAM_PREVIEW.to_string(),
-        admitted_by: service_member_ref,
-        constraints: json!({
+    let constraints = with_operation_binding(
+        json!({
             "sourceIds": source_ids,
             "candidateCount": request.candidates.len(),
             "transport": WEBRTC_TRANSPORT,
             "routePromiseId": &route_promise.promise_id,
             "routePlanId": &route_plan.session_id,
         }),
+        &request.operation_binding,
+    );
+
+    let admission = StreamSessionAdmission {
+        admission_id: format!("admission-{session_id}"),
+        session_id: session_id.clone(),
+        fulfillment_session_id: Some(fulfillment_session_id.clone()),
+        capability_ref: CAPABILITY_MEDIA_STREAM_PREVIEW.to_string(),
+        admitted_by: service_member_ref,
+        constraints,
         issued_at,
     };
     validate_stream_session_admission(&admission)?;
@@ -124,6 +196,7 @@ pub fn stream_session_records_for_offer(
     let offer = StreamSessionOffer {
         offer_id: format!("offer-{session_id}"),
         session_id: session_id.clone(),
+        fulfillment_session_id: Some(fulfillment_session_id.clone()),
         transport: WEBRTC_TRANSPORT.to_string(),
         payload: offer_payload(request),
         issued_at,
@@ -138,6 +211,7 @@ pub fn stream_session_records_for_offer(
         .map(|(idx, candidate)| {
             stream_candidate(
                 &session_id,
+                &fulfillment_session_id,
                 "remote",
                 idx,
                 candidate_payload(candidate),
@@ -145,8 +219,12 @@ pub fn stream_session_records_for_offer(
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    let contribution_lifecycles =
-        offer_contribution_lifecycles(&route_promise, &admission, issued_at)?;
+    let contribution_lifecycles = offer_contribution_lifecycles(
+        &route_promise,
+        &admission,
+        &request.operation_binding,
+        issued_at,
+    )?;
 
     Ok(StreamSessionOfferRecords {
         route_promise,
@@ -165,14 +243,24 @@ pub fn stream_session_records_for_answer(
     issued_at: u64,
 ) -> Result<StreamSessionAnswerRecords> {
     let session_id = response.session_id.clone();
+    let fulfillment_session_id = offer
+        .intent
+        .fulfillment_session_id
+        .clone()
+        .unwrap_or_else(|| fulfillment_session_id_for_session(&session_id));
+    let operation_binding = operation_binding_from_offer(offer);
     let answer = StreamSessionAnswer {
         answer_id: format!("answer-{session_id}"),
         session_id: session_id.clone(),
+        fulfillment_session_id: Some(fulfillment_session_id.clone()),
         transport: WEBRTC_TRANSPORT.to_string(),
-        payload: strip_media_byte_fields(json!({
-            "description": response.answer,
-            "sourceIds": response.sources.iter().map(|source| source.source_id.clone()).collect::<Vec<_>>(),
-        })),
+        payload: with_operation_binding(
+            strip_media_byte_fields(json!({
+                "description": response.answer,
+                "sourceIds": response.sources.iter().map(|source| source.source_id.clone()).collect::<Vec<_>>(),
+            })),
+            &operation_binding,
+        ),
         issued_at,
     };
     validate_answer_record(&answer)?;
@@ -184,6 +272,7 @@ pub fn stream_session_records_for_answer(
         .map(|(idx, candidate)| {
             stream_candidate(
                 &session_id,
+                &fulfillment_session_id,
                 "local",
                 idx,
                 candidate_payload(candidate),
@@ -192,14 +281,35 @@ pub fn stream_session_records_for_answer(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let media_transport_path =
-        media_transport_path_for_answer(response, offer, &candidates, issued_at)?;
-    let contribution_lifecycles =
-        answer_contribution_lifecycles(response, offer, &answer, &media_transport_path, issued_at)?;
+    let media_transport_path = media_transport_path_for_answer(
+        response,
+        offer,
+        &fulfillment_session_id,
+        &operation_binding,
+        &candidates,
+        issued_at,
+    )?;
+    let fulfillment_session = fulfillment_session_for_answer(
+        response,
+        offer,
+        &answer,
+        &media_transport_path,
+        &operation_binding,
+        issued_at,
+    )?;
+    let contribution_lifecycles = answer_contribution_lifecycles(
+        response,
+        offer,
+        &answer,
+        &media_transport_path,
+        &operation_binding,
+        issued_at,
+    )?;
 
     Ok(StreamSessionAnswerRecords {
         answer,
         candidates,
+        fulfillment_session,
         media_transport_path,
         contribution_lifecycles,
     })
@@ -208,6 +318,8 @@ pub fn stream_session_records_for_answer(
 fn media_transport_path_for_answer(
     response: &ManagedOfferResponse,
     offer: &StreamSessionOfferRecords,
+    fulfillment_session_id: &str,
+    operation_binding: &StreamOperationBinding,
     service_candidates: &[StreamSessionCandidate],
     issued_at: u64,
 ) -> Result<MediaTransportPath> {
@@ -236,9 +348,14 @@ fn media_transport_path_for_answer(
         kind: Some(RECORD_MEDIA_TRANSPORT_PATH.to_string()),
         path_id: browser_webrtc_path_id(&response.session_id),
         session_id: response.session_id.clone(),
+        fulfillment_session_id: fulfillment_session_id.to_string(),
         activation_id: Some(offer.route_promise.activation_id.clone()),
         route_promise_id: Some(offer.route_promise.promise_id.clone()),
         transport_profile_ref: "runtime.media.browser-webrtc.default".to_string(),
+        browser_participant_ref: Some(offer.route_promise.requester_ref.clone()),
+        service_participant_ref: Some(service_participant_ref_from_route_promise(
+            &offer.route_promise,
+        )),
         browser_candidate_refs,
         service_candidate_refs,
         relay_participant_refs: vec![],
@@ -246,21 +363,189 @@ fn media_transport_path_for_answer(
         state: state.to_string(),
         selected_pair_state: "pending".to_string(),
         inbound_rtp_state: "pending".to_string(),
+        track_state: if blocked_reason.is_some() {
+            "blocked".to_string()
+        } else {
+            "pending".to_string()
+        },
         render_state: "pending".to_string(),
         blocked_reason,
-        safe_facts: json!({
-            "transport": WEBRTC_TRANSPORT,
-            "iceLite": true,
-            "serviceCandidateCount": service_candidates.len(),
-            "browserCandidateCount": offer.candidates.len(),
-            "sourceCount": response.sources.len(),
-        }),
+        safe_facts: with_operation_binding(
+            json!({
+                "transport": WEBRTC_TRANSPORT,
+                "iceLite": true,
+                "serviceCandidateCount": service_candidates.len(),
+                "browserCandidateCount": offer.candidates.len(),
+                "sourceCount": response.sources.len(),
+            }),
+            operation_binding,
+        ),
         evidence_refs: vec![offer.admission.admission_id.clone()],
         issued_at,
         expires_at: Some(offer.route_promise.expires_at),
     };
     validate_media_transport_path(&path)?;
     Ok(path)
+}
+
+fn fulfillment_session_for_answer(
+    response: &ManagedOfferResponse,
+    offer: &StreamSessionOfferRecords,
+    answer: &StreamSessionAnswer,
+    media_transport_path: &MediaTransportPath,
+    operation_binding: &StreamOperationBinding,
+    issued_at: u64,
+) -> Result<FulfillmentSession> {
+    let source_refs = offer.route_plan.source_refs.clone();
+    let subject_ref = source_refs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "camera:any-preview-source".to_string());
+    let service_participant_ref = service_participant_ref_from_route_promise(&offer.route_promise);
+    let path_blocked_reason = media_transport_path
+        .blocked_reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let state = if path_blocked_reason.is_some() {
+        FULFILLMENT_SESSION_BLOCKED
+    } else {
+        FULFILLMENT_SESSION_ACTIONABLE
+    };
+    let blocked_reasons = path_blocked_reason
+        .map(|reason| vec![reason.to_string()])
+        .unwrap_or_default();
+    let fulfillment_session = FulfillmentSession {
+        kind: Some(RECORD_FULFILLMENT_SESSION.to_string()),
+        session_id: media_transport_path.fulfillment_session_id.clone(),
+        parent_intent_ref: format!("stream.session.intent:{}", offer.intent.session_id),
+        subject_ref: subject_ref.clone(),
+        contract_ref: "contract:nvr-preview@0.1.0".to_string(),
+        state: state.to_string(),
+        node_postures: vec![
+            FulfillmentSessionNodePosture {
+                node_ref: format!("node:source:{}", response.session_id),
+                role: "source".to_string(),
+                state: state.to_string(),
+                required: true,
+                participant_ref: Some(service_participant_ref.clone()),
+                member_ref: Some(offer.route_promise.service_member_ref.clone()),
+                contract_ref: Some("contract:nvr-preview@0.1.0".to_string()),
+                capability_refs: vec![CAPABILITY_MEDIA_STREAM_PREVIEW.to_string()],
+                input_refs: source_refs.clone(),
+                output_refs: source_refs.clone(),
+                evidence_refs: vec![offer.admission.admission_id.clone()],
+                blocked_reasons: blocked_reasons.clone(),
+                safe_facts: with_operation_binding(
+                    json!({
+                        "sourceCount": response.sources.len(),
+                        "sourceLifecycleRef": source_lifecycle_ref(&subject_ref),
+                    }),
+                    operation_binding,
+                ),
+            },
+            FulfillmentSessionNodePosture {
+                node_ref: format!("node:carrier:browser-webrtc:{}", response.session_id),
+                role: "carrier".to_string(),
+                state: state.to_string(),
+                required: true,
+                participant_ref: Some(service_participant_ref.clone()),
+                member_ref: Some(offer.route_promise.service_member_ref.clone()),
+                contract_ref: Some("contract:nvr-preview@0.1.0".to_string()),
+                capability_refs: vec![CAPABILITY_MEDIA_STREAM_PREVIEW.to_string()],
+                input_refs: vec![answer.answer_id.clone()],
+                output_refs: vec![media_transport_path.path_id.clone()],
+                evidence_refs: vec![media_transport_path.path_id.clone()],
+                blocked_reasons: blocked_reasons.clone(),
+                safe_facts: with_operation_binding(
+                    json!({
+                        "transport": WEBRTC_TRANSPORT,
+                        "serviceCandidateCount": media_transport_path.service_candidate_refs.len(),
+                        "browserCandidateCount": media_transport_path.browser_candidate_refs.len(),
+                    }),
+                    operation_binding,
+                ),
+            },
+            FulfillmentSessionNodePosture {
+                node_ref: format!("node:render:browser:{}", response.session_id),
+                role: "render".to_string(),
+                state: FULFILLMENT_SESSION_PENDING.to_string(),
+                required: true,
+                participant_ref: Some(offer.route_promise.requester_ref.clone()),
+                member_ref: None,
+                contract_ref: Some("contract:nvr-preview@0.1.0".to_string()),
+                capability_refs: vec![CAPABILITY_MEDIA_STREAM_PREVIEW.to_string()],
+                input_refs: vec![media_transport_path.path_id.clone()],
+                output_refs: vec![format!("surface:nvr-preview:{}", response.session_id)],
+                evidence_refs: vec![],
+                blocked_reasons: vec![],
+                safe_facts: with_operation_binding(
+                    json!({
+                        "renderExpectation": "browserSurfaceObservation",
+                    }),
+                    operation_binding,
+                ),
+            },
+            FulfillmentSessionNodePosture {
+                node_ref: format!("node:service:nvr:{}", response.session_id),
+                role: "service".to_string(),
+                state: state.to_string(),
+                required: true,
+                participant_ref: Some(service_participant_ref.clone()),
+                member_ref: Some(offer.route_promise.service_member_ref.clone()),
+                contract_ref: Some("contract:nvr-preview@0.1.0".to_string()),
+                capability_refs: vec![CAPABILITY_MEDIA_STREAM_PREVIEW.to_string()],
+                input_refs: vec![offer.admission.admission_id.clone()],
+                output_refs: vec![
+                    answer.answer_id.clone(),
+                    media_transport_path.path_id.clone(),
+                ],
+                evidence_refs: vec![
+                    answer.answer_id.clone(),
+                    media_transport_path.path_id.clone(),
+                ],
+                blocked_reasons: blocked_reasons.clone(),
+                safe_facts: with_operation_binding(
+                    json!({
+                        "role": "preview-answerer",
+                        "processorPrimitiveRef": "primitive:media.processor.leaf",
+                        "processorRoleRef": "role:preview-processor-leaf",
+                    }),
+                    operation_binding,
+                ),
+            },
+        ],
+        dependency_refs: vec![offer.route_promise.promise_id.clone()],
+        router_binding_refs: vec![offer.route_plan.selected_path.path_id.clone()],
+        carrier_edge_refs: vec![format!(
+            "carrier.edge:browser-webrtc:{}",
+            response.session_id
+        )],
+        media_path_refs: vec![media_transport_path.path_id.clone()],
+        lifecycle_plan_refs: vec![offer.route_plan.session_id.clone()],
+        availability_refs: source_refs,
+        evidence_refs: vec![
+            offer.admission.admission_id.clone(),
+            answer.answer_id.clone(),
+            media_transport_path.path_id.clone(),
+        ],
+        release_refs: vec![format!("stream.session.close:{}", response.session_id)],
+        blocked_reasons,
+        safe_facts: with_operation_binding(
+            json!({
+                "profile": "browser-webrtc-preview",
+                "sourceCount": response.sources.len(),
+                "serviceCandidateCount": media_transport_path.service_candidate_refs.len(),
+                "browserCandidateCount": media_transport_path.browser_candidate_refs.len(),
+            }),
+            operation_binding,
+        ),
+        issued_at,
+        observed_at: issued_at,
+        expires_at: media_transport_path.expires_at,
+    };
+    validate_fulfillment_session(&fulfillment_session)?;
+    Ok(fulfillment_session)
 }
 
 fn route_promise_contribution_id(route_promise_id: &str) -> String {
@@ -275,18 +560,23 @@ fn answer_fulfillment_contribution_id(answer_id: &str) -> String {
     format!("contribution:{answer_id}:fulfillment")
 }
 
-fn contribution_scope(session_id: &str) -> Value {
-    json!({
-        "channelId": STREAM_CHANNEL_ID,
-        "capabilityRef": CAPABILITY_MEDIA_STREAM_PREVIEW,
-        "sessionId": session_id,
-        "transport": WEBRTC_TRANSPORT,
-    })
+fn contribution_scope(session_id: &str, operation_binding: &StreamOperationBinding) -> Value {
+    with_operation_binding(
+        json!({
+            "channelId": STREAM_CHANNEL_ID,
+            "capabilityRef": CAPABILITY_MEDIA_STREAM_PREVIEW,
+            "sessionId": session_id,
+            "fulfillmentSessionId": fulfillment_session_id_for_session(session_id),
+            "transport": WEBRTC_TRANSPORT,
+        }),
+        operation_binding,
+    )
 }
 
 fn offer_contribution_lifecycles(
     route_promise: &RoutePromise,
     admission: &StreamSessionAdmission,
+    operation_binding: &StreamOperationBinding,
     issued_at: u64,
 ) -> Result<Vec<ContributionLifecycle>> {
     let promise_id = route_promise_contribution_id(&route_promise.promise_id);
@@ -300,7 +590,7 @@ fn offer_contribution_lifecycles(
         state: "active".to_string(),
         role: "route-producer".to_string(),
         authority_refs: route_promise.authority_refs.clone(),
-        scope: contribution_scope(&admission.session_id),
+        scope: contribution_scope(&admission.session_id, operation_binding),
         target_contribution_ref: None,
         supersedes: vec![],
         witness_refs: vec![],
@@ -324,7 +614,7 @@ fn offer_contribution_lifecycles(
         state: "witnessed".to_string(),
         role: "executor".to_string(),
         authority_refs: route_promise.authority_refs.clone(),
-        scope: contribution_scope(&admission.session_id),
+        scope: contribution_scope(&admission.session_id, operation_binding),
         target_contribution_ref: Some(promise_id),
         supersedes: vec![],
         witness_refs: vec![admission.admission_id.clone()],
@@ -348,6 +638,7 @@ fn answer_contribution_lifecycles(
     offer: &StreamSessionOfferRecords,
     answer: &StreamSessionAnswer,
     media_transport_path: &MediaTransportPath,
+    operation_binding: &StreamOperationBinding,
     issued_at: u64,
 ) -> Result<Vec<ContributionLifecycle>> {
     let fulfillment = ContributionLifecycle {
@@ -360,7 +651,7 @@ fn answer_contribution_lifecycles(
         state: "active".to_string(),
         role: "executor".to_string(),
         authority_refs: offer.route_promise.authority_refs.clone(),
-        scope: contribution_scope(&response.session_id),
+        scope: contribution_scope(&response.session_id, operation_binding),
         target_contribution_ref: Some(admission_witness_contribution_id(
             &offer.admission.admission_id,
         )),
@@ -399,6 +690,7 @@ pub fn stream_session_control_for_request(
 
     let control = StreamSessionControl {
         control_id: format!("control-{session_id}-{issued_at}"),
+        fulfillment_session_id: Some(fulfillment_session_id_for_session(&session_id)),
         session_id,
         command: "ptz".to_string(),
         params,
@@ -417,6 +709,7 @@ pub fn stream_session_close_for_request(
     let session_id = close_session_id_for_request(request, &claims);
     let close = StreamSessionClose {
         close_id: format!("close-{session_id}-{issued_at}"),
+        fulfillment_session_id: Some(fulfillment_session_id_for_session(&session_id)),
         session_id,
         reason_code: request
             .payload
@@ -454,6 +747,7 @@ fn close_session_id_for_request(
 
 fn stream_candidate(
     session_id: &str,
+    fulfillment_session_id: &str,
     direction: &str,
     idx: usize,
     payload: Value,
@@ -476,6 +770,7 @@ fn stream_candidate(
     let candidate = StreamSessionCandidate {
         candidate_id: format!("candidate-{session_id}-{direction}-{idx}"),
         session_id: session_id.to_string(),
+        fulfillment_session_id: Some(fulfillment_session_id.to_string()),
         transport: WEBRTC_TRANSPORT.to_string(),
         candidate_role: role.to_string(),
         actionability,
@@ -512,7 +807,16 @@ fn offer_payload(request: &ManagedOfferRequest) -> Value {
         "candidateCount".to_string(),
         json!(request.candidates.len()),
     );
-    strip_media_byte_fields(Value::Object(payload))
+    with_operation_binding(
+        strip_media_byte_fields(Value::Object(payload)),
+        &request.operation_binding,
+    )
+}
+
+fn operation_binding_from_offer(offer: &StreamSessionOfferRecords) -> StreamOperationBinding {
+    let mut binding = StreamOperationBinding::from_value(&offer.admission.constraints);
+    binding.merge_missing_from(&StreamOperationBinding::from_value(&offer.offer.payload));
+    binding
 }
 
 fn offer_source_ids(offer: &Value) -> Vec<String> {
@@ -679,6 +983,15 @@ pub fn browser_webrtc_path_id(session_id: &str) -> String {
     format!("{session_id}:path:browserWebRtc")
 }
 
+fn service_participant_ref_from_route_promise(route_promise: &RoutePromise) -> String {
+    let service_pk = route_promise.service_pk.trim();
+    if service_pk.is_empty() {
+        "service:nvr".to_string()
+    } else {
+        format!("service:{service_pk}")
+    }
+}
+
 fn route_promise_id(session_id: &str) -> String {
     format!("route-promise-{session_id}")
 }
@@ -718,6 +1031,62 @@ fn push_unique_ref(refs: &mut Vec<String>, value: &str) {
     let trimmed = value.trim();
     if !trimmed.is_empty() && !refs.iter().any(|item| item == trimmed) {
         refs.push(trimmed.to_string());
+    }
+}
+
+fn with_operation_binding(mut value: Value, operation_binding: &StreamOperationBinding) -> Value {
+    if operation_binding.is_bound() {
+        if let Value::Object(map) = &mut value {
+            operation_binding.insert_into_map(map);
+        }
+    }
+    value
+}
+
+fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| value.get(*key))
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .next()
+}
+
+fn insert_trimmed(map: &mut Map<String, Value>, key: &str, value: &str) {
+    let trimmed = value.trim();
+    if !trimmed.is_empty() {
+        map.insert(key.to_string(), json!(trimmed));
+    }
+}
+
+fn source_lifecycle_ref(subject_ref: &str) -> String {
+    format!(
+        "source-lifecycle:nvr-preview:{}",
+        ref_safe_token(subject_ref)
+    )
+}
+
+fn ref_safe_token(value: &str) -> String {
+    let mut out = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed
     }
 }
 
@@ -973,6 +1342,11 @@ mod tests {
                 "sourceIds": ["cam-1"],
                 "mediaBytes": "must-not-survive"
             }),
+            operation_binding: StreamOperationBinding {
+                operation_ref: "operation:nvr-preview:runtime-stream-open:test".to_string(),
+                operation_class_ref: "operation-class:stream-open".to_string(),
+                method_ref: "runtime.stream.open".to_string(),
+            },
             ice_servers: Default::default(),
             candidates: vec![RTCIceCandidateInit {
                 candidate: "candidate:1 1 udp 1 192.0.2.5 5000 typ host".to_string(),
@@ -1000,7 +1374,19 @@ mod tests {
         assert_eq!(records.contribution_lifecycles.len(), 2);
         for contribution in &records.contribution_lifecycles {
             validate_contribution_lifecycle(contribution).expect("contribution lifecycle");
+            assert_eq!(
+                contribution.scope["operationRef"],
+                json!("operation:nvr-preview:runtime-stream-open:test")
+            );
         }
+        assert_eq!(
+            records.admission.constraints["operationRef"],
+            json!("operation:nvr-preview:runtime-stream-open:test")
+        );
+        assert_eq!(
+            records.offer.payload["operationClassRef"],
+            json!("operation-class:stream-open")
+        );
         assert_eq!(records.candidates.len(), 1);
         assert_eq!(
             records.candidates[0].candidate_role,
@@ -1029,6 +1415,11 @@ mod tests {
                 },
                 "sourceIds": ["cam-1"]
             }),
+            operation_binding: StreamOperationBinding {
+                operation_ref: "operation:nvr-preview:runtime-stream-open:test".to_string(),
+                operation_class_ref: "operation-class:stream-open".to_string(),
+                method_ref: "runtime.stream.open".to_string(),
+            },
             ice_servers: Default::default(),
             candidates: vec![RTCIceCandidateInit {
                 candidate: "candidate:1 1 udp 1 192.0.2.10 6000 typ host".to_string(),
@@ -1078,11 +1469,27 @@ mod tests {
         );
         validate_media_transport_path(&records.media_transport_path).expect("media path");
         assert_eq!(records.media_transport_path.state, "actionable");
+        assert_eq!(
+            records.answer.payload["operationRef"],
+            json!("operation:nvr-preview:runtime-stream-open:test")
+        );
+        assert_eq!(
+            records.media_transport_path.safe_facts["methodRef"],
+            json!("runtime.stream.open")
+        );
+        assert_eq!(
+            records.fulfillment_session.safe_facts["operationClassRef"],
+            json!("operation-class:stream-open")
+        );
         assert_eq!(records.media_transport_path.service_candidate_refs.len(), 1);
         assert_eq!(records.media_transport_path.browser_candidate_refs.len(), 1);
         assert_eq!(records.contribution_lifecycles.len(), 1);
         validate_contribution_lifecycle(&records.contribution_lifecycles[0])
             .expect("answer contribution lifecycle");
+        assert_eq!(
+            records.contribution_lifecycles[0].scope["operationRef"],
+            json!("operation:nvr-preview:runtime-stream-open:test")
+        );
         let rendered = serde_json::to_string(&records).expect("json");
         assert!(!rendered.contains("rtsp://"));
         assert!(!rendered.contains("mediaBytes"));
