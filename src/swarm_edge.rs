@@ -5,8 +5,9 @@ use crate::config::{CameraDeviceConfig, Config};
 use crate::live::{
     ManagedCandidateRequest, ManagedCloseRequest, ManagedControlRequest, ManagedOfferRequest,
     ManagedOfferResponse, PreviewManager, PreviewTransportObservationEvent, StreamAuthorityClaims,
-    StreamSessionOfferRecords, resolve_control_camera, stream_session_close_for_request,
-    stream_session_control_for_request, validate_stream_authority,
+    StreamOperationBinding, StreamSessionOfferRecords, fulfillment_session_id_for_session,
+    resolve_control_camera, stream_session_close_for_request, stream_session_control_for_request,
+    validate_stream_authority,
 };
 use crate::util;
 use anyhow::{Context, Result, anyhow};
@@ -15,11 +16,11 @@ use constitute_protocol::{
     CAPABILITY_ROUTE_PROMISE_RESOLVE, CAPABILITY_SERVICE_EDGE_POSTURE_PUBLISH,
     CAPABILITY_STREAM_SESSION_CONTROL, CAPABILITY_STREAM_SESSION_OFFER, CaacEnvelope,
     MediaTransportObservation, ProjectionDeltaOp, ProjectionDeltaOpKind, ProjectionPathSegment,
-    RECORD_CONTRIBUTION_LIFECYCLE, RECORD_MEDIA_TRANSPORT_OBSERVATION, RECORD_MEDIA_TRANSPORT_PATH,
-    RECORD_ROUTE_OBSERVATION, RECORD_ROUTE_PROMISE, RECORD_SERVICE_EDGE_ADAPTER_POSTURE,
-    RECORD_STREAM_ROUTE_PLAN, ReplayCache, RouteObservation, RouteObservationState,
-    SERVICE_EDGE_ADAPTER_READY, SERVICE_EDGE_ADMISSION_AVAILABLE, SERVICE_EDGE_BACKPRESSURE_CLEAR,
-    SERVICE_EDGE_OUTPUT_AVAILABLE, SERVICE_EDGE_RELEASE_HELD,
+    RECORD_CONTRIBUTION_LIFECYCLE, RECORD_FULFILLMENT_SESSION, RECORD_MEDIA_TRANSPORT_OBSERVATION,
+    RECORD_MEDIA_TRANSPORT_PATH, RECORD_ROUTE_OBSERVATION, RECORD_ROUTE_PROMISE,
+    RECORD_SERVICE_EDGE_ADAPTER_POSTURE, RECORD_STREAM_ROUTE_PLAN, ReplayCache, RouteObservation,
+    RouteObservationState, SERVICE_EDGE_ADAPTER_READY, SERVICE_EDGE_ADMISSION_AVAILABLE,
+    SERVICE_EDGE_BACKPRESSURE_CLEAR, SERVICE_EDGE_OUTPUT_AVAILABLE, SERVICE_EDGE_RELEASE_HELD,
     STREAM_CANDIDATE_ACTIONABILITY_USABLE, STREAM_CANDIDATE_ROLE_BROWSER,
     SURFACE_PARTICIPANT_SIDE_SERVICE, ServiceEdgeAdapterPostureRecord, StreamSessionClose,
     StreamSessionControl, StreamSessionHealth, SwarmAck, SwarmFrame, SwarmFrameBody,
@@ -772,6 +773,21 @@ fn build_offer_response_frames(
         None,
         response_zone_scope.as_ref(),
     )?);
+    frames.push(seal_record_frame(
+        cfg,
+        request_frame,
+        SwarmFrameKind::StreamStatus,
+        RECORD_FULFILLMENT_SESSION,
+        &stream_session.answer.fulfillment_session.session_id,
+        CAPABILITY_MEDIA_STREAM_PREVIEW,
+        json!({
+            "recordKind": RECORD_FULFILLMENT_SESSION,
+            "record": &stream_session.answer.fulfillment_session,
+        }),
+        now,
+        None,
+        response_zone_scope.as_ref(),
+    )?);
     for contribution in &stream_session.answer.contribution_lifecycles {
         frames.push(seal_record_frame(
             cfg,
@@ -845,6 +861,7 @@ fn build_transport_observation_frame(
         ),
         path_id: event.path_id.clone(),
         session_id: event.session_id.clone(),
+        fulfillment_session_id: event.fulfillment_session_id.clone(),
         activation_id: Some(event.activation_id.clone()),
         route_promise_id: Some(event.route_promise_id.clone()),
         participant_ref: event.participant_ref.clone(),
@@ -854,6 +871,7 @@ fn build_transport_observation_frame(
         ice_connection_state: event.ice_connection_state.clone(),
         selected_pair_state: event.selected_pair_state.clone(),
         inbound_rtp_state: event.inbound_rtp_state.clone(),
+        track_state: event.track_state.clone(),
         render_state: event.render_state.clone(),
         blocked_reason: event.blocked_reason.clone(),
         reason: event.reason.clone(),
@@ -863,6 +881,7 @@ fn build_transport_observation_frame(
             "pathExpiresAt": event.expires_at,
             "serviceConnectionState": event.connection_state,
             "selectedPairState": event.selected_pair_state,
+            "trackState": event.track_state,
         }),
         evidence_refs: vec![event.path_id.clone()],
         observed_at: event.observed_at,
@@ -984,6 +1003,7 @@ fn build_candidate_response_frames(
                 "record": {
                     "candidateId": format!("candidate-applied-{session_id}-{now}"),
                     "sessionId": session_id,
+                    "fulfillmentSessionId": fulfillment_session_id_for_session(&session_id),
                     "transport": "webrtc",
                     "candidateRole": STREAM_CANDIDATE_ROLE_BROWSER,
                     "actionability": STREAM_CANDIDATE_ACTIONABILITY_USABLE,
@@ -1103,6 +1123,7 @@ fn stream_session_health(session_id: &str, status: &str, now: u64) -> Result<Str
     let health = StreamSessionHealth {
         health_id: format!("health-{session_id}-{now}"),
         session_id: session_id.to_string(),
+        fulfillment_session_id: Some(fulfillment_session_id_for_session(session_id)),
         status: status.to_string(),
         recovery: json!({}),
         issued_at: now,
@@ -1786,12 +1807,45 @@ fn managed_offer_from_claims(cfg: &Config, claims: &Value) -> Result<ManagedOffe
     collect_candidates(claims.get("candidates"), &mut candidates)?;
     collect_candidates(payload.get("candidates"), &mut candidates)?;
     collect_candidates(offer.get("candidates"), &mut candidates)?;
+    let operation_binding = operation_binding_from_claims_and_offer(claims, &offer);
     Ok(ManagedOfferRequest {
         authority: authority_from_claims(cfg, claims)?,
         offer,
+        operation_binding,
         ice_servers,
         candidates,
     })
+}
+
+fn operation_binding_from_claims_and_offer(
+    claims: &Value,
+    offer: &Value,
+) -> StreamOperationBinding {
+    let payload = object_or_empty(claims.get("payload"));
+    let mut binding = StreamOperationBinding::default();
+    for source in [
+        Some(claims),
+        claims.get("params"),
+        claims
+            .get("activation")
+            .and_then(|value| value.get("params")),
+        claims.get("activationParams"),
+        claims.get("record").and_then(|value| value.get("params")),
+        claims.get("record").and_then(|value| value.get("payload")),
+        Some(&payload),
+        payload.get("params"),
+        payload
+            .get("activation")
+            .and_then(|value| value.get("params")),
+        payload.get("activationParams"),
+        Some(offer),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        binding.merge_missing_from(&StreamOperationBinding::from_value(source));
+    }
+    binding
 }
 
 fn managed_control_from_claims(cfg: &Config, claims: &Value) -> Result<ManagedControlRequest> {
@@ -2028,6 +2082,7 @@ mod tests {
                 "description": { "type": "offer", "sdp": "v=0\r\n" },
                 "sourceIds": ["cam-1"]
             }),
+            operation_binding: StreamOperationBinding::default(),
             ice_servers: Default::default(),
             candidates: vec![],
         };
@@ -2272,6 +2327,7 @@ mod tests {
         let event = PreviewTransportObservationEvent {
             path_id: "nvr-preview-nonce-1:path:browserWebRtc".to_string(),
             session_id: "nvr-preview-nonce-1".to_string(),
+            fulfillment_session_id: "fulfillment:preview:nvr-preview-nonce-1".to_string(),
             activation_id: "activation-1".to_string(),
             route_promise_id: "route-promise-nvr-preview-nonce-1".to_string(),
             requester_ref: cfg.gateway.host_gateway_pk.clone(),
@@ -2282,6 +2338,7 @@ mod tests {
             ice_connection_state: None,
             selected_pair_state: Some("selected".to_string()),
             inbound_rtp_state: None,
+            track_state: Some("pending".to_string()),
             render_state: None,
             blocked_reason: Some("peerConnectionDisconnected".to_string()),
             reason: Some("peerConnectionDisconnected".to_string()),
@@ -2314,6 +2371,7 @@ mod tests {
         let event = PreviewTransportObservationEvent {
             path_id: "nvr-preview-nonce-1:path:browserWebRtc".to_string(),
             session_id: "nvr-preview-nonce-1".to_string(),
+            fulfillment_session_id: "fulfillment:preview:nvr-preview-nonce-1".to_string(),
             activation_id: "activation-1".to_string(),
             route_promise_id: "route-promise-nvr-preview-nonce-1".to_string(),
             requester_ref: cfg.gateway.host_gateway_pk.clone(),
@@ -2324,6 +2382,7 @@ mod tests {
             ice_connection_state: None,
             selected_pair_state: Some("failed".to_string()),
             inbound_rtp_state: None,
+            track_state: Some("blocked".to_string()),
             render_state: None,
             blocked_reason: Some("peerConnectionFailed".to_string()),
             reason: Some("peerConnectionFailed".to_string()),
@@ -2396,6 +2455,7 @@ mod tests {
         let control = StreamSessionControl {
             control_id: "control-nvr-preview-nonce-1".to_string(),
             session_id: "nvr-preview-nonce-1".to_string(),
+            fulfillment_session_id: Some("fulfillment:preview:nvr-preview-nonce-1".to_string()),
             command: "ptz".to_string(),
             params: json!({ "sourceId": "cam-1", "ptz": { "pan": 0.1 } }),
             issued_at: now,
@@ -2403,6 +2463,7 @@ mod tests {
         let close = StreamSessionClose {
             close_id: "close-nvr-preview-nonce-1".to_string(),
             session_id: "nvr-preview-nonce-1".to_string(),
+            fulfillment_session_id: Some("fulfillment:preview:nvr-preview-nonce-1".to_string()),
             reason_code: "closed".to_string(),
             issued_at: now,
         };
@@ -2654,6 +2715,13 @@ mod tests {
         let cfg = config();
         let claims = json!({
             "authority": authority_claims(&cfg, "nonce-claims"),
+            "activation": {
+                "params": {
+                    "operationRef": "operation:nvr-preview:runtime-stream-open:test",
+                    "operationClassRef": "operation-class:stream-open",
+                    "methodRef": "runtime.stream.open"
+                }
+            },
             "payload": {
                 "description": { "type": "offer", "sdp": "v=0\r\n" }
             }
@@ -2662,6 +2730,11 @@ mod tests {
         let request = managed_offer_from_claims(&cfg, &claims).expect("managed offer");
         assert_eq!(request.authority.nonce, "nonce-claims");
         assert_eq!(request.offer["description"]["type"], json!("offer"));
+        assert_eq!(
+            request.operation_binding.operation_ref,
+            "operation:nvr-preview:runtime-stream-open:test"
+        );
+        assert_eq!(request.operation_binding.method_ref, "runtime.stream.open");
     }
 
     #[tokio::test]

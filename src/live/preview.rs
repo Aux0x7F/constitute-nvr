@@ -5,9 +5,9 @@
 //! service-edge sealed frame payloads directly.
 
 use super::stream_records::{
-    StreamSessionExchangeRecords, StreamSessionOfferRecords, browser_webrtc_path_id,
-    parse_candidate_endpoint, session_id_for_claims, stream_session_records_for_answer,
-    stream_session_records_for_offer,
+    StreamOperationBinding, StreamSessionExchangeRecords, StreamSessionOfferRecords,
+    browser_webrtc_path_id, fulfillment_session_id_for_session, parse_candidate_endpoint,
+    session_id_for_claims, stream_session_records_for_answer, stream_session_records_for_offer,
 };
 use crate::camera_device::registry::driver_is_xm;
 use crate::config::{CameraDeviceConfig, Config, LivePreviewConfig};
@@ -90,6 +90,8 @@ pub struct StreamAuthorityClaims {
 pub struct ManagedOfferRequest {
     pub authority: StreamAuthorityClaims,
     pub offer: Value,
+    #[serde(rename = "operationBinding", default)]
+    pub operation_binding: StreamOperationBinding,
     #[serde(rename = "iceServers", default)]
     pub ice_servers: ManagedIceServerHints,
     #[serde(default)]
@@ -207,6 +209,7 @@ struct PreviewSessionHandle {
 pub struct PreviewTransportObservationEvent {
     pub path_id: String,
     pub session_id: String,
+    pub fulfillment_session_id: String,
     pub activation_id: String,
     pub route_promise_id: String,
     pub requester_ref: String,
@@ -217,6 +220,7 @@ pub struct PreviewTransportObservationEvent {
     pub ice_connection_state: Option<String>,
     pub selected_pair_state: Option<String>,
     pub inbound_rtp_state: Option<String>,
+    pub track_state: Option<String>,
     pub render_state: Option<String>,
     pub blocked_reason: Option<String>,
     pub reason: Option<String>,
@@ -230,6 +234,7 @@ pub struct PreviewTransportObservationEvent {
 struct PreviewTransportObservationContext {
     path_id: String,
     session_id: String,
+    fulfillment_session_id: String,
     activation_id: String,
     route_promise_id: String,
     requester_ref: String,
@@ -363,6 +368,11 @@ impl PreviewManager {
             .collect::<Vec<_>>();
         let offer_records = stream_session_records_for_offer(cfg, &request, &authority, issued_at)?;
         let session_id = session_id_for_claims(&authority);
+        let fulfillment_session_id = offer_records
+            .intent
+            .fulfillment_session_id
+            .clone()
+            .unwrap_or_else(|| fulfillment_session_id_for_session(&session_id));
         let path_id = browser_webrtc_path_id(&session_id);
         let activation_id = offer_records.route_promise.activation_id.clone();
         let route_promise_id = offer_records.route_promise.promise_id.clone();
@@ -408,6 +418,7 @@ impl PreviewManager {
         let transport_events = self.transport_events.clone();
         let event_path_id = path_id.clone();
         let event_session_id = session_id.clone();
+        let event_fulfillment_session_id = fulfillment_session_id.clone();
         let event_activation_id = activation_id.clone();
         let event_route_promise_id = route_promise_id.clone();
         let event_requester_ref = requester_ref.clone();
@@ -421,6 +432,7 @@ impl PreviewManager {
             let transport_events = transport_events.clone();
             let path_id = event_path_id.clone();
             let session_id = event_session_id.clone();
+            let fulfillment_session_id = event_fulfillment_session_id.clone();
             let activation_id = event_activation_id.clone();
             let route_promise_id = event_route_promise_id.clone();
             let requester_ref = event_requester_ref.clone();
@@ -432,6 +444,7 @@ impl PreviewManager {
                 let _ = transport_events.send(PreviewTransportObservationEvent {
                     path_id: path_id.clone(),
                     session_id: session_id.clone(),
+                    fulfillment_session_id: fulfillment_session_id.clone(),
                     activation_id: activation_id.clone(),
                     route_promise_id: route_promise_id.clone(),
                     requester_ref: requester_ref.clone(),
@@ -442,6 +455,7 @@ impl PreviewManager {
                     ice_connection_state: None,
                     selected_pair_state: selected_pair_state_for_peer_state(state).map(str::to_string),
                     inbound_rtp_state: None,
+                    track_state: None,
                     render_state: None,
                     blocked_reason: reason.clone(),
                     reason,
@@ -468,6 +482,7 @@ impl PreviewManager {
                                     let _ = transport_events.send(PreviewTransportObservationEvent {
                                         path_id,
                                         session_id: session_id.clone(),
+                                        fulfillment_session_id,
                                         activation_id,
                                         route_promise_id,
                                         requester_ref,
@@ -478,6 +493,7 @@ impl PreviewManager {
                                         ice_connection_state: None,
                                         selected_pair_state: Some("none".to_string()),
                                         inbound_rtp_state: None,
+                                        track_state: Some("released".to_string()),
                                         render_state: None,
                                         blocked_reason: Some("disconnectedGraceExpired".to_string()),
                                         reason: Some("disconnectedGraceExpired".to_string()),
@@ -545,6 +561,7 @@ impl PreviewManager {
                 PreviewTransportObservationContext {
                     path_id: path_id.clone(),
                     session_id: session_id.clone(),
+                    fulfillment_session_id: fulfillment_session_id.clone(),
                     activation_id: activation_id.clone(),
                     route_promise_id: route_promise_id.clone(),
                     requester_ref: requester_ref.clone(),
@@ -1332,6 +1349,7 @@ fn service_media_transport_observation(
     PreviewTransportObservationEvent {
         path_id: context.path_id.clone(),
         session_id: context.session_id.clone(),
+        fulfillment_session_id: context.fulfillment_session_id.clone(),
         activation_id: context.activation_id.clone(),
         route_promise_id: context.route_promise_id.clone(),
         requester_ref: context.requester_ref.clone(),
@@ -1342,6 +1360,7 @@ fn service_media_transport_observation(
         ice_connection_state: None,
         selected_pair_state: selected_pair_state.map(str::to_string),
         inbound_rtp_state: inbound_rtp_state.map(str::to_string),
+        track_state: service_track_state_for_inbound_rtp(inbound_rtp_state).map(str::to_string),
         render_state: render_state.map(str::to_string),
         blocked_reason: blocked_reason.map(str::to_string),
         reason: reason.map(str::to_string),
@@ -1349,6 +1368,16 @@ fn service_media_transport_observation(
         grace_ms,
         observed_at: crate::util::now_ms(),
         expires_at: context.expires_at,
+    }
+}
+
+fn service_track_state_for_inbound_rtp(inbound_rtp_state: Option<&str>) -> Option<&'static str> {
+    match inbound_rtp_state {
+        Some("flowing") => Some("live"),
+        Some("blocked") => Some("blocked"),
+        Some("released") => Some("released"),
+        Some("pending") | Some("stalled") => Some("pending"),
+        _ => None,
     }
 }
 
@@ -1615,6 +1644,7 @@ mod tests {
                     }
                 ]
             }),
+            operation_binding: StreamOperationBinding::default(),
             ice_servers: ManagedIceServerHints::default(),
             candidates: vec![RTCIceCandidateInit {
                 candidate: "candidate:1 1 udp 2122260223 10.0.229.73 54547 typ host".to_string(),
@@ -1647,6 +1677,7 @@ mod tests {
                     "sdp": "v=0\r\n"
                 }
             }),
+            operation_binding: StreamOperationBinding::default(),
             ice_servers: ManagedIceServerHints::default(),
             candidates: vec![RTCIceCandidateInit {
                 candidate: "candidate:1 1 udp 2122260223 10.0.229.73 typ host".to_string(),
@@ -1778,6 +1809,7 @@ mod tests {
         let context = PreviewTransportObservationContext {
             path_id: "nvr-preview-1:path:browserWebRtc".to_string(),
             session_id: "nvr-preview-1".to_string(),
+            fulfillment_session_id: "fulfillment:preview:nvr-preview-1".to_string(),
             activation_id: "activation-1".to_string(),
             route_promise_id: "route-promise-1".to_string(),
             requester_ref: "device:aux".to_string(),
@@ -1800,8 +1832,13 @@ mod tests {
         );
         assert_eq!(pending.session_id, "nvr-preview-1");
         assert_eq!(pending.participant_role, "service");
+        assert_eq!(
+            pending.fulfillment_session_id,
+            "fulfillment:preview:nvr-preview-1"
+        );
         assert_eq!(pending.state, "pending");
         assert_eq!(pending.inbound_rtp_state.as_deref(), Some("pending"));
+        assert_eq!(pending.track_state.as_deref(), Some("pending"));
         assert_eq!(pending.blocked_reason, None);
 
         let blocked = service_media_transport_observation(
@@ -1817,6 +1854,7 @@ mod tests {
         );
         assert_eq!(blocked.state, "blocked");
         assert_eq!(blocked.inbound_rtp_state.as_deref(), Some("blocked"));
+        assert_eq!(blocked.track_state.as_deref(), Some("blocked"));
         assert_eq!(
             blocked.blocked_reason.as_deref(),
             Some("sourceRtpUnavailable")

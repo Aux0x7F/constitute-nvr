@@ -74,13 +74,15 @@ pub fn stream_session_health_records(
         .sources
         .iter()
         .filter_map(|source| {
+            let session_id = format!("nvr-preview-source-{}", record_token(&source.source_id));
             let record = StreamSessionHealth {
                 health_id: format!(
                     "nvr-media-projection-{}-{}-{issued_at}",
                     record_token(&source.source_id),
                     record_token(&source.codec)
                 ),
-                session_id: format!("nvr-preview-source-{}", record_token(&source.source_id)),
+                fulfillment_session_id: Some(format!("fulfillment:preview:{session_id}")),
+                session_id,
                 status: source.state.clone(),
                 recovery: json!({
                     "serviceRef": service_ref(service_pk),
@@ -763,7 +765,35 @@ fn projection_safe_facts(
 ) -> Value {
     let mut facts = Map::new();
     facts.insert("eventType".to_string(), json!(event_type));
+    facts.insert(
+        "processorPrimitiveRef".to_string(),
+        json!("primitive:media.processor.leaf"),
+    );
+    facts.insert(
+        "processorRef".to_string(),
+        json!("processor:nvr-preview:media-projection"),
+    );
+    facts.insert(
+        "processorPolicyRef".to_string(),
+        json!("processor-policy:nvr-preview:preview-projection"),
+    );
+    facts.insert(
+        "processorRoleRef".to_string(),
+        json!("role:preview-processor-leaf"),
+    );
+    facts.insert(
+        "operationClassRef".to_string(),
+        json!("operation-class:stream-open"),
+    );
+    facts.insert("methodRef".to_string(), json!("runtime.stream.open"));
     facts.insert("sourceId".to_string(), json!(camera.source_id.as_str()));
+    facts.insert(
+        "sourceLifecycleRef".to_string(),
+        json!(format!(
+            "source-lifecycle:nvr-preview:{}",
+            projection_ref_safe_token(&camera.source_id)
+        )),
+    );
     facts.insert("cameraName".to_string(), json!(camera.name.as_str()));
     facts.insert("driverId".to_string(), json!(camera.driver_id.as_str()));
     facts.insert("vendor".to_string(), json!(camera.vendor.as_str()));
@@ -781,6 +811,29 @@ fn projection_safe_facts(
         facts.insert("idleTimeoutSecs".to_string(), json!(idle_timeout_secs));
     }
     Value::Object(facts)
+}
+
+fn projection_ref_safe_token(value: &str) -> String {
+    let mut out = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed
+    }
 }
 
 fn projection_no_packet_timeout_secs() -> u64 {
@@ -982,6 +1035,25 @@ mod tests {
         assert!(!rendered.contains("supersecret"));
         assert!(!rendered.contains("h264Preview"));
         assert_eq!(facts["selectedStream"], "preview");
+        assert_eq!(
+            facts["processorPrimitiveRef"],
+            "primitive:media.processor.leaf"
+        );
+        assert_eq!(
+            facts["processorRef"],
+            "processor:nvr-preview:media-projection"
+        );
+        assert_eq!(
+            facts["processorPolicyRef"],
+            "processor-policy:nvr-preview:preview-projection"
+        );
+        assert_eq!(facts["processorRoleRef"], "role:preview-processor-leaf");
+        assert_eq!(facts["operationClassRef"], "operation-class:stream-open");
+        assert_eq!(facts["methodRef"], "runtime.stream.open");
+        assert_eq!(
+            facts["sourceLifecycleRef"],
+            "source-lifecycle:nvr-preview:reolink-carport"
+        );
         assert_eq!(facts["restartAttempt"], 3);
         assert_eq!(facts["backoffSecs"], 8);
         assert_eq!(facts["idleTimeoutSecs"], 8);

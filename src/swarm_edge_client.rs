@@ -7,15 +7,19 @@ use crate::config::Config;
 use crate::swarm_edge::{GatewayFrameAdmission, SwarmEdge};
 use crate::util;
 use anyhow::{Context, Result, anyhow};
-use constitute_fabric::{HostFabricMemberContributionSpec, build_host_fabric_member_contribution};
+use constitute_fabric::{
+    GatewayWebSocketCarrierSessionEvidenceInput, HostFabricMemberContributionSpec,
+    build_gateway_websocket_carrier_session_evidence, build_host_fabric_member_contribution,
+};
 use constitute_protocol::{
     CAPABILITY_MEDIA_STREAM_PREVIEW, CAPABILITY_PROJECTION_DELTA_APPLY,
     CAPABILITY_PROJECTION_OBSERVE, CAPABILITY_STORAGE_PIN, CAPABILITY_STREAM_SESSION_CONTROL,
-    CAPABILITY_STREAM_SESSION_OFFER, CAPABILITY_SWARM_EDGE_ATTACH,
-    FABRIC_MEMBER_CONTRIBUTION_RUNNING, FABRIC_MEMBER_ROLE_DOMAIN_SERVICE,
-    HostFabricMemberContribution, SWARM_EDGE_WIRE_ACCEPT, SWARM_EDGE_WIRE_HELLO,
-    SWARM_EDGE_WIRE_RESUME, SWARM_FRAME_VERSION, SWARM_WIRE_FRAME, SwarmEdgeAccept, SwarmEdgeHello,
-    SwarmEdgeResume, SwarmFrame, SwarmFrameBody, ZoneScope, seal_envelope,
+    CAPABILITY_STREAM_SESSION_OFFER, CAPABILITY_SWARM_EDGE_ATTACH, CARRIER_EDGE_SESSION_OPEN,
+    CarrierEdgeSessionEvidence, FABRIC_MEMBER_CONTRIBUTION_RUNNING,
+    FABRIC_MEMBER_ROLE_DOMAIN_SERVICE, HostFabricMemberContribution, SWARM_EDGE_WIRE_ACCEPT,
+    SWARM_EDGE_WIRE_HELLO, SWARM_EDGE_WIRE_RESUME, SWARM_FRAME_VERSION, SWARM_WIRE_FRAME,
+    SwarmEdgeAccept, SwarmEdgeHello, SwarmEdgeResume, SwarmFrame, SwarmFrameBody, ZoneScope,
+    seal_envelope, validate_carrier_edge_session_evidence,
     validate_host_fabric_member_contribution, validate_swarm_edge_hello,
     validate_swarm_edge_resume,
 };
@@ -288,7 +292,14 @@ async fn run_connection(endpoint: String, cfg: Config, edge: SwarmEdge) -> Resul
                 };
                 match parse_edge_wire_text(&text) {
                     Ok(EdgeWireRecord::Accept(accept)) => {
-                        debug!(session_id = %accept.session_id, "gateway accepted nvr edge session");
+                        let evidence =
+                            nvr_carrier_edge_session_evidence(&accept, util::now_ms())?;
+                        debug!(
+                            session_id = %accept.session_id,
+                            adapter_ref = %evidence.adapter_ref,
+                            carrier_state = %evidence.state,
+                            "gateway accepted nvr carrier edge session"
+                        );
                         accepted_session = Some(accept);
                     }
                     Ok(EdgeWireRecord::Frame(frame)) => {
@@ -521,10 +532,18 @@ fn nvr_host_fabric_contribution(
         fabric_ref,
         host_ref,
         member_ref: member_ref.to_string(),
+        participant_ref: member_ref.to_string(),
         role: FABRIC_MEMBER_ROLE_DOMAIN_SERVICE.to_string(),
+        role_ref: format!("role:{FABRIC_MEMBER_ROLE_DOMAIN_SERVICE}"),
         state: FABRIC_MEMBER_CONTRIBUTION_RUNNING.to_string(),
         contract_ref: service_ref.to_string(),
         subject_ref: service_ref.to_string(),
+        module_refs: vec![
+            "module:nvr-edge-client".to_string(),
+            "module:nvr-service".to_string(),
+            service_ref.to_string(),
+        ],
+        source_refs: vec![format!("source:nvr:{}", cfg.nostr_pubkey.trim())],
         capability_refs: nvr_edge_capabilities()
             .into_iter()
             .map(ToOwned::to_owned)
@@ -643,6 +662,63 @@ fn service_ref(cfg: &Config) -> String {
     } else {
         format!("service:{service_pk}")
     }
+}
+
+fn nvr_carrier_edge_session_evidence(
+    accept: &SwarmEdgeAccept,
+    now: u64,
+) -> Result<CarrierEdgeSessionEvidence> {
+    let member_ref = accept.member_ref.trim();
+    let session_id = accept.session_id.trim();
+    let service_ref = accept
+        .promise_refs
+        .iter()
+        .map(|reference| reference.trim())
+        .find(|reference| reference.starts_with("service:"))
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("service:nvr:{member_ref}"));
+    build_gateway_websocket_carrier_session_evidence(GatewayWebSocketCarrierSessionEvidenceInput {
+        evidence_id: format!(
+            "carrier-edge-evidence:nvr:{}:{}",
+            slug(&service_ref),
+            slug(session_id)
+        ),
+        selection_ref: format!("carrier-select:{}:gateway-edge", slug(&service_ref)),
+        edge_session_ref: format!("edge-session:{session_id}"),
+        participant_ref: service_ref.clone(),
+        peer_ref: None,
+        session_binding_ref: format!("binding:gateway-edge:{session_id}"),
+        safe_facts: json!({
+            "service": "nvr",
+            "memberKind": accept.member_kind,
+            "capabilityCount": accept.capability_refs.len(),
+            "channelCount": accept.channel_refs.len(),
+            "promiseCount": accept.promise_refs.len(),
+            "source": "swarmEdgeAccept"
+        }),
+        evidence_refs: vec![format!("session:{session_id}"), service_ref],
+        proof_substrate_refs: vec![],
+        resource_posture_refs: vec![],
+        observed_at: now,
+        expires_at: accept.expires_at,
+    })
+}
+
+fn slug(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 fn edge_hello_wire(hello: &SwarmEdgeHello) -> Value {
@@ -820,6 +896,14 @@ mod tests {
             expires_at: Some(now + 60_000),
             sealed_claims: hello.sealed_claims.clone(),
         };
+        let evidence =
+            nvr_carrier_edge_session_evidence(&accept, now + 1).expect("carrier evidence");
+        validate_carrier_edge_session_evidence(&evidence).expect("valid carrier evidence");
+        assert_eq!(
+            evidence.adapter_ref,
+            "adapter:gateway-association:websocket"
+        );
+        assert_eq!(evidence.state, CARRIER_EDGE_SESSION_OPEN);
         match parse_edge_wire_text(
             &json!({ "type": SWARM_EDGE_WIRE_ACCEPT, "session": accept }).to_string(),
         )

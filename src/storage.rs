@@ -141,22 +141,16 @@ pub fn storage_pin_intent_for_segment(
     retention: &str,
     issued_at: u64,
 ) -> Result<StoragePinIntent> {
-    let object_ref = segment_object_ref(source_id, &segment.name);
-    let metadata = json!({
-        "kind": "nvr.media.segment",
-        "sourceId": source_id,
-        "name": segment.name,
-        "bytes": segment.bytes,
-        "modifiedUnix": segment.modified_unix,
-    });
+    let metadata = segment_metadata(source_id, segment);
+    let manifest_hash = metadata_manifest_hash(&metadata);
     let intent = StoragePinIntent {
         intent_id: format!(
             "pin-nvr-segment-{}-{}-{issued_at}",
             record_token(source_id),
             record_token(&segment.name)
         ),
-        object_refs: vec![object_ref],
-        manifest_hash: metadata_manifest_hash(&metadata),
+        object_refs: vec![storage_object_ref_for_manifest_hash(&manifest_hash)],
+        manifest_hash,
         desired_replicas: desired_replicas.max(1),
         retention: retention_class(retention),
         authority_refs: vec![authority_ref(service_pk)],
@@ -176,20 +170,24 @@ pub fn storage_pin_intent_for_history(
 ) -> Result<StoragePinIntent> {
     let mut object_refs = segments
         .iter()
-        .map(|segment| segment_object_ref(source_id, &segment.name))
+        .map(|segment| {
+            let metadata = segment_metadata(source_id, segment);
+            storage_object_ref_for_manifest_hash(&metadata_manifest_hash(&metadata))
+        })
         .collect::<Vec<_>>();
-    if object_refs.is_empty() {
-        object_refs.push(format!("nvr.media.history:{}", record_token(source_id)));
-    }
     let metadata = json!({
         "kind": "nvr.media.history",
         "sourceId": source_id,
         "segments": segments,
     });
+    let manifest_hash = metadata_manifest_hash(&metadata);
+    if object_refs.is_empty() {
+        object_refs.push(storage_object_ref_for_manifest_hash(&manifest_hash));
+    }
     let intent = StoragePinIntent {
         intent_id: format!("pin-nvr-history-{}-{issued_at}", record_token(source_id)),
         object_refs,
-        manifest_hash: metadata_manifest_hash(&metadata),
+        manifest_hash,
         desired_replicas: desired_replicas.max(1),
         retention: retention_class(retention),
         authority_refs: vec![authority_ref(service_pk)],
@@ -256,12 +254,19 @@ fn decrypt_blob(key: &[u8], blob: &[u8]) -> Result<Vec<u8>> {
     crypto::decrypt_payload(key, &nonce, cipher)
 }
 
-fn segment_object_ref(source_id: &str, name: &str) -> String {
-    format!(
-        "nvr.media.segment:{}:{}",
-        record_token(source_id),
-        record_token(name)
-    )
+fn segment_metadata(source_id: &str, segment: &SegmentEntry) -> serde_json::Value {
+    json!({
+        "kind": "nvr.media.segment",
+        "sourceId": source_id,
+        "name": segment.name,
+        "bytes": segment.bytes,
+        "modifiedUnix": segment.modified_unix,
+    })
+}
+
+fn storage_object_ref_for_manifest_hash(hash: &str) -> String {
+    let digest = hash.trim().strip_prefix("sha256:").unwrap_or(hash.trim());
+    format!("storage:object:{digest}")
 }
 
 fn metadata_manifest_hash(value: &serde_json::Value) -> String {
